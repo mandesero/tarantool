@@ -836,6 +836,11 @@ if(DEFINED EXTRA_DEPENDENCIES_CMAKE)
     include(${EXTRA_DEPENDENCIES_CMAKE})
 endif()
 
+#
+# WASM
+#
+option(TARANTOOL_WASM "Enable building for tarantool WASM" OFF)
+
 # cpack config. called package.cmake to avoid
 # conflicts with the global CPack.cmake (On MacOS X
 # file names are case-insensitive)
