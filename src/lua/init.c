@@ -187,6 +187,9 @@ extern char minifio_lua[],
 	print_lua[],
 	pairs_lua[],
 	luadebug_lua[],
+#ifdef TARANTOOL_WASM
+	luawasm_lua[],
+#endif
 	version_lua[]
 ;
 
@@ -257,6 +260,9 @@ static const char *lua_modules[] = {
 	"internal.print", print_lua,
 	"internal.pairs", pairs_lua,
 	"luadebug", luadebug_lua,
+#ifdef TARANTOOL_WASM
+	"luawasm", luawasm_lua,
+#endif
 	"version", version_lua,
 	EXTRA_LUA_MODULES
 	NULL
