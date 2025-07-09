@@ -28,14 +28,18 @@ local function parse_exports(exports_path)
     end
 
     local map = {}
+    local fnmap = {}  -- lua_name to original_name
+
     for _, func in ipairs(exports) do
-        map[func.name] = {
+        local lua_name = func.name:gsub("-", "_")
+        fnmap[lua_name] = func.name
+        map[lua_name] = {
             args = func.params,
             result = func.result,
             doc = func.doc,
         }
     end
-    return map
+    return map, fnmap
 end
 
 -- parse tarawasm.json to get the world name
@@ -57,16 +61,16 @@ function M:new(opts)
     local exports_json_path = opts.exports or (fio.pathjoin(opts.dir, "/component.exports.json"))
 
     local m = wasm.load(fio.pathjoin(opts.dir, wasm_file))
-    local exports = parse_exports(exports_json_path)
+    local exports, fnmap = parse_exports(exports_json_path)
 
     local obj = {
         __module = m,
         __exports = exports
     }
 
-    for name, _ in pairs(exports) do
-        obj[name] = function(self, ...)
-            return wasm.call(self.__module, name, ...)
+    for lua_name, _ in pairs(exports) do
+        obj[lua_name] = function(self, ...)
+            return wasm.call(self.__module, fnmap[lua_name], ...)
         end
     end
 
