@@ -120,6 +120,40 @@ function M:new(opts)
         end
     end
 
+    function obj:batch(call_list)
+        local batch_calls = {}
+
+        for i, entry in ipairs(call_list) do
+            local func = entry[1]
+            if type(func) ~= "function" then
+                error(string.format("entry[%d][1] must be a function", i))
+            end
+
+            local info = debug.getinfo(func, "f")
+            local found_name = nil
+
+            for lua_name, _ in pairs(self.__exports) do
+                if self[lua_name] == func then
+                    found_name = lua_name
+                    break
+                end
+            end
+
+            if not found_name then
+                error("function is not an exported wasm function")
+            end
+
+            local args = {}
+            for j = 2, #entry do
+                table.insert(args, entry[j])
+            end
+
+            table.insert(batch_calls, {fnmap[found_name], unpack(args)})
+        end
+
+        return wasm.batch(self.__module, batch_calls)
+    end
+
     return obj
 end
 
