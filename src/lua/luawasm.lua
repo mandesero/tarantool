@@ -1,160 +1,208 @@
-local M = {}
-local wasm = require('wasm')
 local json = require('json')
 local fio = require('fio')
 
-getmetatable("").__index.split = function(str, sep)
-    sep = sep or "%s"
-    local t = {}
-    for part in str:gmatch("([^" .. sep .. "]+)") do
-        table.insert(t, part)
-    end
-    return t
+local ok, wasm = pcall(require, "wasm")
+if not ok then
+    return {
+        new = function()
+            error("WASM module not found. Please ensure 'wasm.so' is available.")
+        end
+    }
+end
+
+local M = {}
+
+local function sanitize(name)
+    return name:gsub("-", "_")
 end
 
 local function read_file(path)
-    local f = assert(io.open(path, 'r'))
-    local content = f:read('*a')
+    local f = assert(io.open(path, "r"))
+    local content = f:read("*a")
     f:close()
     return content
 end
 
--- parse JSON exports
-local function parse_exports(exports_path)
-    local content = read_file(exports_path)
-    local ok, exports = pcall(json.decode, content)
+local function exists(file)
+    local ok, err, code = os.rename(file, file)
     if not ok then
-        error("failed to parse exports JSON: " .. tostring(exports))
+       if code == 13 then
+          return true
+       end
     end
+    return ok, err
+ end
 
-    local map = {}
-    local fnmap = {}  -- lua_name to original_name
+local function make_func(module, full_name, short_name, info, iface_full, iface_short)
+    local wrapper = {}
 
-    for _, func in ipairs(exports) do
-        local lua_name = func.name:gsub("-", "_")
-        fnmap[lua_name] = func.name
-        map[lua_name] = {
-            args = func.params,
-            result = func.result,
-            doc = func.doc,
-        }
-    end
-    return map, fnmap
-end
+    wrapper._args = info.params
+    wrapper._result = info.result
+    wrapper._doc = info.doc
+    wrapper._interface = iface_full
+    wrapper._interface_short = iface_short
+    wrapper._short_name = short_name
+    wrapper._full_name = full_name
 
--- parse tarawasm.json to get the world name
-local function parse_world_name(path)
-    local content = read_file(path)
-    local ok, data = pcall(json.decode, content)
-    if not ok then
-        error("failed to parse tarawasm.json: " .. tostring(data))
-    end
-    return data.world
-end
+    function wrapper:help()
+        local args = {}
+        for _, pair in ipairs(self._args or {}) do
+            table.insert(args, pair[1] .. ": " .. pair[2])
+        end
 
-function M:new(opts)
-    assert(opts.dir, "component dir must be provided")
+        local sig = string.format("%s(%s) -> %s",
+            sanitize(self._short_name),
+            table.concat(args, ", "),
+            table.concat(self._result or {}, ", "))
 
-    local tarawasm_json_path = fio.pathjoin(opts.dir, "tarawasm.json")
-    local world = opts.world or parse_world_name(tarawasm_json_path)
-    local wasm_file = opts.wasm or (world .. ".wasm")
-    local exports_json_path = opts.exports or (fio.pathjoin(opts.dir, "/component.exports.json"))
+        if self._doc then
+            print(self._doc)
+        end
 
-    local m = wasm.load(fio.pathjoin(opts.dir, wasm_file))
-    local exports, fnmap = parse_exports(exports_json_path)
-
-    local obj = {
-        __module = m,
-        __exports = exports
-    }
-
-    for lua_name, _ in pairs(exports) do
-        obj[lua_name] = function(self, ...)
-            return wasm.call(self.__module, fnmap[lua_name], ...)
+        if self._interface and self._interface_short then
+            print(string.format("%s\tfrom iface.%s (\"%s\")", sig, self._interface_short, self._interface))
+        else
+            print(sig)
         end
     end
 
-    function obj:run()
-        self.__handle = wasm.run(self.__module)
+    return setmetatable(wrapper, {
+        __call = function(_, _, ...)
+            return wasm.call(module, full_name, ...)
+        end
+    })
+end
+
+function M:new(opts)
+    assert(opts.wasm or opts.dir, "must provide either `wasm` or `dir`")
+
+    local meta = {
+        wasm_path = opts.wasm,
+        world = nil,
+        lang = nil,
+        wit_path = nil,
+        source = nil,
+    }
+
+    if opts.dir then
+        local tarawasm_path = fio.pathjoin(opts.dir, "tarawasm.json")
+        local content = read_file(tarawasm_path)
+        local parsed = assert(json.decode(content))
+
+        meta.world = parsed.world
+        meta.lang = parsed.lang
+        meta.wit_path = fio.pathjoin(opts.dir, parsed.wit_path)
+        meta.source = fio.pathjoin(opts.dir, parsed.src_file)
+        meta.wasm_wit_path = fio.pathjoin(opts.dir, parsed.wasm_file)
+
+        if opts.wasm then
+            if exists(opts.wasm) then
+                meta.wasm_path = opts.wasm
+            else
+                meta.wasm_path = fio.pathjoin(opts.dir, opts.wasm)
+            end
+        else
+            meta.wasm_path = fio.pathjoin(opts.dir, parsed.world .. ".wasm")
+        end
+    elseif not meta.wasm_path then
+        error("WASM path is not resolved")
     end
 
-    function obj:join()
+    local m = wasm.load(meta.wasm_path)
+    local exports = wasm.exports(m)
+
+    local iface = {}
+    local lookup = {}
+    local name_counter = {}
+
+    local public = {
+        iface = iface
+    }
+
+    local internal = {
+        __module = m,
+        __wasm_exports = exports,
+        __lookup = lookup,
+        __meta = meta
+    }
+
+    for key, value in pairs(exports) do
+        if value.params then
+            local sanitized = sanitize(key)
+            public[sanitized] = make_func(m, key, sanitized, value, nil, nil)
+            lookup[sanitized] = public[sanitized]
+        else
+            local short = key:match(".*/([%w%-_]+)@") or key
+            short = sanitize(short)
+            if public[short] then
+                name_counter[short] = (name_counter[short] or 0) + 1
+                short = short .. "_" .. tostring(name_counter[short])
+            end
+
+            iface[short] = {}
+
+            for fname, finfo in pairs(value) do
+                local full = key .. "::" .. fname
+                local sanitized_fname = sanitize(fname)
+                local f = make_func(m, full, sanitized_fname, finfo, key, short)
+                iface[short][sanitized_fname] = f
+                lookup["iface." .. short .. "." .. sanitized_fname] = f
+            end
+        end
+    end
+
+    function public:help()
+        print("Exported functions:\n")
+        for name, f in pairs(internal.__lookup) do
+            if type(f) == "table" and f.help and getmetatable(f) and getmetatable(f).__call then
+                f:help()
+            end
+        end
+    end
+
+    function public:meta()
+        return internal.__meta
+    end
+
+    function public:run()
+        self.__handle = wasm.run(internal.__module)
+    end
+
+    function public:join()
         if not self.__handle then
             error("No handle to join. Did you run the component?")
         end
         return wasm.join(self.__handle)
     end
 
-    function obj:help(name)
-        local function print_func(fname, def)
-            local args = {}
-            for _, pair in ipairs(def.args or {}) do
-                table.insert(args, pair[1] .. ": " .. pair[2])
-            end
-
-            local signature = string.format("%s(%s) -> %s",
-                fname, table.concat(args, ", "), def.result or "void")
-
-            if def.doc then
-                for _, line in ipairs(def.doc:split("\n")) do
-                    print(line)
-                end
-            end
-            print(signature)
-            print("")
-        end
-
-        if name == nil then
-            print("Exported functions:")
-            print("")
-            for fname, def in pairs(self.__exports) do
-                print_func(fname, def)
-            end
-        else
-            local def = self.__exports[name]
-            if def then
-                print_func(name, def)
-            else
-                print("No such exported function: " .. name)
-            end
-        end
-    end
-
-    function obj:batch(call_list)
+    function public:batch(call_list)
         local batch_calls = {}
-
+    
         for i, entry in ipairs(call_list) do
             local func = entry[1]
-            if type(func) ~= "function" then
-                error(string.format("entry[%d][1] must be a function", i))
+    
+            if not getmetatable(func) or not getmetatable(func).__call or not func._full_name then
+                error(string.format("entry[%d][1] must be a valid wasm function", i))
             end
-
-            local info = debug.getinfo(func, "f")
-            local found_name = nil
-
-            for lua_name, _ in pairs(self.__exports) do
-                if self[lua_name] == func then
-                    found_name = lua_name
-                    break
-                end
-            end
-
-            if not found_name then
-                error("function is not an exported wasm function")
-            end
-
+            
+            local found_name = func._full_name            
+    
             local args = {}
             for j = 2, #entry do
                 table.insert(args, entry[j])
             end
-
-            table.insert(batch_calls, {fnmap[found_name], unpack(args)})
+    
+            table.insert(batch_calls, {found_name, unpack(args)})
         end
-
-        return wasm.batch(self.__module, batch_calls)
+    
+        return wasm.batch(internal.__module, batch_calls)
     end
 
-    return obj
+    return setmetatable(public, {
+        __index = function(_, k)
+            return internal[k]
+        end
+    })
 end
 
 return M
