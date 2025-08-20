@@ -33,6 +33,52 @@ local function exists(file)
     return ok, err
  end
 
+ local function prepare_config(config)
+    local cfg = {}
+
+    cfg.inherit_env     = config.env.inherit_env
+    cfg.inherit_args    = config.args.inherit_args
+    cfg.inherit_stdin   = config.stdio.inherit_stdin
+    cfg.inherit_stdout  = config.stdio.inherit_stdout
+    cfg.inherit_stderr  = config.stdio.inherit_stderr
+    cfg.inherit_network = config.network.inherit_network
+
+    cfg.env = {}
+    for k, v in pairs(config.env.vars or {}) do
+        cfg.env[k] = v
+    end
+
+    cfg.args = {}
+    for _, v in ipairs(config.args.value or {}) do
+        table.insert(cfg.args, v)
+    end
+
+    cfg.stdin  = config.stdio.stdin_path
+    cfg.stdout = config.stdio.stdout_path
+    cfg.stderr = config.stdio.stderr_path
+
+    cfg.allow_ip_name_lookup = config.network.allow_ip_name_lookup
+    cfg.allow_tcp            = config.network.allow_tcp
+    cfg.allow_udp            = config.network.allow_udp
+    cfg.allowed_ips          = config.network.allowed_ips or {}
+    cfg.allowed_ports        = config.network.allowed_ports or {}
+
+    cfg.memory_limit     = config.limits.memory_limit
+    cfg.max_instructions = config.limits.max_instructions
+
+    cfg.preopened_dirs = {}
+    for _, d in ipairs(config.fs.preopened_dirs or {}) do
+        table.insert(cfg.preopened_dirs, {
+            host_path  = d.host_path,
+            guest_path = d.guest_path,
+            perms      = d.perms,
+        })
+    end
+
+    return cfg
+end
+
+
 local function make_func(module, full_name, short_name, info, iface_full, iface_short)
     local wrapper = {}
 
@@ -108,7 +154,9 @@ function M:new(opts)
         error("WASM path is not resolved")
     end
 
-    local m = wasm.load(meta.wasm_path)
+    local config = prepare_config(opts.config or {})
+
+    local m = wasm.load(meta.wasm_path, config)
     local exports = wasm.exports(m)
 
     local iface = {}
@@ -123,7 +171,8 @@ function M:new(opts)
         __module = m,
         __wasm_exports = exports,
         __lookup = lookup,
-        __meta = meta
+        __meta = meta,
+        __config = config,
     }
 
     for key, value in pairs(exports) do
@@ -164,8 +213,9 @@ function M:new(opts)
         return internal.__meta
     end
 
-    function public:run()
-        self.__handle = wasm.run(internal.__module)
+    function public:run(config)
+        local config = config or internal.__config
+        self.__handle = wasm.run(internal.__module, config)
     end
 
     function public:join()
@@ -203,6 +253,33 @@ function M:new(opts)
             return internal[k]
         end
     })
+end
+
+function M.load_components(components)
+    local registry = {}
+    if type(components) ~= 'table' then
+        return registry
+    end
+
+    for name, opts in pairs(components) do
+        local comp_opts = {
+            config = opts
+        }
+
+        if fio.path.is_dir(opts.path) then
+            comp_opts.dir = opts.path
+        else
+            comp_opts.wasm = opts.path
+        end
+
+        local comp = M:new(comp_opts)
+        registry[name] = comp
+        if opts.autorun then
+            comp:run()
+        end
+    end
+
+    return registry
 end
 
 return M

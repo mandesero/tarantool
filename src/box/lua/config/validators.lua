@@ -423,4 +423,14 @@ end
 
 -- }}} sharding
 
+-- {{{ wasm
+
+M['wasm.components.*'] = function(comp, w)
+    if not comp.path or comp.path == '' then
+        w.error('path must be specified: path to the wasm file or component directory is required')
+    end
+end
+
+-- }}} wasm
+
 return M

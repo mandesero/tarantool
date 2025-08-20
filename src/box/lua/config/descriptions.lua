@@ -28,6 +28,52 @@ end
 
 local I = {}
 
+I['wasm'] = ''
+I['wasm.components'] = ''
+I['wasm.components.*'] = ''
+I['wasm.components.*.alias'] = ''
+I['wasm.components.*.path'] = ''
+I['wasm.components.*.autorun'] = ''
+
+I['wasm.components.*.limits'] = ''
+I['wasm.components.*.limits.max_instructions'] = ''
+I['wasm.components.*.limits.memory_limit'] = ''
+
+I['wasm.components.*.env'] = ''
+I['wasm.components.*.env.inherit_env'] = ''
+I['wasm.components.*.env.vars'] = ''
+I['wasm.components.*.env.vars.*'] = ''
+
+I['wasm.components.*.args'] = ''
+I['wasm.components.*.args.inherit_args'] = ''
+I['wasm.components.*.args.value'] = ''
+I['wasm.components.*.args.value.*'] = ''
+
+I['wasm.components.*.stdio'] = ''
+I['wasm.components.*.stdio.inherit_stdin'] = ''
+I['wasm.components.*.stdio.inherit_stdout'] = ''
+I['wasm.components.*.stdio.inherit_stderr'] = ''
+I['wasm.components.*.stdio.stdin_path'] = ''
+I['wasm.components.*.stdio.stdout_path'] = ''
+I['wasm.components.*.stdio.stderr_path'] = ''
+
+I['wasm.components.*.network'] = ''
+I['wasm.components.*.network.inherit_network'] = ''
+I['wasm.components.*.network.allow_ip_name_lookup'] = ''
+I['wasm.components.*.network.allow_tcp'] = ''
+I['wasm.components.*.network.allow_udp'] = ''
+I['wasm.components.*.network.allowed_ips'] = ''
+I['wasm.components.*.network.allowed_ips.*'] = ''
+I['wasm.components.*.network.allowed_ports'] = ''
+I['wasm.components.*.network.allowed_ports.*'] = ''
+
+I['wasm.components.*.fs'] = ''
+I['wasm.components.*.fs.preopened_dirs'] = ''
+I['wasm.components.*.fs.preopened_dirs.*'] = ''
+I['wasm.components.*.fs.preopened_dirs.*.host_path'] = ''
+I['wasm.components.*.fs.preopened_dirs.*.guest_path'] = ''
+I['wasm.components.*.fs.preopened_dirs.*.perms'] = ''
+
 I[''] = 'Instance configuration'
 
 -- {{{ <uri>.params configuration
