@@ -128,6 +128,7 @@ function M:new(opts)
         lang = nil,
         wit_path = nil,
         source = nil,
+        component_name = opts.name,
     }
 
     if opts.dir then
@@ -173,6 +174,7 @@ function M:new(opts)
         __lookup = lookup,
         __meta = meta,
         __config = config,
+        __handle = nil,
     }
 
     for key, value in pairs(exports) do
@@ -214,11 +216,11 @@ function M:new(opts)
     end
 
     function public:run()
-        self.__handle = wasm.run(internal.__uid)
+        internal.__handle = wasm.run(internal.__uid)
     end
 
     function public:join()
-        local h = self.__handle
+        local h = internal.__handle
         if not h then
             error("No handle to join. Did you run the component?")
         end
@@ -246,6 +248,18 @@ function M:new(opts)
         return wasm.batch(internal.__uid, batch_calls)
     end
 
+    function public:drop()
+        local name = internal.__meta.component_name
+
+        if box.wasm.get(name) == nil then
+            error("No such component: " .. name, 2)
+        end
+
+        wasm.drop(internal.__uid)
+        box.wasm.components[name] = nil
+        return true
+    end
+
     return setmetatable(public, {
         __index = function(_, k)
             return internal[k]
@@ -261,7 +275,8 @@ function M.load_components(components)
 
     for name, opts in pairs(components) do
         local comp_opts = {
-            config = opts
+            name = name,
+            config = opts,
         }
 
         if fio.path.is_dir(opts.path) then
