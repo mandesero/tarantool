@@ -1,84 +1,127 @@
 local json = require('json')
 local fio = require('fio')
 
+-- Try to load the runtime part. When it is absent provide a stub that
+-- raises a clear error message on attempt to create a component.
 local ok, wasm = pcall(require, "wasm")
 if not ok then
     return {
         new = function()
             error("WASM module not found. Please ensure 'wasm.so' is available.")
-        end
+        end,
     }
 end
 
 local M = {}
 
+-- {{{ Helpers
+
+-- Replace dashes with underscores to obtain valid Lua identifiers.
 local function sanitize(name)
     return name:gsub("-", "_")
 end
 
 local function read_file(path)
-    local f = assert(io.open(path, "r"))
-    local content = f:read("*a")
+    local f = fio.open(path, {'O_RDONLY'})
+    local content = f:read()
     f:close()
     return content
 end
 
-local function exists(file)
-    local ok, err, code = os.rename(file, file)
-    if not ok then
-       if code == 13 then
-          return true
-       end
+ local function get(t, ...)
+    local v = t
+    for i = 1, select('#', ...) do
+        if type(v) ~= 'table' then return nil end
+        v = v[select(i, ...)]
     end
-    return ok, err
- end
+    return v
+end
 
- local function prepare_config(config)
+local function as_bool(v, default)
+    if v == nil then return default end
+    return not not v
+end
+
+local function copy_array(arr)
+    local out = {}
+    for i = 1, #arr do out[#out+1] = arr[i] end
+    return out
+end
+
+local function copy_map(map)
+    local out = {}
+    for k, v in pairs(map) do out[k] = v end
+    return out
+end
+
+local function valid_str(x) return type(x) == 'string' and x ~= '' end
+
+-- }}} Helpers
+
+-- Transform user configuration into a form accepted by the wasm module.
+local function prepare_config(config)
+    config = config or {}
+
     local cfg = {}
 
-    cfg.inherit_env     = config.env.inherit_env
-    cfg.inherit_args    = config.args.inherit_args
-    cfg.inherit_stdin   = config.stdio.inherit_stdin
-    cfg.inherit_stdout  = config.stdio.inherit_stdout
-    cfg.inherit_stderr  = config.stdio.inherit_stderr
-    cfg.inherit_network = config.network.inherit_network
+    -- Inherit flags
+    cfg.inherit_env = as_bool(get(config, 'env', 'inherit_env'), true)
+    cfg.inherit_args = as_bool(get(config, 'args', 'inherit_args'), false)
+    cfg.inherit_stdin = as_bool(get(config, 'stdio', 'inherit_stdin'), true)
+    cfg.inherit_stdout = as_bool(get(config, 'stdio', 'inherit_stdout'), true)
+    cfg.inherit_stderr = as_bool(get(config, 'stdio', 'inherit_stderr'), true)
+    cfg.inherit_network = as_bool(get(config, 'network','inherit_network'), false)
 
-    cfg.env = {}
-    for k, v in pairs(config.env.vars or {}) do
-        cfg.env[k] = v
+    -- Env/args
+    cfg.env  = copy_map(get(config, 'env', 'vars')  or {})
+    cfg.args = copy_array(get(config, 'args', 'value') or {})
+
+    -- Stdio paths
+    do
+        local stdin_path = get(config, 'stdio', 'stdin_path')
+        local stdout_path = get(config, 'stdio', 'stdout_path')
+        local stderr_path = get(config, 'stdio', 'stderr_path')
+        cfg.stdin  = valid_str(stdin_path)  and stdin_path  or nil
+        cfg.stdout = valid_str(stdout_path) and stdout_path or nil
+        cfg.stderr = valid_str(stderr_path) and stderr_path or nil
     end
 
-    cfg.args = {}
-    for _, v in ipairs(config.args.value or {}) do
-        table.insert(cfg.args, v)
+    -- Network options
+    cfg.allow_ip_name_lookup = as_bool(get(config, 'network', 'allow_ip_name_lookup'), false)
+    cfg.allow_tcp = as_bool(get(config, 'network', 'allow_tcp'), false)
+    cfg.allow_udp = as_bool(get(config, 'network', 'allow_udp'), false)
+    cfg.allowed_ips = copy_array(get(config, 'network', 'allowed_ips')   or {})
+    cfg.allowed_ports = copy_array(get(config, 'network', 'allowed_ports') or {})
+
+    -- Limits
+    do
+        local mem  = get(config, 'limits', 'memory_limit')
+        local fuel = get(config, 'limits', 'max_instructions')
+        cfg.memory_limit = type(mem)  == 'number' and mem  or nil
+        cfg.max_instructions = type(fuel) == 'number' and fuel or nil
     end
 
-    cfg.stdin  = config.stdio.stdin_path
-    cfg.stdout = config.stdio.stdout_path
-    cfg.stderr = config.stdio.stderr_path
-
-    cfg.allow_ip_name_lookup = config.network.allow_ip_name_lookup
-    cfg.allow_tcp            = config.network.allow_tcp
-    cfg.allow_udp            = config.network.allow_udp
-    cfg.allowed_ips          = config.network.allowed_ips or {}
-    cfg.allowed_ports        = config.network.allowed_ports or {}
-
-    cfg.memory_limit     = config.limits.memory_limit
-    cfg.max_instructions = config.limits.max_instructions
-
+    -- Preopened dirs: { host_path, guest_path, perms = ... }
     cfg.preopened_dirs = {}
-    for _, d in ipairs(config.fs.preopened_dirs or {}) do
-        table.insert(cfg.preopened_dirs, {
-            host_path  = d.host_path,
-            guest_path = d.guest_path,
-            perms      = d.perms,
-        })
+    do
+        local list = get(config, 'fs', 'preopened_dirs') or {}
+        if type(list) == 'table' then
+            for _, d in ipairs(list) do
+                if type(d) == 'table' and valid_str(d.host_path) and valid_str(d.guest_path) then
+                    cfg.preopened_dirs[#cfg.preopened_dirs+1] = {
+                        d.host_path,
+                        d.guest_path,
+                        perms = d.perms,
+                    }
+                end
+            end
+        end
     end
 
     return cfg
 end
 
-
+-- Build a callable wrapper for an exported function.
 local function make_func(uid, full_name, short_name, info, iface_full, iface_short)
     local wrapper = {}
 
@@ -119,6 +162,7 @@ local function make_func(uid, full_name, short_name, info, iface_full, iface_sho
     })
 end
 
+-- Create a new component instance from options.
 function M:new(opts)
     assert(opts.wasm or opts.dir, "must provide either `wasm` or `dir`")
 
@@ -143,7 +187,9 @@ function M:new(opts)
         meta.wasm_wit_path = fio.pathjoin(opts.dir, parsed.wasm_file)
 
         if opts.wasm then
-            if exists(opts.wasm) then
+            -- Use provided path as-is if it exists; otherwise, treat it as
+            -- relative to the component directory.
+            if fio.path.exists(opts.wasm) then
                 meta.wasm_path = opts.wasm
             else
                 meta.wasm_path = fio.pathjoin(opts.dir, opts.wasm)
@@ -202,6 +248,7 @@ function M:new(opts)
         end
     end
 
+    -- Print information about all exported functions.
     function public:help()
         print("Exported functions:\n")
         for _, f in pairs(internal.__lookup) do
@@ -215,10 +262,12 @@ function M:new(opts)
         return internal.__meta
     end
 
+    -- Start component execution.
     function public:run()
         internal.__handle = wasm.run(internal.__uid)
     end
 
+    -- Wait for the component started with `run` to finish.
     function public:join()
         local h = internal.__handle
         if not h then
@@ -227,6 +276,7 @@ function M:new(opts)
         return wasm.join(h)
     end
 
+    -- Invoke multiple functions in one call.
     function public:batch(call_list)
         local batch_calls = {}
 
@@ -248,6 +298,7 @@ function M:new(opts)
         return wasm.batch(internal.__uid, batch_calls)
     end
 
+    -- Remove component from registry and unload it.
     function public:drop()
         local name = internal.__meta.component_name
 
@@ -267,6 +318,7 @@ function M:new(opts)
     })
 end
 
+-- Helper that loads all components described in configuration.
 function M.load_components(components)
     local registry = {}
     if type(components) ~= 'table' then
