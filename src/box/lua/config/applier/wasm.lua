@@ -1,4 +1,13 @@
 local luawasm = require('luawasm')
+local tarantool = require('tarantool')
+local log = require('internal.config.utils.log')
+
+if not tarantool.build.wasm then
+    log.warn('WebAssembly support is not available. ' ..
+                'Please rebuild Tarantool with -DTARANTOOL_WASM=ON. ' ..
+                'The luawasm module may still run, but crashes are possible ' ..
+                'during graceful shutdown.')
+end
 
 local function apply(config)
     local cfg = config._configdata:get('wasm.components', {use_default = true}) or {}
