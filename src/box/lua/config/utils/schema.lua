@@ -2365,6 +2365,60 @@ end
 
 -- }}} schema.fromenv()
 
+-- {{{ schema.annotate()
+
+-- Annotate schema nodes recursively.
+--
+-- The function copies a given schema node, attaches the provided
+-- annotations to it and all its descendants and returns the new
+-- node.
+--
+-- An optional opts.on_node callback may be provided to perform extra
+-- changes on each annotated node (for example, to chain validators).
+local function annotate(schema_node, annotations, opts)
+    assert(type(schema_node) == 'table')
+    assert(type(annotations) == 'table')
+
+    opts = opts or {}
+    assert(opts.on_node == nil or type(opts.on_node) == 'function')
+
+    local function annotate_impl(node)
+        local res = table.copy(node)
+        res.computed = nil
+
+        for k, v in pairs(annotations) do
+            res[k] = v
+        end
+
+        if opts.on_node ~= nil then
+            opts.on_node(res)
+        end
+
+        if is_scalar(res) then
+            return res
+        elseif res.type == 'record' then
+            local fields = {}
+            for field_name, field_def in pairs(res.fields) do
+                fields[field_name] = annotate_impl(field_def)
+            end
+            res.fields = fields
+        elseif res.type == 'map' then
+            res.key = annotate_impl(res.key)
+            res.value = annotate_impl(res.value)
+        elseif res.type == 'array' then
+            res.items = annotate_impl(res.items)
+        else
+            assert(false)
+        end
+
+        return res
+    end
+
+    return annotate_impl(schema_node)
+end
+
+-- }}} schema.annotate()
+
 return {
     -- Schema node constructors.
     scalar = scalar,
@@ -2379,6 +2433,7 @@ return {
     -- rules at validation.
     enum = enum,
     set = set,
+    annotate = annotate,
 
     -- Schema object constructor.
     new = new,

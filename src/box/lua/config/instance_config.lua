@@ -74,22 +74,24 @@ end
 
 -- Available only in Tarantool Enterprise Edition.
 local function enterprise_edition(schema_node)
-    schema_node.enterprise_edition = true
+    local function annotate_node(node)
+        -- Perform a domain specific validation first and only then
+        -- check, whether the option is to be used with Tarantool
+        -- Enterprise Edition.
+        --
+        -- This order is consistent with data type validation, which
+        -- is also performed before the EE check.
+        node.validate = funcutils.chain2(
+            node.validate,
+            enterprise_edition_validate)
+        node.apply_default_if = funcutils.chain2(
+            node.apply_default_if,
+            enterprise_edition_apply_default_if)
+    end
 
-    -- Perform a domain specific validation first and only then
-    -- check, whether the option is to be used with Tarantool
-    -- Enterprise Edition.
-    --
-    -- This order is consistent with data type validation, which
-    -- is also performed before the EE check.
-    schema_node.validate = funcutils.chain2(
-        schema_node.validate,
-        enterprise_edition_validate)
-    schema_node.apply_default_if = funcutils.chain2(
-        schema_node.apply_default_if,
-        enterprise_edition_apply_default_if)
-
-    return schema_node
+    return schema.annotate(schema_node, {enterprise_edition = true}, {
+        on_node = annotate_node,
+    })
 end
 
 -- Accept a value of 'iproto.listen' option and return the first URI
@@ -407,24 +409,24 @@ return schema.new('instance_config', schema.record({
                             'plain',
                             'ssl',
                         }),
-                        ssl_key_file = enterprise_edition(schema.scalar({
+                        ssl_key_file = schema.scalar({
                             type = 'string',
-                        })),
-                        ssl_cert_file = enterprise_edition(schema.scalar({
+                        }),
+                        ssl_cert_file = schema.scalar({
                             type = 'string',
-                        })),
-                        ssl_ca_file = enterprise_edition(schema.scalar({
+                        }),
+                        ssl_ca_file = schema.scalar({
                             type = 'string',
-                        })),
-                        ssl_ciphers = enterprise_edition(schema.scalar({
+                        }),
+                        ssl_ciphers = schema.scalar({
                             type = 'string',
-                        })),
-                        ssl_password = enterprise_edition(schema.scalar({
+                        }),
+                        ssl_password = schema.scalar({
                             type = 'string',
-                        })),
-                        ssl_password_file = enterprise_edition(schema.scalar({
+                        }),
+                        ssl_password_file = schema.scalar({
                             type = 'string',
-                        })),
+                        }),
                     }),
                 }),
                 validate = validators['config.storage.endpoints'],
@@ -1078,23 +1080,23 @@ return schema.new('instance_config', schema.record({
         }),
     }),
     quiver = enterprise_edition(schema.record({
-        dir = enterprise_edition(schema.scalar({
+        dir = schema.scalar({
             type = 'string',
             box_cfg = 'quiver_dir',
             box_cfg_nondynamic = true,
             mkdir = true,
             default = 'var/lib/{{ instance_name }}',
-        })),
-        memory = enterprise_edition(schema.scalar({
+        }),
+        memory = schema.scalar({
             type = 'integer',
             box_cfg = 'quiver_memory',
             default = 128 * 1024 * 1024,
-        })),
-        run_size = enterprise_edition(schema.scalar({
+        }),
+        run_size = schema.scalar({
             type = 'integer',
             box_cfg = 'quiver_run_size',
             default = 16 * 1024 * 1024,
-        })),
+        }),
     })),
     wal = schema.record({
         dir = schema.scalar({
@@ -1599,55 +1601,55 @@ return schema.new('instance_config', schema.record({
             validate = validators['feedback.metrics_limit'],
         }),
     }),
-    flightrec = schema.record({
-        enabled = enterprise_edition(schema.scalar({
+    flightrec = enterprise_edition(schema.record({
+        enabled = schema.scalar({
             type = 'boolean',
             box_cfg = 'flightrec_enabled',
             default = false,
-        })),
-        logs_size = enterprise_edition(schema.scalar({
+        }),
+        logs_size = schema.scalar({
             type = 'integer',
             box_cfg = 'flightrec_logs_size',
             default = 10485760,
-        })),
-        logs_max_msg_size = enterprise_edition(schema.scalar({
+        }),
+        logs_max_msg_size = schema.scalar({
             type = 'integer',
             box_cfg = 'flightrec_logs_max_msg_size',
             default = 4096,
-        })),
-        logs_log_level = enterprise_edition(schema.scalar({
+        }),
+        logs_log_level = schema.scalar({
             type = 'integer',
             box_cfg = 'flightrec_logs_log_level',
             default = 6,
             allowed_values = {0, 1, 2, 3, 4, 5, 6, 7},
-        })),
-        metrics_interval = enterprise_edition(schema.scalar({
+        }),
+        metrics_interval = schema.scalar({
             type = 'number',
             box_cfg = 'flightrec_metrics_interval',
             default = 1.0,
-        })),
-        metrics_period = enterprise_edition(schema.scalar({
+        }),
+        metrics_period = schema.scalar({
             type = 'number',
             box_cfg = 'flightrec_metrics_period',
             default = 60 * 3,
-        })),
-        requests_size = enterprise_edition(schema.scalar({
+        }),
+        requests_size = schema.scalar({
             type = 'integer',
             box_cfg = 'flightrec_requests_size',
             default = 10485760,
-        })),
-        requests_max_req_size = enterprise_edition(schema.scalar({
+        }),
+        requests_max_req_size = schema.scalar({
             type = 'integer',
             box_cfg = 'flightrec_requests_max_req_size',
             default = 16384,
-        })),
-        requests_max_res_size = enterprise_edition(schema.scalar({
+        }),
+        requests_max_res_size = schema.scalar({
             type = 'integer',
             box_cfg = 'flightrec_requests_max_res_size',
             default = 16384,
-        })),
-    }),
-    security = schema.record({
+        }),
+    })),
+    security = enterprise_edition(schema.record({
         auth_type = schema.enum({
             'chap-sha1',
             'pap-sha256',
@@ -1656,62 +1658,62 @@ return schema.new('instance_config', schema.record({
             default = 'chap-sha1',
             validate = validators['security.auth_type'],
         }),
-        auth_delay = enterprise_edition(schema.scalar({
+        auth_delay = schema.scalar({
             type = 'number',
             default = 0,
             box_cfg = 'auth_delay',
-        })),
-        auth_retries = enterprise_edition(schema.scalar({
+        }),
+        auth_retries = schema.scalar({
             type = 'integer',
             default = 0,
             box_cfg = 'auth_retries',
-        })),
-        disable_guest = enterprise_edition(schema.scalar({
+        }),
+        disable_guest = schema.scalar({
             type = 'boolean',
             default = false,
             box_cfg = 'disable_guest',
-        })),
-        secure_erasing = enterprise_edition(schema.scalar({
+        }),
+        secure_erasing = schema.scalar({
             type = 'boolean',
             default = false,
             box_cfg = 'secure_erasing',
-        })),
-        password_lifetime_days = enterprise_edition(schema.scalar({
+        }),
+        password_lifetime_days = schema.scalar({
             type = 'integer',
             default = 0,
             box_cfg = 'password_lifetime_days',
-        })),
-        password_min_length = enterprise_edition(schema.scalar({
+        }),
+        password_min_length = schema.scalar({
             type = 'integer',
             default = 0,
             box_cfg = 'password_min_length',
-        })),
-        password_enforce_uppercase = enterprise_edition(schema.scalar({
+        }),
+        password_enforce_uppercase = schema.scalar({
             type = 'boolean',
             default = false,
             box_cfg = 'password_enforce_uppercase',
-        })),
-        password_enforce_lowercase = enterprise_edition(schema.scalar({
+        }),
+        password_enforce_lowercase = schema.scalar({
             type = 'boolean',
             default = false,
             box_cfg = 'password_enforce_lowercase',
-        })),
-        password_enforce_digits = enterprise_edition(schema.scalar({
+        }),
+        password_enforce_digits = schema.scalar({
             type = 'boolean',
             default = false,
             box_cfg = 'password_enforce_digits',
-        })),
-        password_enforce_specialchars = enterprise_edition(schema.scalar({
+        }),
+        password_enforce_specialchars = schema.scalar({
             type = 'boolean',
             default = false,
             box_cfg = 'password_enforce_specialchars',
-        })),
-        password_history_length = enterprise_edition(schema.scalar({
+        }),
+        password_history_length = schema.scalar({
             type = 'integer',
             default = 0,
             box_cfg = 'password_history_length',
-        })),
-    }),
+        }),
+    })),
     metrics = schema.record({
         -- Metrics doesn't have box_cfg annotation, because currently nested
         -- options and maps/arrays defaults are not supported.
@@ -1857,49 +1859,49 @@ return schema.new('instance_config', schema.record({
         -- The reason is that there is no direct-no-transform
         -- mapping from, say, `audit_log.file` to `box_cfg.audit_log`.
         -- The applier should add the `file:` prefix.
-        to = enterprise_edition(schema.enum({
+        to = schema.enum({
             'devnull',
             'file',
             'pipe',
             'syslog',
         }, {
             default = 'devnull',
-        })),
-        file = enterprise_edition(schema.scalar({
+        }),
+        file = schema.scalar({
             type = 'string',
             -- The mk_parent_dir annotation is not present here,
             -- because otherwise the directory would be created
             -- unconditionally. Instead, mkdir applier creates it
             -- if audit_log.to is 'file'.
             default = 'var/log/{{ instance_name }}/audit.log',
-        })),
-        pipe = enterprise_edition(schema.scalar({
+        }),
+        pipe = schema.scalar({
             type = 'string',
             default = box.NULL,
-        })),
+        }),
         syslog = schema.record({
-            identity = enterprise_edition(schema.scalar({
+            identity = schema.scalar({
                 type = 'string',
                 default = 'tarantool',
-            })),
-            facility = enterprise_edition(schema.scalar({
+            }),
+            facility = schema.scalar({
                 type = 'string',
                 default = 'local7',
-            })),
-            server = enterprise_edition(schema.scalar({
+            }),
+            server = schema.scalar({
                 type = 'string',
                 -- The logger tries /dev/log and then
                 -- /var/run/syslog if no server is provided.
                 default = box.NULL,
-            })),
+            }),
         }),
-        nonblock = enterprise_edition(schema.scalar({
+        nonblock = schema.scalar({
             type = 'boolean',
             box_cfg = 'audit_nonblock',
             box_cfg_nondynamic = true,
             default = false,
-        })),
-        format = enterprise_edition(schema.enum({
+        }),
+        format = schema.enum({
             'plain',
             'json',
             'csv',
@@ -1907,7 +1909,7 @@ return schema.new('instance_config', schema.record({
             box_cfg = 'audit_format',
             box_cfg_nondynamic = true,
             default = 'json',
-        })),
+        }),
         -- The reason for the absence of the box_cfg and box_cfg_nondynamic
         -- annotations is that this setting needs to be converted to a string
         -- before being set to 'audit_filter'. This will be done in box_cfg
@@ -1955,20 +1957,20 @@ return schema.new('instance_config', schema.record({
             "data_operations",
             "compatibility",
         }),
-        spaces = enterprise_edition(schema.array({
+        spaces = schema.array({
             items = schema.scalar({
                 type = 'string',
             }),
             box_cfg = 'audit_spaces',
             box_cfg_nondynamic = true,
             default = box.NULL,
-        })),
-        extract_key = enterprise_edition(schema.scalar({
+        }),
+        extract_key = schema.scalar({
             type = 'boolean',
             box_cfg = 'audit_extract_key',
             box_cfg_nondynamic = true,
             default = false,
-        })),
+        }),
     })),
     roles_cfg = schema.map({
         key = schema.scalar({type = 'string'}),
@@ -1978,7 +1980,7 @@ return schema.new('instance_config', schema.record({
         items = schema.scalar({type = 'string'})
     }),
     -- Options of the failover coordinator service.
-    failover = schema.record({
+    failover = enterprise_edition(schema.record({
         probe_interval = schema.scalar({
             type = 'number',
             default = 10,
@@ -2089,7 +2091,7 @@ return schema.new('instance_config', schema.record({
         }),
     }, {
         validate = validators['failover'],
-    }),
+    })),
     -- Compatibility options.
     compat = schema.record({
         json_escape_forward_slash = schema.enum({
