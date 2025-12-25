@@ -883,6 +883,10 @@ I['database.hot_standby'] = format_text([[
     - For spaces created with engine set to `vinyl`.
 ]])
 
+I['database.schema'] = format_text([[
+    ...
+]])
+
 I['database.instance_uuid'] = format_text([[
     An instance UUID.
 
