@@ -76,7 +76,19 @@ g.test_popen_is_closed = function()
     t.assert_error_covers(exp_err, ph.is_closed)
 
     -- Check that 'is_closed()' works properly when handle is closed.
-    t.assert_equals(ph:close(), true)
+    --
+    -- Note: ph:close() may return nil, err on macOS here.
+    --
+    -- popen.shell() enables setsid/group_signal by default, see
+    -- src/lua/popen.c:luaT_popen_parse_mode(). When close() kills a
+    -- process group, macOS may report EPERM for an already dead zombie
+    -- group, see src/lua/popen.c:lbox_popen_close() and
+    -- src/lib/core/popen.c:popen_delete().
+    --
+    -- This is an informational diagnostic, not a close() failure: the
+    -- handle is still closed and the resources are still released, as
+    -- documented in the same functions.
+    ph:close()
     t.assert_equals(ph:is_closed(), true)
 
     -- Check the error description for an invalid argument to the 'is_closed()'
