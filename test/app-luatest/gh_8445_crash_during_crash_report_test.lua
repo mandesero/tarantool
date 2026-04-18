@@ -1,4 +1,5 @@
 local fio = require('fio')
+local fiber = require('fiber')
 local t = require('luatest')
 local g = t.group('gh-8445')
 
@@ -31,13 +32,27 @@ g.test_crash_during_crash_report = function(cg)
                           stderr = popen.opts.PIPE, shell = true})
     t.assert(ph)
 
-    -- Wait for box.cfg{} completion.
-    local output = ''
-    t.helpers.retrying({}, function()
-        local chunk = ph:read({stderr = true, timeout = 0.05})
-        if chunk ~= nil then
-           output = output .. chunk
+    local chunks = {}
+    local stderr_fiber = fiber.new(function()
+        while true do
+            local chunk, err = ph:read({stderr = true})
+            if chunk == nil then
+                return nil, err
+            end
+            if chunk == '' then
+                return table.concat(chunks)
+            end
+            table.insert(chunks, chunk)
         end
+    end)
+    stderr_fiber:set_joinable(true)
+
+    local output = ''
+    -- Keep draining stderr while waiting for box.cfg{} completion. Otherwise
+    -- the crash report may fill the pipe and block the child in write() while
+    -- the parent is already waiting in ph:wait().
+    t.helpers.retrying({timeout = 5}, function()
+        output = table.concat(chunks)
         t.assert_str_contains(output, "pid = ")
     end)
 
@@ -47,7 +62,9 @@ g.test_crash_during_crash_report = function(cg)
     t.assert(pid)
     ffi.C.kill(pid, popen.signal.SIGILL)
     ph:wait()
-    output = ph:read({stderr = true})
+    local ok, output_or_err = stderr_fiber:join()
+    t.assert(ok, output_or_err)
+    output = output_or_err
     t.assert_str_contains(output, "Please file a bug")
 
     -- Check that there were no fatal signals during crash report.
