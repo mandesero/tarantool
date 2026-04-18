@@ -1,4 +1,5 @@
 local fio = require('fio')
+local fiber = require('fiber')
 local t = require('luatest')
 
 local g = t.group('gh-8083', {{errinj = 'ERRINJ_SIGILL_MAIN_THREAD'},
@@ -28,7 +29,27 @@ g.test_fatal_signal_handler = function(cg)
     local ph = popen.new({cmd}, {stderr = popen.opts.PIPE, env = tarantool_env,
                                  shell = true})
     t.assert(ph)
+    local chunks = {}
+    local stderr_fiber = fiber.new(function()
+        while true do
+            local chunk, err = ph:read({stderr = true})
+            if chunk == nil then
+                return nil, err
+            end
+            if chunk == '' then
+                return table.concat(chunks)
+            end
+            table.insert(chunks, chunk)
+        end
+    end)
+    stderr_fiber:set_joinable(true)
+
+    -- Keep draining stderr while waiting for the crash report. Otherwise the
+    -- report may fill the pipe and block the child in write(), so ph:wait()
+    -- never returns.
     ph:wait()
-    t.assert_str_contains(ph:read({stderr = true}), "Please file a bug")
+    local ok, output_or_err = stderr_fiber:join()
+    t.assert(ok, output_or_err)
+    t.assert_str_contains(output_or_err, "Please file a bug")
     ph:close()
 end
