@@ -47,6 +47,11 @@ local expected = {
 
 http_version_group.before_each(function(g)
     g.server = socket.tcp_server('127.0.0.1', 0, function(_s) end)
+    t.helpers.retrying({timeout = 5}, function()
+        local conn = socket.tcp_connect('127.0.0.1', g.server:name().port)
+        t.assert_not_equals(conn, nil)
+        conn:close()
+    end)
 end)
 
 http_version_group.after_each(function(g)
@@ -72,23 +77,29 @@ local http_request_script = string.dump(function()
 end)
 
 http_version_group.test_http_version = function(g)
-    local dir = treegen.prepare_directory({}, {})
-    local script_name = 'http_request.lua'
-    treegen.write_file(dir, script_name, http_request_script)
-    local args = {script_name}
-    local opts = {nojson = true, stderr = true}
-    local env = {HTTP_SERVER_PORT = g.server:name().port}
-    env.PROTO = g.params.proto
-    env.HTTP_VERSION = g.params.version
-    justrun.tarantool(dir, env, args, opts)
-
-    local log_path = fio.pathjoin(dir, 'tarantool.log')
-    local log_file = fio.open(log_path)
-    t.assert_not_equals(log_file, nil)
-    local log_data = log_file:read()
-    log_file:close()
     local exp = expected[tostring(g.params.version)][g.params.proto]
-    t.assert_str_contains(log_data, exp)
+    -- The test starts a throwaway server and an external Tarantool process in
+    -- parallel. Under load, the child process may hit a transient
+    -- "Could not connect to server" before libcurl reaches the HTTP/ALPN path
+    -- we actually want to verify, so retry the whole run for a short time.
+    t.helpers.retrying({timeout = 5}, function()
+        local dir = treegen.prepare_directory({}, {})
+        local script_name = 'http_request.lua'
+        treegen.write_file(dir, script_name, http_request_script)
+        local args = {script_name}
+        local opts = {nojson = true, stderr = true}
+        local env = {HTTP_SERVER_PORT = g.server:name().port}
+        env.PROTO = g.params.proto
+        env.HTTP_VERSION = g.params.version
+        justrun.tarantool(dir, env, args, opts)
+
+        local log_path = fio.pathjoin(dir, 'tarantool.log')
+        local log_file = fio.open(log_path)
+        t.assert_not_equals(log_file, nil)
+        local log_data = log_file:read()
+        log_file:close()
+        t.assert_str_contains(log_data, exp)
+    end)
 end
 
 wrong_version_group.test_request_wrong_http_version = function()
