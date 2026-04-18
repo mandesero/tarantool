@@ -15,8 +15,15 @@ LuajitError: module 'aaa<...>aaa' not found:
 g.test_long_init_error = function()
     local module_name = string.rep('a', 500)
     local args = {'-l', module_name, '-e', '""'}
-    local res = justrun.tarantool('.', {}, args, {stderr = true, nojson = true})
     local ref = ("module '%s' not found:.*"):format(module_name)
-    t.assert_str_matches(res.stderr, ref)
-    t.assert_gt(string.len(res.stderr), 1000, 'error is longer than 1000 chars')
+    -- The child exits during startup, so stderr collection via justrun may
+    -- occasionally miss part of the fatal error. Retry until the complete
+    -- "module ... not found" report is observed and verify it is not stripped.
+    t.helpers.retrying({timeout = 5}, function()
+        local res = justrun.tarantool('.', {}, args,
+                                      {stderr = true, nojson = true})
+        t.assert_str_matches(res.stderr, ref)
+        t.assert_gt(string.len(res.stderr), 1000,
+                    'error is longer than 1000 chars')
+    end)
 end
