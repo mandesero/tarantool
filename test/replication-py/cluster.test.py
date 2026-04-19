@@ -69,6 +69,9 @@ status = len(rows) == 1 and rows[0].return_message.find("Read access") >= 0 and 
     "ok" or "not ok"
 print("{} - subscribe without read permissions on universe".format(status))
 
+# SUBSCRIBE may leave the iproto connection in a bad state on failure.
+# Reconnect before sending regular requests over the same connection.
+server.iproto.reconnect() # reconnect after SUBSCRIBE attempt
 server.iproto.py_con.space("_cluster").delete(server_id)
 
 # JOIN with granted role
