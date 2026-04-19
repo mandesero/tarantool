@@ -1048,13 +1048,15 @@ g.test_role_graceful_shutdown = function(g)
     local log_content = log_file:read('*all')
     log_file:close()
 
+    -- The signal line may have an OS-specific suffix after "Terminated",
+    -- for example "Terminated: 15" on macOS.
     t.assert_str_contains(log_content,
-        '.*Terminated\n' ..
+        '.*Terminated.*\n' ..
         '.* roles.on_shutdown: stopping role two\n' ..
         '.* Role two stopped\n' ..
         '.* roles.on_shutdown: stopping role one\n' ..
         '.* Role one stopped\n' ..
-        '.* tx_binary: stopped\n',
+        '.* tx_binary: stopped',
         true)
 end
 
@@ -1106,13 +1108,15 @@ g.test_role_graceful_shutdown_order = function(g)
     local log_content = log_file:read('*all')
     log_file:close()
 
+    -- The signal line may have an OS-specific suffix after "Terminated",
+    -- for example "Terminated: 15" on macOS.
     t.assert_str_contains(log_content,
-        '.*Terminated\n' ..
+        '.*Terminated.*\n' ..
         '.* roles.on_shutdown: stopping role one\n' ..
         '.* Role one stopped\n' ..
         '.* roles.on_shutdown: stopping role two\n' ..
         '.* Role two stopped\n' ..
-        '.* tx_binary: stopped\n',
+        '.* tx_binary: stopped',
         true)
 end
 
