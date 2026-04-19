@@ -2,10 +2,15 @@ local net = require('net.box')
 
 local t = require('luatest')
 local server = require('luatest.server')
+local is_macos = jit.os == 'OSX'
 
 local g1 = t.group('iproto_export', t.helpers.matrix({
     before_box_cfg = {false, true},
 }))
+
+g1.before_all(function()
+    t.skip_if(is_macos)
+end)
 
 g1.after_each(function(cg)
     if cg.server ~= nil then
@@ -41,6 +46,10 @@ g1.test_iproto_export = function(cg)
 end
 
 local g2 = t.group('iproto_export')
+
+g2.before_all(function()
+    t.skip_if(is_macos)
+end)
 
 g2.after_each(function(cg)
     if cg.server ~= nil then
