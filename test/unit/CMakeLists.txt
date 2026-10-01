@@ -99,6 +99,10 @@ endfunction()
 
 add_library(unit STATIC unit.c)
 
+create_unit_test(PREFIX ann
+                 SOURCES ann.c
+                 LIBRARIES ann unit)
+
 create_unit_test(PREFIX heap
                  SOURCES heap.c
                  LIBRARIES unit
