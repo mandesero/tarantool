@@ -46,6 +46,7 @@ enum index_type {
 	TREE,     /* TREE Index */
 	BITSET,   /* BITSET Index */
 	RTREE,    /* R-Tree Index */
+	VECTOR,   /* Vector Index */
 	index_type_MAX,
 };
 

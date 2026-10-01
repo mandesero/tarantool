@@ -36,7 +36,7 @@
 #include "fiber.h"
 #include "tt_static.h"
 
-const char *index_type_strs[] = { "HASH", "TREE", "BITSET", "RTREE" };
+const char *index_type_strs[] = { "HASH", "TREE", "BITSET", "RTREE", "VECTOR" };
 
 const char *rtree_index_distance_type_strs[] = { "EUCLID", "MANHATTAN" };
 

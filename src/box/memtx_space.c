@@ -41,6 +41,7 @@
 #include "memtx_tree.h"
 #include "memtx_rtree.h"
 #include "memtx_bitset.h"
+#include "memtx_vector.h"
 #include "memtx_engine.h"
 #include "column_mask.h"
 #include "sequence.h"
@@ -927,6 +928,48 @@ memtx_space_check_index_def(struct space *space, struct index_def *index_def)
 	case TREE:
 		/* TREE index has no limitations. */
 		break;
+	case VECTOR:
+		if (key_def->part_count != 1) {
+			diag_set(ClientError, ER_MODIFY_INDEX,
+				 index_def->name, space_name(space),
+				 "Vector index key can not be multipart");
+			return -1;
+		}
+		if (index_def->opts.is_unique) {
+			diag_set(ClientError, ER_MODIFY_INDEX,
+				 index_def->name, space_name(space),
+				 "Vector index can not be unique");
+			return -1;
+		}
+		if (key_def->parts[0].type != FIELD_TYPE_ARRAY) {
+			diag_set(ClientError, ER_MODIFY_INDEX,
+				 index_def->name, space_name(space),
+				 "Vector index field type must be ARRAY");
+			return -1;
+		}
+		if (key_def->is_multikey) {
+			diag_set(ClientError, ER_MODIFY_INDEX,
+				 index_def->name, space_name(space),
+				 "Vector index cannot be multikey");
+			return -1;
+		}
+		if (key_def->for_func_index) {
+			diag_set(ClientError, ER_MODIFY_INDEX,
+				 index_def->name, space_name(space),
+				 "Vector index can not use a function");
+			return -1;
+		}
+		if (index_def->opts.dimension < 1 ||
+		    index_def->opts.dimension > MEMTX_VECTOR_MAX_DIMENSION) {
+			diag_set(ClientError, ER_MODIFY_INDEX,
+				 index_def->name, space_name(space),
+				 tt_sprintf("Vector index dimension must be "
+					    "between 1 and %d",
+					    MEMTX_VECTOR_MAX_DIMENSION));
+			return -1;
+		}
+		/* no furter checks of parts needed */
+		return 0;
 	case RTREE:
 		if (key_def->part_count != 1) {
 			diag_set(ClientError, ER_MODIFY_INDEX,
@@ -1089,6 +1132,8 @@ memtx_space_create_index(struct space *space, struct index_def *index_def)
 		return memtx_tree_index_new(memtx, index_def);
 	case RTREE:
 		return memtx_rtree_index_new(memtx, index_def);
+	case VECTOR:
+		return memtx_vector_index_new(memtx, index_def);
 	case BITSET:
 		return memtx_bitset_index_new(memtx, index_def);
 	default:

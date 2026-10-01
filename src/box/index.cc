@@ -107,6 +107,7 @@ iterator_validate(struct index_def *index_def, enum iterator_type type,
 			(1U << ITER_LT) | (1U << ITER_LE) |
 			(1U << ITER_GT) | (1U << ITER_GE) |
 			(1U << ITER_OVERLAPS) | (1U << ITER_NEIGHBOR),
+		/* [VECTOR] = */ (1U << ITER_EQ),
 	};
 	if (((1U << type) & supported_types[index_def->type]) == 0) {
 		diag_set(UnsupportedIndexFeature, index_def,
