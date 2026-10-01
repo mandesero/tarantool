@@ -34,8 +34,10 @@ jobs:
             box-luatest/memtx_vector_ddl_test.lua \
             box-luatest/memtx_vector_select_test.lua \
             box-luatest/memtx_vector_lifecycle_test.lua \
+            box-luatest/memtx_vector_sync_test.lua \
             box-luatest/vector_storage_test.lua \
-            box-luatest/vector_router_test.lua
+            box-luatest/vector_router_test.lua \
+            replication-luatest/vector_index_test.lua
       - name: Run pinned vshard cluster contract
         run: |
           apt-get install -y python3-pip
