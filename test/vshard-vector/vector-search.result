@@ -1,0 +1,5 @@
+-- test-run result file version 2
+assert(dofile(assert(os.getenv('VSHARD_VECTOR_FIXTURE'))))
+ | ---
+ | - true
+ | ...

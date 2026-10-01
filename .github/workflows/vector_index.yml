@@ -1,0 +1,62 @@
+name: vector-index
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  vector-index:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: docker.io/tarantool/testing:ubuntu-focal
+      options: '--init --privileged'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/install-deps-debian
+      - name: Build pinned USearch adapter and Tarantool
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build --target tarantool ann.test \
+            ann_memory.test ann_tuple_map.test ann_usearch.test -j 8
+      - name: Run VECTOR unit and Lua contracts
+        run: |
+          ctest --test-dir build -R '^test/unit/ann.*\.test$' \
+            --output-on-failure
+          python3 test/test-run.py --builddir build \
+            --executable "$PWD/build/src/tarantool" \
+            --vardir /tmp/vector-index-tests \
+            box-luatest/memtx_vector_index_test.lua \
+            box-luatest/memtx_vector_atomic_test.lua \
+            box-luatest/memtx_vector_mvcc_test.lua \
+            box-luatest/memtx_vector_ddl_test.lua \
+            box-luatest/memtx_vector_select_test.lua \
+            box-luatest/memtx_vector_lifecycle_test.lua \
+            box-luatest/vector_storage_test.lua \
+            box-luatest/vector_router_test.lua
+      - name: Run pinned vshard cluster contract
+        run: |
+          apt-get install -y python3-pip
+          python3 -m pip install 'tarantool==0.12'
+          git clone --recursive https://github.com/mandesero/vshard.git \
+            /tmp/vector-vshard
+          git -C /tmp/vector-vshard checkout \
+            674cda708d957cc145aa4f0622804bb5c2f8007a
+          git -C /tmp/vector-vshard submodule update --init --recursive
+          cp test/vshard-vector/localcfg.lua \
+            /tmp/vector-vshard/example/localcfg.lua
+          cp test/vshard-vector/vector-search.test.lua \
+            /tmp/vector-vshard/test/router/vector-search.test.lua
+          cp test/vshard-vector/vector-search.result \
+            /tmp/vector-vshard/test/router/vector-search.result
+          ln -s ../lua_libs/storage_template.lua \
+            /tmp/vector-vshard/test/router/storage_3_a.lua
+          fixture="$GITHUB_WORKSPACE/test/vshard-vector"
+          export VSHARD_VECTOR_FIXTURE="$fixture/fixture.lua"
+          cd /tmp/vector-vshard/test
+          PATH="$GITHUB_WORKSPACE/build/src:$PATH" \
+            python3 test-run.py --suite router \
+            --executable "$GITHUB_WORKSPACE/build/src/tarantool" \
+            --vardir /tmp/vector-vshard-tests -j 1 vector-search
