@@ -29,6 +29,8 @@ struct memtx_vector_index {
 	struct index base;
 	/** Number of scalar coordinates in each vector. */
 	unsigned dimension;
+	/** Numeric distance function configured for this index. */
+	enum ann_metric metric;
 	/** All backend allocations are charged to the memtx quota. */
 	struct ann_quota_memory memory_owner;
 	/** Current HNSW generation. */
@@ -274,8 +276,8 @@ memtx_vector_index_create_iterator(struct index *base, enum iterator_type type,
 	if (rc == 0) {
 		float *query = xregion_alloc_array(region, float,
 					     index->dimension);
-		enum ann_status status = ann_vector_from_double(vector,
-			index->dimension, ANN_COSINE, query);
+			enum ann_status status = ann_vector_from_double(vector,
+			index->dimension, index->metric, query);
 		if (status == ANN_OK) {
 			struct space *space = space_by_id(base->def->space_id);
 			struct txn *txn = in_txn();
@@ -359,7 +361,7 @@ memtx_vector_index_replace(struct index *base, struct tuple *old_tuple,
 		if (extract_vector(&vector, new_tuple, base->def) != 0)
 			goto fail;
 		enum ann_status status = ann_vector_from_double(vector,
-			index->dimension, ANN_COSINE, canonical);
+			index->dimension, index->metric, canonical);
 		if (vector_index_diag(status, "convert") != 0)
 			goto fail;
 		status = ann_tuple_map_prepare(&index->tuples);
@@ -511,8 +513,6 @@ memtx_vector_index_new(struct memtx_engine *memtx, struct index_def *def)
 	assert(def->opts.dimension >= 1 &&
 	       def->opts.dimension <= MEMTX_VECTOR_MAX_DIMENSION);
 
-	// TODO: try different distance types.
-
 	struct memtx_vector_index *index =
 		(struct memtx_vector_index *)xcalloc(1, sizeof(*index));
 	index_create(&index->base, (struct engine *)memtx,
@@ -522,7 +522,25 @@ memtx_vector_index_new(struct memtx_engine *memtx, struct index_def *def)
 	struct ann_memory memory = ann_quota_memory_bind(&index->memory_owner);
 	struct ann_config config = {};
 	config.dimension = def->opts.dimension;
-	config.metric = ANN_COSINE;
+	switch (def->opts.vector_distance) {
+	case VECTOR_INDEX_DISTANCE_L2:
+		config.metric = ANN_L2;
+		break;
+	case VECTOR_INDEX_DISTANCE_COSINE:
+		config.metric = ANN_COSINE;
+		break;
+	case VECTOR_INDEX_DISTANCE_IP:
+		config.metric = ANN_IP;
+		break;
+	default:
+		unreachable();
+	}
+	struct ann_usearch_config algorithm = {
+		def->opts.vector_m,
+		def->opts.vector_ef_construction,
+		def->opts.vector_ef_search,
+	};
+	config.algorithm = &algorithm;
 	enum ann_status status = ann_usearch_ops.create(&config, &memory,
 							  &index->backend);
 	if (vector_index_diag(status, "init") != 0) {
@@ -532,5 +550,6 @@ memtx_vector_index_new(struct memtx_engine *memtx, struct index_def *def)
 	ann_tuple_map_create(&index->tuples, &memory);
 
 	index->dimension = def->opts.dimension;
+	index->metric = config.metric;
 	return &index->base;
 }

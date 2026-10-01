@@ -901,6 +901,14 @@ static int
 memtx_space_check_index_def(struct space *space, struct index_def *index_def)
 {
 	struct key_def *key_def = index_def->key_def;
+	const struct index_opts *opts = &index_def->opts;
+	if (index_def->type != VECTOR &&
+	    (opts->distance_kind == INDEX_DISTANCE_VECTOR ||
+	     opts->vector_algorithm_is_set || opts->vector_opts_is_set)) {
+		diag_set(ClientError, ER_MODIFY_INDEX, index_def->name,
+			 space_name(space), "VECTOR options require a VECTOR index");
+		return -1;
+	}
 
 	if (key_def->is_nullable) {
 		if (index_def->iid == 0) {
@@ -940,6 +948,28 @@ memtx_space_check_index_def(struct space *space, struct index_def *index_def)
 		/* TREE index has no limitations. */
 		break;
 	case VECTOR:
+		if (index_def->iid == 0) {
+			diag_set(ClientError, ER_MODIFY_INDEX,
+				 index_def->name, space_name(space),
+				 "VECTOR must be a secondary index");
+			return -1;
+		}
+		if (opts->distance_kind == INDEX_DISTANCE_RTREE) {
+			diag_set(ClientError, ER_MODIFY_INDEX,
+				 index_def->name, space_name(space),
+				 "RTREE distance is not valid for VECTOR");
+			return -1;
+		}
+		if (opts->vector_m < 4 || opts->vector_m > 64 ||
+		    opts->vector_ef_construction < opts->vector_m ||
+		    opts->vector_ef_construction > 8192 ||
+		    opts->vector_ef_search < 1 ||
+		    opts->vector_ef_search > 8192) {
+			diag_set(ClientError, ER_MODIFY_INDEX,
+				 index_def->name, space_name(space),
+				 "HNSW options are outside server bounds");
+			return -1;
+		}
 		if (key_def->part_count != 1) {
 			diag_set(ClientError, ER_MODIFY_INDEX,
 				 index_def->name, space_name(space),
