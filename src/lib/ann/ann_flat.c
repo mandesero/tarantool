@@ -284,6 +284,18 @@ ann_flat_finish(struct ann_change *change)
 }
 
 static enum ann_status
+ann_flat_set_live(struct ann_backend *backend, uint64_t label, bool live)
+{
+	if (backend == NULL)
+		return ANN_INVALID;
+	int64_t slot = ann_flat_find(backend, label);
+	if (slot < 0)
+		return ANN_NOT_FOUND;
+	backend->entries[slot].live = live;
+	return ANN_OK;
+}
+
+static enum ann_status
 ann_flat_reclaim(struct ann_backend *backend, uint64_t label)
 {
 	if (backend == NULL)
@@ -404,6 +416,7 @@ const struct ann_backend_ops ann_flat_ops = {
 	.apply = ann_flat_apply,
 	.rollback = ann_flat_rollback,
 	.finish = ann_flat_finish,
+	.set_live = ann_flat_set_live,
 	.reclaim = ann_flat_reclaim,
 	.search = ann_flat_search,
 	.stat = ann_flat_stat,

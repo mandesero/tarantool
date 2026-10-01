@@ -107,7 +107,7 @@ search(const struct ann_backend_ops *ops, struct ann_backend *backend,
 static void
 test_lifecycle(const struct ann_backend_ops *ops)
 {
-	plan(17);
+	plan(21);
 	struct owner owner = {};
 	struct ann_memory memory = owner_memory(&owner);
 	struct ann_config config = {2, ANN_L2, nullptr};
@@ -132,6 +132,15 @@ test_lifecycle(const struct ann_backend_ops *ops)
 	is(count, 2, "two candidates found");
 	is(found[0].label, 11, "nearest label is first");
 	is(found[0].distance, 0, "nearest distance is zero");
+	size_t alloc_before = owner.calls;
+	is(ops->set_live(backend, 11, false), ANN_OK,
+	   "existing label deactivates without preparation");
+	is(ops->set_live(backend, 11, true), ANN_OK,
+	   "existing label reactivates without preparation");
+	is(ops->set_live(backend, 33, false), ANN_NOT_FOUND,
+	   "unknown label cannot change visibility");
+	ok(owner.calls == alloc_before,
+	   "visibility compensation makes no allocations");
 	struct ann_change *change = nullptr;
 	is(ops->prepare(backend, ANN_RETIRE, 11, nullptr, 0, &change),
 	   ANN_OK, "retire prepared");

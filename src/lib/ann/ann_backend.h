@@ -149,6 +149,9 @@ struct ann_backend_ops {
 	void (*rollback)(struct ann_change *change);
 	/** Discard the top undo record after commit or rollback. */
 	void (*finish)(struct ann_change *change);
+	/** Change visibility of a retained label without allocation. */
+	enum ann_status (*set_live)(struct ann_backend *backend,
+				    uint64_t label, bool live);
 	/** Release a retired label after external version GC permits it. */
 	enum ann_status (*reclaim)(struct ann_backend *backend,
 				   uint64_t label);

@@ -104,11 +104,19 @@ create_unit_test(PREFIX ann
                  LIBRARIES ann unit)
 
 create_unit_test(PREFIX ann_memory
-                 SOURCES ann_memory.c ${PROJECT_SOURCE_DIR}/src/box/ann_memory.c
+                 SOURCES ann_memory.c ann_errinj.c
+                         ${PROJECT_SOURCE_DIR}/src/box/ann_memory.c
                  LIBRARIES ann unit)
 
+create_unit_test(PREFIX ann_tuple_map
+                 SOURCES ann_tuple_map.c ann_errinj.c
+                         ${PROJECT_SOURCE_DIR}/src/box/ann_tuple_map.c
+                         ${PROJECT_SOURCE_DIR}/src/box/ann_memory.c
+                 LIBRARIES unit)
+
 create_unit_test(PREFIX ann_usearch
-                 SOURCES ann_usearch.cc ${PROJECT_SOURCE_DIR}/src/box/ann_memory.c
+                 SOURCES ann_usearch.cc ann_errinj.c
+                         ${PROJECT_SOURCE_DIR}/src/box/ann_memory.c
                  LIBRARIES ann_usearch ann unit)
 
 create_unit_test(PREFIX heap

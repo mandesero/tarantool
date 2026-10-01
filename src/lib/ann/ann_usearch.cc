@@ -631,6 +631,18 @@ ann_usearch_finish(struct ann_change *change)
 }
 
 static enum ann_status
+ann_usearch_set_live(struct ann_backend *backend, uint64_t label, bool live)
+{
+	if (backend == nullptr)
+		return ANN_INVALID;
+	int64_t slot = ann_usearch_find(backend, label);
+	if (slot < 0)
+		return ANN_NOT_FOUND;
+	backend->entries[slot].live = live;
+	return ANN_OK;
+}
+
+static enum ann_status
 ann_usearch_reclaim(struct ann_backend *backend, uint64_t label)
 {
 	if (backend == nullptr)
@@ -731,6 +743,7 @@ ann_usearch_stat(const struct ann_backend *backend,
 extern "C" const struct ann_backend_ops ann_usearch_ops = {
 	"usearch", ann_usearch_create, ann_usearch_destroy,
 	ann_usearch_reserve, ann_usearch_prepare, ann_usearch_apply,
-	ann_usearch_rollback, ann_usearch_finish, ann_usearch_reclaim,
+	ann_usearch_rollback, ann_usearch_finish, ann_usearch_set_live,
+	ann_usearch_reclaim,
 	ann_usearch_search, ann_usearch_stat,
 };

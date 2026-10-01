@@ -209,6 +209,7 @@ set(box_sources
     memtx_rtree.cc
     memtx_vector.cc
     ann_memory.c
+    ann_tuple_map.c
     memtx_bitset.cc
     memtx_tx.c
     module_cache.c

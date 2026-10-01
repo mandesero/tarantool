@@ -4,6 +4,7 @@
  * Copyright 2026, Tarantool AUTHORS, please see AUTHORS file.
  */
 #include "ann_memory.h"
+#include "errinj.h"
 
 #include <assert.h>
 #include <stddef.h>
@@ -32,6 +33,7 @@ ann_quota_alloc(void *ctx, size_t size)
 	if (owner == NULL || owner->quota == NULL || size == 0 ||
 	    size > SIZE_MAX - sizeof(union ann_quota_block))
 		return NULL;
+	ERROR_INJECT_COUNTDOWN(ERRINJ_VECTOR_ALLOC, return NULL);
 	size_t total = sizeof(union ann_quota_block) + size;
 	ssize_t charged = quota_use(owner->quota, total);
 	if (charged < 0)

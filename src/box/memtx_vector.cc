@@ -17,11 +17,13 @@
 #include "schema.h"
 #include "memtx_engine.h"
 #include "ann_memory.h"
+#include "ann_tuple_map.h"
 #include "lib/ann/ann_numeric.h"
 #include "lib/ann/ann_usearch.h"
 
 #include <cmath>
 
+/** A memtx secondary index backed by one ANN graph. */
 struct memtx_vector_index {
 	/** Generic index interface. */
 	struct index base;
@@ -31,6 +33,8 @@ struct memtx_vector_index {
 	struct ann_quota_memory memory_owner;
 	/** Current HNSW generation. */
 	struct ann_backend *backend;
+	/** Stable labels and retained tuple addresses. */
+	struct ann_tuple_map tuples;
 };
 
 /**
@@ -40,6 +44,7 @@ struct memtx_vector_index {
  */
 #define MEMTX_VECTOR_NEIGHBOURS 32
 
+/** Search results resolved through the index's tuple bindings. */
 struct index_vector_iterator {
 	struct iterator base;
 	/** Neighbours found by the search, nearest first. */
@@ -51,16 +56,6 @@ struct index_vector_iterator {
 	/** Memory pool the iterator was allocated from. */
 	struct mempool *pool;
 };
-
-/**
- * A usearch key is the tuple pointer itself: the index keeps no copy of the
- * data and a search hands the tuples back directly.
- */
-static inline uint64_t
-vector_index_key(struct tuple *tuple)
-{
-	return (uint64_t)(uintptr_t)tuple;
-}
 
 /** Report a backend failure through the Tarantool diagnostic area. */
 static int
@@ -191,8 +186,11 @@ index_vector_iterator_next(struct iterator *i, struct tuple **ret)
 	struct txn *txn = in_txn();
 
 	while (itr->pos < itr->count) {
-		struct tuple *tuple =
-			(struct tuple *)(uintptr_t)itr->keys[itr->pos++];
+		struct memtx_vector_index *vector_index =
+			(struct memtx_vector_index *)index;
+		struct tuple *tuple = (struct tuple *)ann_tuple_map_get(
+			&vector_index->tuples, itr->keys[itr->pos++]);
+		assert(tuple != NULL);
 		tuple = memtx_tx_tuple_clarify(txn, space, tuple, index, 0);
 		if (tuple != NULL) {
 			*ret = tuple;
@@ -291,15 +289,26 @@ memtx_vector_index_replace(struct index *base, struct tuple *old_tuple,
 {
 	(void)mode;
 	struct memtx_vector_index *index = (struct memtx_vector_index *)base;
-	struct ann_change *old_change = NULL;
 	struct ann_change *new_change = NULL;
 	struct ann_search_control control = vector_index_control();
 	*successor = NULL;
+	if (old_tuple == new_tuple) {
+		*result = old_tuple;
+		return 0;
+	}
+	uint64_t old_label = old_tuple == NULL ? 0 :
+		ann_tuple_map_find(&index->tuples, old_tuple);
+	uint64_t new_label = new_tuple == NULL ? 0 :
+		ann_tuple_map_find(&index->tuples, new_tuple);
+	if (old_tuple != NULL && old_label == 0) {
+		vector_index_diag(ANN_NOT_FOUND, "old tuple");
+		return -1;
+	}
 
 	struct region *region = &fiber()->gc;
 	size_t region_svp = region_used(region);
 	float *canonical = NULL;
-	if (new_tuple != NULL) {
+	if (new_tuple != NULL && new_label == 0) {
 		double *vector = xregion_alloc_array(region, double,
 						       index->dimension);
 		canonical = xregion_alloc_array(region, float,
@@ -310,42 +319,48 @@ memtx_vector_index_replace(struct index *base, struct tuple *old_tuple,
 			index->dimension, ANN_COSINE, canonical);
 		if (vector_index_diag(status, "convert") != 0)
 			goto fail;
-	}
-	if (old_tuple != NULL) {
-		enum ann_status status = ann_usearch_ops.prepare(index->backend,
-			ANN_RETIRE, vector_index_key(old_tuple), NULL, 0,
-			&old_change);
-		if (vector_index_diag(status, "retire") != 0)
+		status = ann_tuple_map_prepare(&index->tuples);
+		if (vector_index_diag(status, "tuple map") != 0)
 			goto fail;
-		status = ann_usearch_ops.apply(old_change, &control);
+		new_label = (uint64_t)index->tuples.count + 1;
+		status = ann_usearch_ops.prepare(index->backend,
+			ANN_INSERT, new_label, canonical,
+			index->dimension, &new_change);
+		if (vector_index_diag(status, "prepare") != 0)
+			goto fail;
+	}
+	if (old_label != 0) {
+		enum ann_status status = ann_usearch_ops.set_live(
+			index->backend, old_label, false);
 		if (vector_index_diag(status, "retire") != 0)
 			goto fail;
 	}
 	if (new_tuple != NULL) {
-		enum ann_status status = ann_usearch_ops.prepare(index->backend,
-			ANN_INSERT, vector_index_key(new_tuple), canonical,
-			index->dimension, &new_change);
-		if (vector_index_diag(status, "prepare") != 0)
-			goto fail;
-		status = ann_usearch_ops.apply(new_change, &control);
+		enum ann_status status = new_change == NULL ?
+			ann_usearch_ops.set_live(index->backend, new_label, true) :
+			ann_usearch_ops.apply(new_change, &control);
 		if (vector_index_diag(status, "insert") != 0)
-			goto fail;
+			goto fail_restore_old;
+		if (new_change != NULL) {
+			uint64_t published = ann_tuple_map_insert(&index->tuples,
+								new_tuple);
+			assert(published == new_label);
+			tuple_ref(new_tuple);
+		}
 	}
 	ann_usearch_ops.finish(new_change);
-	ann_usearch_ops.finish(old_change);
-	if (old_tuple != NULL) {
-		enum ann_status status = ann_usearch_ops.reclaim(
-			index->backend, vector_index_key(old_tuple));
-		assert(status == ANN_OK);
-	}
 	region_truncate(region, region_svp);
 	*result = old_tuple;
 	return 0;
+fail_restore_old:
+	if (old_label != 0) {
+		enum ann_status status = ann_usearch_ops.set_live(
+			index->backend, old_label, true);
+		assert(status == ANN_OK);
+	}
 fail:
 	ann_usearch_ops.rollback(new_change);
 	ann_usearch_ops.finish(new_change);
-	ann_usearch_ops.rollback(old_change);
-	ann_usearch_ops.finish(old_change);
 	region_truncate(region, region_svp);
 	return -1;
 }
@@ -363,9 +378,7 @@ static ssize_t
 memtx_vector_index_bsize(struct index *base)
 {
 	struct memtx_vector_index *index = (struct memtx_vector_index *)base;
-	struct ann_backend_stats stats;
-	ann_usearch_ops.stat(index->backend, &stats);
-	return stats.resident_bytes;
+	return index->memory_owner.bytes;
 }
 
 static void
@@ -373,6 +386,12 @@ memtx_vector_index_destroy(struct index *base)
 {
 	struct memtx_vector_index *index = (struct memtx_vector_index *)base;
 	ann_usearch_ops.destroy(index->backend);
+	for (uint32_t i = 0; i < index->tuples.count; ++i) {
+		struct tuple *tuple = (struct tuple *)ann_tuple_map_get(
+			&index->tuples, (uint64_t)i + 1);
+		tuple_unref(tuple);
+	}
+	ann_tuple_map_destroy(&index->tuples);
 	assert(index->memory_owner.blocks == 0);
 	free(index);
 }
@@ -445,6 +464,7 @@ memtx_vector_index_new(struct memtx_engine *memtx, struct index_def *def)
 		free(index);
 		return NULL;
 	}
+	ann_tuple_map_create(&index->tuples, &memory);
 
 	index->dimension = def->opts.dimension;
 	return &index->base;
