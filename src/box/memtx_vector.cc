@@ -173,7 +173,7 @@ vector_index_should_stop(void *ctx)
 	return fiber_is_cancelled();
 }
 
-/** Bound HNSW work by the remaining slice of the current fiber call. */
+/** Bound client HNSW work by the current fiber slice. */
 static struct ann_search_control
 vector_index_control(void)
 {
@@ -181,6 +181,9 @@ vector_index_control(void)
 	control.work_limit = UINT64_MAX;
 	control.now_ns = vector_index_now_ns;
 	control.should_stop = vector_index_should_stop;
+	/* Recovery can rebuild an index for longer than a client slice. */
+	if (!box_is_configured())
+		return control;
 	double deadline = cord()->call_time + cord()->slice.err;
 	if (std::isfinite(deadline) && deadline > 0 &&
 	    deadline < (double)UINT64_MAX / 1000000000.0)
