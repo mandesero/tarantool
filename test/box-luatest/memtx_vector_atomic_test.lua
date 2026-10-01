@@ -92,7 +92,8 @@ g.test_invalid_replace_and_followup = function(cg)
         end), false)
         t.assert_equals(s:get{1}:totable(), {1, {1, 0}, 'a'})
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ'})[1][1], 1)
+                                           {iterator = 'EQ',
+                                            limit = 1})[1][1], 1)
         s:replace{1, {0, 1}, 'b'}
         t.assert_equals(s:get{1}:totable(), {1, {0, 1}, 'b'})
     end)
@@ -104,7 +105,8 @@ g.test_primary_key_and_nonvector_update = function(cg)
         s:insert{1, {1, 0}, 'a'}
         s:update({1}, {{'=', 3, 'b'}})
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ'})[1]:totable(),
+                                           {iterator = 'EQ',
+                                            limit = 1})[1]:totable(),
                         {1, {1, 0}, 'b'})
         t.assert_equals(pcall(function()
             s:update({1}, {{'=', 1, 2}})
@@ -116,11 +118,13 @@ g.test_primary_key_and_nonvector_update = function(cg)
         box.commit()
         t.assert_equals(s:get{1}, nil)
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ'})[1]:totable(),
+                                           {iterator = 'EQ',
+                                            limit = 1})[1]:totable(),
                         {2, {1, 0}, 'b'})
         s:replace{2, {0, 1}, 'c'}
         t.assert_equals(s.index.vec:select({{0, 1}},
-                                           {iterator = 'EQ'})[1][1], 2)
+                                           {iterator = 'EQ',
+                                            limit = 1})[1][1], 2)
     end)
 end
 
@@ -134,7 +138,8 @@ g.test_wal_failure_restores_vector = function(cg)
         t.assert_equals(ok, false)
         t.assert_equals(s:get{1}:totable(), {1, {1, 0}, 'a'})
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ'})[1][1], 1)
+                                           {iterator = 'EQ',
+                                            limit = 1})[1][1], 1)
         s:replace{1, {0, 1}, 'b'}
         t.assert_equals(s:get{1}:totable(), {1, {0, 1}, 'b'})
     end)
@@ -160,7 +165,8 @@ g.test_repeated_replacement_and_delete_rollback = function(cg)
                         1)
         s:delete{1}
         t.assert_equals(#s.index.vec:select({{0, 1}},
-                                            {iterator = 'EQ'}), 0)
+                                            {iterator = 'EQ',
+                                            limit = 1}), 0)
         s:insert{1, {1, 0}, 'a'}
         t.assert_equals(s.index.vec:select({{1, 0}},
                                            {iterator = 'EQ', limit = 1})[1][1],

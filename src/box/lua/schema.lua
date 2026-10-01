@@ -126,6 +126,23 @@ ffi.cdef[[
                    struct port *port, int64_t iterator, uint64_t offset,
                    uint64_t limit);
 
+    struct memtx_vector_search_opts {
+        const char *key;
+        const char *key_end;
+        const char *filter;
+        const char *filter_end;
+        uint32_t limit;
+        uint32_t offset;
+        uint32_t ef_search;
+        uint32_t filter_fieldno;
+        double timeout;
+    };
+    int
+    box_vector_select_ffi(uint32_t space_id, uint32_t index_id,
+                          int64_t iterator,
+                          const struct memtx_vector_search_opts *opts,
+                          struct port *port, double *distances);
+
     enum priv_type {
         PRIV_R = 1,
         PRIV_W = 2,
@@ -2174,7 +2191,138 @@ base_index_mt.get_luac = function(index, key)
     return internal.get(index.space_id, index.id, key)
 end
 
+local function vector_select(index, key, opts)
+    local function invalid(message)
+        box.error(box.error.ILLEGAL_PARAMS, message, 3)
+    end
+    if opts == nil then
+        opts = {}
+    end
+    if type(opts) ~= 'table' then
+        invalid('VECTOR select options must be a table')
+    end
+    for name in pairs(opts) do
+        if name ~= 'iterator' and name ~= 'limit' and
+           name ~= 'with_distance' and name ~= 'timeout' and
+           name ~= 'filter' and name ~= 'opts' then
+            invalid('Unknown VECTOR select option: ' .. tostring(name))
+        end
+    end
+    local iterator = check_iterator_type(opts, false, 3)
+    if iterator ~= box.index.EQ and iterator ~= box.index.NEIGHBOR then
+        invalid('VECTOR does not support requested iterator type')
+    end
+    if key == nil or (type(key) == 'table' and #key == 0) then
+        invalid('VECTOR does not support requested iterator type without key')
+    end
+    local limit = opts.limit
+    if type(limit) ~= 'number' or limit % 1 ~= 0 or
+       limit < 0 or limit > 1024 then
+        invalid('VECTOR limit must be an integer from 0 to 1024')
+    end
+    if opts.with_distance ~= nil and type(opts.with_distance) ~= 'boolean' then
+        invalid('VECTOR with_distance must be boolean')
+    end
+    local timeout = opts.timeout
+    if timeout == nil then
+        timeout = 1
+    end
+    if type(timeout) ~= 'number' or timeout ~= timeout or
+       timeout <= 0 or timeout > 30 then
+        invalid('VECTOR timeout must be in (0, 30]')
+    end
+    local ef_search = 0
+    if opts.opts ~= nil then
+        if type(opts.opts) ~= 'table' then
+            invalid('VECTOR opts must be a table')
+        end
+        for name in pairs(opts.opts) do
+            if name ~= 'ef_search' then
+                invalid('Unknown VECTOR search option: ' .. tostring(name))
+            end
+        end
+        ef_search = opts.opts.ef_search
+        if ef_search == nil then
+            invalid('VECTOR opts requires ef_search')
+        end
+        if type(ef_search) ~= 'number' or ef_search % 1 ~= 0 or
+           ef_search < 1 or ef_search > 8192 then
+            invalid('VECTOR ef_search must be in [1, 8192]')
+        end
+    end
+    local filter_fieldno = 0
+    local filter_values
+    if opts.filter ~= nil then
+        local filter = opts.filter
+        if type(filter) ~= 'table' or type(filter.field) ~= 'string' or
+           type(filter.values) ~= 'table' then
+            invalid('VECTOR filter requires field and values')
+        end
+        for name in pairs(filter) do
+            if name ~= 'field' and name ~= 'values' then
+                invalid('Unknown VECTOR filter option: ' .. tostring(name))
+            end
+        end
+        local format = box.space[index.space_id]:format()
+        for i, field in ipairs(format) do
+            if field.name == filter.field and field.type == 'unsigned' then
+                filter_fieldno = i
+                break
+            end
+        end
+        if filter_fieldno == 0 then
+            invalid('VECTOR filter field must be an unsigned field')
+        end
+        filter_values = filter.values
+        if #filter_values > 65536 then
+            invalid('Too many VECTOR filter values')
+        end
+    end
+    local ibuf = cord_ibuf_take()
+    tuple_encode(ibuf, key, 2)
+    local key_size = ibuf:size()
+    if filter_values ~= nil then
+        tuple_encode(ibuf, filter_values, 2)
+    end
+    local request = ffi.new('struct memtx_vector_search_opts')
+    request.key = ibuf.rpos
+    request.key_end = ibuf.rpos + key_size
+    request.limit = limit
+    request.timeout = timeout
+    request.ef_search = ef_search
+    request.filter_fieldno = filter_fieldno
+    if filter_values ~= nil then
+        request.filter = ibuf.rpos + key_size
+        request.filter_end = ibuf.wpos
+    end
+    local distances = ffi.new('double[1024]')
+    local region_svp = builtin.box_region_used()
+    local rc = builtin.box_vector_select_ffi(index.space_id, index.id,
+                                              iterator, request, port,
+                                              distances)
+    builtin.box_region_truncate(region_svp)
+    cord_ibuf_put(ibuf)
+    if rc ~= 0 then
+        box.error(box.error.last(), 2)
+    end
+    local ret = {}
+    local entry = port_c.first
+    for i = 1, tonumber(port_c.size) do
+        local tuple = tuple_bless(entry.tuple)
+        ret[i] = opts.with_distance and
+                 {tuple = tuple, distance = tonumber(distances[i - 1])} or
+                 tuple
+        entry = entry.next
+    end
+    builtin.port_destroy(port)
+    return ret
+end
+
 base_index_mt.select_ffi = function(index, key, opts)
+    check_index_arg(index, 'select', 2)
+    if index.type == 'VECTOR' then
+        return vector_select(index, key, opts)
+    end
     if builtin.box_read_ffi_is_disabled then
         return base_index_mt.select_luac(index, key, opts)
     end
@@ -2223,6 +2371,9 @@ end
 
 base_index_mt.select_luac = function(index, key, opts)
     check_index_arg(index, 'select', 2)
+    if index.type == 'VECTOR' then
+        return vector_select(index, key, opts)
+    end
     local key = keify(key)
     local key_is_nil = #key == 0
     local iterator, offset, limit, after, fetch_pos =

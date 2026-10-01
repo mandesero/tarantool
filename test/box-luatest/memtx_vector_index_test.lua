@@ -45,7 +45,7 @@ g.test_search_returns_nearest_first = function(cg)
         s:insert{2, {0.9, 0.1, 0}}
         s:insert{3, {0, 1, 0}}
         s:insert{4, {0, 0, 1}}
-        local ids = neighbours({{1, 0, 0}}, {iterator = 'EQ'})
+        local ids = neighbours({{1, 0, 0}}, {iterator = 'EQ', limit = 4})
         t.assert_equals({ids[1], ids[2], #ids}, {1, 2, 4})
         t.assert_equals(#neighbours({{1, 0, 0}}, {iterator = 'EQ', limit = 2}), 2)
         t.assert_equals({s.index.v:len(), s.index.v:bsize() > 0}, {4, true})
@@ -67,11 +67,13 @@ g.test_delete_and_update_are_visible = function(cg)
         s:insert{3, {0, 1, 0}}
 
         s:delete{2}
-        t.assert_equals({neighbours({{1, 0, 0}}, {iterator = 'EQ'}),
+        t.assert_equals({neighbours({{1, 0, 0}},
+                                    {iterator = 'EQ', limit = 2}),
                          s.index.v:len()}, {{1, 3}, 2})
 
         s:replace{3, {0.99, 0.01, 0}}
-        t.assert_equals(neighbours({{1, 0, 0}}, {iterator = 'EQ'}), {1, 3})
+        t.assert_equals(neighbours({{1, 0, 0}},
+                                   {iterator = 'EQ', limit = 2}), {1, 3})
     end)
 end
 
@@ -95,12 +97,14 @@ g.test_search_observes_fiber_slice = function(cg)
         s:insert{1, {1, 0, 0}}
         fiber.set_slice(0)
         local ok, err = pcall(function()
-            return s.index.v:select({{1, 0, 0}}, {iterator = 'EQ'})
+            return s.index.v:select({{1, 0, 0}},
+                                    {iterator = 'EQ', limit = 1})
         end)
         fiber.set_slice(1)
         t.assert_equals(ok, false)
         t.assert_str_contains(tostring(err), 'fiber slice is exceeded')
-        local found = s.index.v:select({{1, 0, 0}}, {iterator = 'EQ'})
+        local found = s.index.v:select({{1, 0, 0}},
+                                       {iterator = 'EQ', limit = 1})
         t.assert_equals({#found, found[1][1]}, {1, 1})
     end)
 end
@@ -130,8 +134,9 @@ g.test_index_grows_past_its_initial_reserve = function(cg)
             s:insert{i, {i / 500, 1 - i / 500, 0}}
         end
         t.assert_equals({s.index.v:len(), #neighbours({{1, 0, 0}},
-                                                      {iterator = 'EQ'})},
-                        {500, 32})
+                                                      {iterator = 'EQ',
+                                                       limit = 500})},
+                        {500, 500})
     end)
 end
 

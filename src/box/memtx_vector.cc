@@ -4,6 +4,8 @@
 #include <small/mempool.h>
 
 #include "index.h"
+#include "box.h"
+#include "port.h"
 #include "memtx_index.h"
 #include "errinj.h"
 #include "fiber.h"
@@ -39,26 +41,6 @@ struct memtx_vector_index {
 	struct ann_tuple_map tuples;
 };
 
-/**
- * How many neighbours one search asks usearch for. The index API does not
- * pass the select limit down, so this is the upper bound on what a single
- * iterator can return.
- */
-#define MEMTX_VECTOR_NEIGHBOURS 32
-
-/** Search results resolved through the index's tuple bindings. */
-struct index_vector_iterator {
-	struct iterator base;
-	/** Neighbours found by the search, nearest first. */
-	uint64_t keys[MEMTX_VECTOR_NEIGHBOURS];
-	/** How many of them were found. */
-	size_t count;
-	/** Position of the next neighbour to return. */
-	size_t pos;
-	/** Memory pool the iterator was allocated from. */
-	struct mempool *pool;
-};
-
 /** Read context shared by the ANN candidate predicate. */
 struct vector_index_filter_ctx {
 	/** Index whose label map is read. */
@@ -67,6 +49,12 @@ struct vector_index_filter_ctx {
 	struct space *space;
 	/** Transaction whose visible version is selected. */
 	struct txn *txn;
+	/** Optional one-based unsigned field number. */
+	uint32_t fieldno;
+	/** Sorted membership set, owned by the fiber region. */
+	const uint64_t *values;
+	/** Number of membership values. */
+	uint32_t value_count;
 };
 
 /** Accept only a candidate's own visible tuple version. */
@@ -77,10 +65,34 @@ vector_index_filter(uint64_t label, void *ctx)
 		(struct vector_index_filter_ctx *)ctx;
 	struct tuple *tuple = (struct tuple *)ann_tuple_map_get(
 		&filter->index->tuples, label);
-	return tuple != NULL &&
-	       ann_usearch_ops.is_live(filter->index->backend, label) &&
-	       memtx_tx_tuple_clarify(filter->txn, filter->space, tuple,
-				      &filter->index->base, 0) == tuple;
+	if (tuple == NULL ||
+	    !ann_usearch_ops.is_live(filter->index->backend, label) ||
+	    memtx_tx_tuple_clarify(filter->txn, filter->space, tuple,
+				   &filter->index->base, 0) != tuple)
+		return false;
+	if (filter->fieldno == 0)
+		return true;
+	const char *field = tuple_field(tuple, filter->fieldno - 1);
+	if (field == NULL || mp_typeof(*field) != MP_UINT)
+		return false;
+	uint64_t value = mp_decode_uint(&field);
+	uint32_t lo = 0, hi = filter->value_count;
+	while (lo < hi) {
+		uint32_t mid = lo + (hi - lo) / 2;
+		if (filter->values[mid] < value)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo < filter->value_count && filter->values[lo] == value;
+}
+
+static int
+vector_u64_compare(const void *left, const void *right)
+{
+	uint64_t a = *(const uint64_t *)left;
+	uint64_t b = *(const uint64_t *)right;
+	return (a > b) - (a < b);
 }
 
 /** Report a backend failure through the Tarantool diagnostic area. */
@@ -96,7 +108,7 @@ vector_index_diag(enum ann_status status, const char *what)
 	} else if (status == ANN_STOPPED) {
 		diag_set(FiberIsCancelled);
 	} else {
-		diag_set(ClientError, ER_SYSTEM,
+		diag_set(IllegalParams,
 			 tt_sprintf("vector index: %s: status %d", what,
 				    (int)status));
 	}
@@ -109,6 +121,16 @@ vector_index_now_ns(void *ctx)
 {
 	(void)ctx;
 	return clock_monotonic64();
+}
+
+/** Apply the query deadline to work done outside the ANN backend. */
+static int
+vector_index_check_deadline(uint64_t deadline)
+{
+	if (vector_index_now_ns(NULL) < deadline)
+		return 0;
+	diag_set(TimedOut);
+	return -1;
 }
 
 /** Cancellation is safe to check in a USearch noexcept traversal. */
@@ -202,128 +224,177 @@ memtx_vector_index_get_internal(struct index *base, const char *key,
 	return -1;
 }
 
-static int
-index_vector_iterator_next(struct iterator *i, struct tuple **ret)
-{
-	struct index_vector_iterator *itr = (struct index_vector_iterator *)i;
-	struct space *space;
-	struct index *index;
-	index_weak_ref_get_checked(&i->index_ref, &space, &index);
-	struct txn *txn = in_txn();
-
-	while (itr->pos < itr->count) {
-		struct memtx_vector_index *vector_index =
-			(struct memtx_vector_index *)index;
-		struct tuple *tuple = (struct tuple *)ann_tuple_map_get(
-			&vector_index->tuples, itr->keys[itr->pos++]);
-		if (tuple == NULL)
-			continue;
-		struct tuple *visible =
-			memtx_tx_tuple_clarify(txn, space, tuple, index, 0);
-		if (visible == tuple) {
-			*ret = tuple;
-			return 0;
-		}
-	}
-	*ret = NULL;
-	return 0;
-}
-
-static void
-index_vector_iterator_free(struct iterator *i)
-{
-	struct index_vector_iterator *itr = (struct index_vector_iterator *)i;
-	mempool_free(itr->pool, itr);
-}
-
-/** Implementation of create_iterator for memtx vector index. */
+/** Generic iterators cannot carry the bounded VECTOR search options. */
 static struct iterator *
 memtx_vector_index_create_iterator(struct index *base, enum iterator_type type,
 				  const char *key, uint32_t part_count,
 				  const char *pos)
 {
+	(void)type;
+	(void)key;
+	(void)part_count;
+	(void)pos;
+	diag_set(UnsupportedIndexFeature, base->def,
+		 "generic iterator; use index:select with a limit");
+	return NULL;
+}
+
+int
+memtx_vector_index_search(struct index *base,
+			  const struct memtx_vector_search_opts *request,
+			  struct port *port, double *distances)
+{
 	struct memtx_vector_index *index = (struct memtx_vector_index *)base;
-	struct memtx_engine *memtx = (struct memtx_engine *)base->engine;
 	struct txn *txn = in_txn();
 	if (txn != NULL && txn->isolation == TXN_ISOLATION_LINEARIZABLE) {
 		diag_set(UnsupportedIndexFeature, base->def,
 			 "linearizable transactions");
-		return NULL;
+		return -1;
 	}
-
-	if (pos != NULL) {
-		diag_set(UnsupportedIndexFeature, base->def, "pagination");
-		return NULL;
+	if (request->limit > 1024 || request->offset != 0 ||
+	    !std::isfinite(request->timeout) || request->timeout <= 0 ||
+	    request->timeout > 30 || request->ef_search > 8192 ||
+	    (request->filter == NULL) != (request->filter_fieldno == 0)) {
+		diag_set(IllegalParams, "Invalid VECTOR search options");
+		return -1;
 	}
-	/*
-	 * A vector index answers one question: which tuples are nearest to
-	 * this vector. Anything else, a full scan included, belongs to
-	 * another index of the space.
-	 */
-	if (type != ITER_EQ || part_count == 0) {
-		diag_set(UnsupportedIndexFeature, base->def,
-			 "iterator type other than EQ with a vector key");
-		return NULL;
-	}
-
+	uint64_t deadline = vector_index_now_ns(NULL) +
+			(uint64_t)(request->timeout * 1000000000.0);
 	struct region *region = &fiber()->gc;
-	size_t region_svp = region_used(region);
-	double *vector = xregion_alloc_array(region, double, index->dimension);
-	int rc = mp_decode_vector_from_key(&vector, index->dimension,
-					   key, part_count);
-	struct ann_candidate candidates[MEMTX_VECTOR_NEIGHBOURS];
+	size_t svp = region_used(region);
+	const char *key = request->key;
+	uint32_t part_count = 0;
+	double *vector = NULL;
+	float *query = NULL;
+	enum ann_status status = ANN_OK;
+	struct ann_candidate *candidates = NULL;
+	struct ann_filter filter = {};
+	struct ann_search_control control = {};
+	struct ann_usearch_search_opts algorithm = {};
+	struct ann_search_opts opts = {};
 	uint32_t count = 0;
-	if (rc == 0) {
-		float *query = xregion_alloc_array(region, float,
-					     index->dimension);
-			enum ann_status status = ann_vector_from_double(vector,
-			index->dimension, index->metric, query);
-		if (status == ANN_OK) {
-			struct space *space = space_by_id(base->def->space_id);
-			struct txn *txn = in_txn();
-			memtx_tx_track_full_scan(txn, space, base);
-			struct vector_index_filter_ctx filter_ctx = {
-				index, space, txn
-			};
-			struct ann_filter filter = {
-				vector_index_filter, &filter_ctx
-			};
-			struct ann_search_control control =
-				vector_index_control();
-			struct ann_search_opts opts = {};
-			opts.candidate_limit = MEMTX_VECTOR_NEIGHBOURS;
-			opts.query_dimension = index->dimension;
-			opts.filter = &filter;
-			opts.control = &control;
-			status = ann_usearch_ops.search(index->backend, query,
-						  &opts, candidates, &count);
+	struct key_def *pk = NULL;
+	uint32_t out_count = 0;
+	struct vector_index_filter_ctx filter_ctx = {};
+	filter_ctx.index = index;
+	filter_ctx.space = space_by_id(base->def->space_id);
+	filter_ctx.txn = txn;
+	filter_ctx.fieldno = request->filter_fieldno;
+	if (request->filter != NULL) {
+		const char *data = request->filter;
+		if (mp_typeof(*data) != MP_ARRAY) {
+			diag_set(IllegalParams, "Invalid VECTOR filter values");
+			goto fail;
 		}
-		rc = vector_index_diag(status, "search");
+		filter_ctx.value_count = mp_decode_array(&data);
+		if (filter_ctx.value_count > 65536) {
+			diag_set(IllegalParams, "Too many VECTOR filter values");
+			goto fail;
+		}
+		uint64_t *values = filter_ctx.value_count == 0 ? NULL :
+			xregion_alloc_array(region, uint64_t,
+					    filter_ctx.value_count);
+		for (uint32_t i = 0; i < filter_ctx.value_count; ++i) {
+			if ((i & 1023) == 0 &&
+			    vector_index_check_deadline(deadline) != 0)
+				goto fail;
+			if (data >= request->filter_end ||
+			    mp_typeof(*data) != MP_UINT) {
+				diag_set(IllegalParams,
+					 "VECTOR filter requires unsigned values");
+				goto fail;
+			}
+			values[i] = mp_decode_uint(&data);
+		}
+		if (data != request->filter_end) {
+			diag_set(IllegalParams, "Invalid VECTOR filter values");
+			goto fail;
+		}
+		if (filter_ctx.value_count > 1)
+			qsort(values, filter_ctx.value_count, sizeof(*values),
+			      vector_u64_compare);
+		filter_ctx.values = values;
 	}
-	region_truncate(region, region_svp);
-	if (rc != 0)
-		return NULL;
-
-	struct index_vector_iterator *it = (struct index_vector_iterator *)
-		mempool_alloc(&memtx->iterator_pool);
-	if (it == NULL) {
-		diag_set(OutOfMemory, sizeof(struct index_vector_iterator),
-			 "memtx_vector_index", "iterator");
-		return NULL;
+	part_count = mp_decode_array(&key);
+	vector = xregion_alloc_array(region, double, index->dimension);
+	if (mp_decode_vector_from_key(&vector, index->dimension, key,
+				      part_count) != 0)
+		goto fail;
+	query = xregion_alloc_array(region, float, index->dimension);
+	status = ann_vector_from_double(vector, index->dimension,
+							index->metric, query);
+	if (vector_index_diag(status, "query") != 0)
+		goto fail;
+	if (vector_index_check_deadline(deadline) != 0)
+		goto fail;
+	if (box_check_slice() != 0)
+		goto fail;
+	if (request->limit == 0) {
+		region_truncate(region, svp);
+		return 0;
 	}
-
-	iterator_create(&it->base, base);
-	it->pool = &memtx->iterator_pool;
-	it->base.next_internal = index_vector_iterator_next;
-	it->base.next = memtx_iterator_next;
-	it->base.position = generic_iterator_position;
-	it->base.free = index_vector_iterator_free;
-	for (uint32_t i = 0; i < count; ++i)
-		it->keys[i] = candidates[i].label;
-	it->count = count;
-	it->pos = 0;
-
-	return (struct iterator *)it;
+	memtx_tx_track_full_scan(txn, filter_ctx.space, base);
+	candidates = xregion_alloc_array(region,
+					struct ann_candidate, request->limit);
+	filter.accept = vector_index_filter;
+	filter.ctx = &filter_ctx;
+	control = vector_index_control();
+	if (control.deadline_ns == 0 || deadline < control.deadline_ns)
+		control.deadline_ns = deadline;
+	control.work_limit = 1ULL << 32;
+	algorithm.expansion = request->ef_search != 0 ?
+		request->ef_search : base->def->opts.vector_ef_search;
+	if (algorithm.expansion < request->limit)
+		algorithm.expansion = request->limit;
+	opts.candidate_limit = request->limit;
+	opts.query_dimension = index->dimension;
+	opts.filter = &filter;
+	opts.control = &control;
+	opts.algorithm = &algorithm;
+	status = ann_usearch_ops.search(index->backend, query, &opts,
+					&candidates[0], &count);
+	if (status == ANN_TIMEOUT &&
+	    vector_index_check_deadline(deadline) != 0)
+		goto fail;
+	if (vector_index_diag(status, "search") != 0)
+		goto fail;
+	/* The backend orders by distance; resolve equal distances by PK. */
+	pk = filter_ctx.space->index[0]->def->key_def;
+	for (uint32_t i = 1; i < count; ++i) {
+		if (vector_index_check_deadline(deadline) != 0)
+			goto fail;
+		struct ann_candidate item = candidates[i];
+		uint32_t j = i;
+		while (j > 0 && candidates[j - 1].distance == item.distance) {
+			struct tuple *left = (struct tuple *)ann_tuple_map_get(
+				&index->tuples, candidates[j - 1].label);
+			struct tuple *right = (struct tuple *)ann_tuple_map_get(
+				&index->tuples, item.label);
+			if (tuple_compare(left, HINT_NONE, right, HINT_NONE,
+					  pk) <= 0)
+				break;
+			candidates[j] = candidates[j - 1];
+			--j;
+		}
+		candidates[j] = item;
+	}
+	for (uint32_t i = 0; i < count; ++i) {
+		if (vector_index_check_deadline(deadline) != 0)
+			goto fail;
+		if (box_check_slice() != 0)
+			goto fail;
+		struct tuple *tuple = (struct tuple *)ann_tuple_map_get(
+			&index->tuples, candidates[i].label);
+		if (tuple == NULL)
+			continue;
+		port_c_add_tuple(port, tuple);
+		distances[out_count++] = candidates[i].distance;
+	}
+	region_truncate(region, svp);
+	return 0;
+fail:
+	region_truncate(region, svp);
+	return -1;
 }
 
 static int

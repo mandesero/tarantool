@@ -57,6 +57,7 @@
 #include "engine.h"
 #include "memtx_engine.h"
 #include "memtx_space.h"
+#include "memtx_vector.h"
 #include "memcs_engine.h"
 #include "quiver_engine.h"
 #include "sysview.h"
@@ -4012,6 +4013,45 @@ box_select_ffi(uint32_t space_id, uint32_t index_id, const char *key,
 	return box_select(space_id, index_id, iterator, offset, limit, key,
 			  key_end, packed_pos, packed_pos_end, update_pos,
 			  port);
+}
+
+/** FFI entry for the local VECTOR select contract. */
+extern "C" int
+box_vector_select_ffi(uint32_t space_id, uint32_t index_id, int64_t iterator,
+		      const struct memtx_vector_search_opts *opts,
+		      struct port *port, double *distances)
+{
+	if (iterator != ITER_EQ && iterator != ITER_NEIGHBOR) {
+		diag_set(IllegalParams, "Invalid VECTOR iterator type");
+		return -1;
+	}
+	struct space *space = space_cache_find(space_id);
+	if (space == NULL || access_check_space(space, PRIV_R) != 0)
+		return -1;
+	struct index *index = index_find(space, index_id);
+	if (index == NULL)
+		return -1;
+	if (index->def->type != VECTOR) {
+		diag_set(IllegalParams, "Index is not VECTOR");
+		return -1;
+	}
+	const char *key = opts->key;
+	uint32_t part_count = mp_decode_array(&key);
+	if (iterator_validate(index->def, (enum iterator_type)iterator,
+			      key, part_count) != 0)
+		return -1;
+	box_run_on_select(space, index, (enum iterator_type)iterator,
+			  opts->key);
+	struct txn *txn;
+	struct txn_ro_savepoint svp;
+	if (txn_begin_ro_stmt(space, &txn, &svp) != 0)
+		return -1;
+	port_c_create(port);
+	int rc = memtx_vector_index_search(index, opts, port, distances);
+	txn_end_ro_stmt(txn, &svp);
+	if (rc != 0)
+		port_destroy(port);
+	return rc;
 }
 
 API_EXPORT int

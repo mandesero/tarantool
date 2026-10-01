@@ -104,6 +104,55 @@ search(const struct ann_backend_ops *ops, struct ann_backend *backend,
 	return ops->search(backend, query, &opts, out, count);
 }
 
+/** Flat defines filtered top-k semantics independently of HNSW recall. */
+static bool
+accept_odd_label(uint64_t label, void *ctx)
+{
+	(void)ctx;
+	return (label & 1) != 0;
+}
+
+static void
+test_filtered_topk(const struct ann_backend_ops *ops)
+{
+	plan(3);
+	struct owner owner = {};
+	struct ann_memory memory = owner_memory(&owner);
+	struct ann_config config = {2, ANN_L2, nullptr};
+	struct ann_backend *backend = nullptr;
+	is(ops->create(&config, &memory, &backend), ANN_OK,
+	   "filtered reference backend creates");
+	bool inserted = true;
+	for (uint64_t label = 1; label <= 80; ++label) {
+		float vector[] = {(float)label, 0};
+		inserted &= insert(ops, backend, label, vector) == ANN_OK;
+	}
+	struct ann_filter filter = {accept_odd_label, nullptr};
+	struct ann_search_control control = {};
+	control.work_limit = 1000000;
+	struct ann_usearch_search_opts algorithm = {128};
+	struct ann_search_opts opts = {};
+	opts.candidate_limit = 10;
+	opts.query_dimension = 2;
+	opts.filter = &filter;
+	opts.control = &control;
+	if (ops == &ann_usearch_ops)
+		opts.algorithm = &algorithm;
+	float query[] = {0, 0};
+	struct ann_candidate found[10];
+	uint32_t count = 0;
+	bool matches = inserted &&
+		ops->search(backend, query, &opts, found, &count) == ANN_OK &&
+		count == 10;
+	for (uint32_t i = 0; matches && i < count; ++i)
+		matches &= found[i].label == 2 * i + 1;
+	ok(matches, "filter runs before limiting candidates");
+	ops->destroy(backend);
+	ok(owner.bytes == 0 && owner.bad_free == 0,
+	   "filtered search releases all memory");
+	check_plan();
+}
+
 static void
 test_lifecycle(const struct ann_backend_ops *ops)
 {
@@ -645,9 +694,11 @@ test_generation_rebuild(void)
 int
 main(void)
 {
-	plan(12);
+	plan(14);
 	test_lifecycle(ann_backend_find("flat"));
 	test_lifecycle(&ann_usearch_ops);
+	test_filtered_topk(ann_backend_find("flat"));
+	test_filtered_topk(&ann_usearch_ops);
 	test_failed_insert();
 	test_interrupted_search();
 	test_failed_search();
