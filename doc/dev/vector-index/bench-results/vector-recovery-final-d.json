@@ -1,0 +1,1 @@
+{"target":"Linux-x86_64-Debug","tuples":5000,"version":"3.9.0-entrypoint-178-gba28b727d","dimension":16,"recovery_seconds":7.0295055317692,"index_memory":{"temporary_peak":352,"generations":{"current":2248065},"total":2248065,"graph":1305473,"retained":0,"lookup":622592,"vectors":320000},"first_search_seconds":0.0022368133068085,"versions":{"live":5000,"retained":0,"retired":0}}
