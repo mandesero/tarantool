@@ -2193,7 +2193,10 @@ end
 
 local function vector_select(index, key, opts)
     local function invalid(message)
-        box.error(box.error.ILLEGAL_PARAMS, message, 3)
+        box.error({code = box.error.VECTOR_INVALID, reason = message}, 3)
+    end
+    local function unsupported(message)
+        box.error({code = box.error.VECTOR_UNSUPPORTED, reason = message}, 3)
     end
     if opts == nil then
         opts = {}
@@ -2210,7 +2213,7 @@ local function vector_select(index, key, opts)
     end
     local iterator = check_iterator_type(opts, false, 3)
     if iterator ~= box.index.EQ and iterator ~= box.index.NEIGHBOR then
-        invalid('VECTOR does not support requested iterator type')
+        unsupported('VECTOR does not support requested iterator type')
     end
     if key == nil or (type(key) == 'table' and #key == 0) then
         invalid('VECTOR does not support requested iterator type without key')

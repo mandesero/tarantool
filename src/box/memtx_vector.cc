@@ -104,7 +104,12 @@ vector_index_diag(enum ann_status status, const char *what)
 	if (status == ANN_OUT_OF_MEMORY) {
 		diag_set(OutOfMemory, 0, "vector index", what);
 	} else if (status == ANN_TIMEOUT) {
-		diag_set(FiberSliceIsExceeded);
+		if (box_check_slice() == 0)
+			diag_set(ClientError, ER_VECTOR_TIMEOUT);
+	} else if (status == ANN_WORK_LIMIT) {
+		diag_set(ClientError, ER_VECTOR_WORK_LIMIT);
+	} else if (status == ANN_INVALID) {
+		diag_set(ClientError, ER_VECTOR_INVALID);
 	} else if (status == ANN_STOPPED) {
 		diag_set(FiberIsCancelled);
 	} else {
@@ -129,7 +134,7 @@ vector_index_check_deadline(uint64_t deadline)
 {
 	if (vector_index_now_ns(NULL) < deadline)
 		return 0;
-	diag_set(TimedOut);
+	diag_set(ClientError, ER_VECTOR_TIMEOUT);
 	return -1;
 }
 
@@ -216,11 +221,12 @@ memtx_vector_index_get_internal(struct index *base, const char *key,
 			       uint32_t part_count, struct tuple **result,
 			       bool is_rw)
 {
+	(void)base;
 	(void)key;
 	(void)part_count;
 	(void)result;
 	(void)is_rw;
-	diag_set(UnsupportedIndexFeature, base->def, "get");
+	diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
 	return -1;
 }
 
@@ -230,12 +236,12 @@ memtx_vector_index_create_iterator(struct index *base, enum iterator_type type,
 				  const char *key, uint32_t part_count,
 				  const char *pos)
 {
+	(void)base;
 	(void)type;
 	(void)key;
 	(void)part_count;
 	(void)pos;
-	diag_set(UnsupportedIndexFeature, base->def,
-		 "generic iterator; use index:select with a limit");
+	diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
 	return NULL;
 }
 
@@ -247,15 +253,14 @@ memtx_vector_index_search(struct index *base,
 	struct memtx_vector_index *index = (struct memtx_vector_index *)base;
 	struct txn *txn = in_txn();
 	if (txn != NULL && txn->isolation == TXN_ISOLATION_LINEARIZABLE) {
-		diag_set(UnsupportedIndexFeature, base->def,
-			 "linearizable transactions");
+		diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
 		return -1;
 	}
 	if (request->limit > 1024 || request->offset != 0 ||
 	    !std::isfinite(request->timeout) || request->timeout <= 0 ||
 	    request->timeout > 30 || request->ef_search > 8192 ||
 	    (request->filter == NULL) != (request->filter_fieldno == 0)) {
-		diag_set(IllegalParams, "Invalid VECTOR search options");
+		diag_set(ClientError, ER_VECTOR_INVALID);
 		return -1;
 	}
 	uint64_t deadline = vector_index_now_ns(NULL) +
@@ -275,6 +280,7 @@ memtx_vector_index_search(struct index *base,
 	uint32_t count = 0;
 	struct key_def *pk = NULL;
 	uint32_t out_count = 0;
+	struct errinj *work_inj = NULL;
 	struct vector_index_filter_ctx filter_ctx = {};
 	filter_ctx.index = index;
 	filter_ctx.space = space_by_id(base->def->space_id);
@@ -283,12 +289,12 @@ memtx_vector_index_search(struct index *base,
 	if (request->filter != NULL) {
 		const char *data = request->filter;
 		if (mp_typeof(*data) != MP_ARRAY) {
-			diag_set(IllegalParams, "Invalid VECTOR filter values");
+			diag_set(ClientError, ER_VECTOR_INVALID);
 			goto fail;
 		}
 		filter_ctx.value_count = mp_decode_array(&data);
 		if (filter_ctx.value_count > 65536) {
-			diag_set(IllegalParams, "Too many VECTOR filter values");
+			diag_set(ClientError, ER_VECTOR_INVALID);
 			goto fail;
 		}
 		uint64_t *values = filter_ctx.value_count == 0 ? NULL :
@@ -300,14 +306,13 @@ memtx_vector_index_search(struct index *base,
 				goto fail;
 			if (data >= request->filter_end ||
 			    mp_typeof(*data) != MP_UINT) {
-				diag_set(IllegalParams,
-					 "VECTOR filter requires unsigned values");
+				diag_set(ClientError, ER_VECTOR_INVALID);
 				goto fail;
 			}
 			values[i] = mp_decode_uint(&data);
 		}
 		if (data != request->filter_end) {
-			diag_set(IllegalParams, "Invalid VECTOR filter values");
+			diag_set(ClientError, ER_VECTOR_INVALID);
 			goto fail;
 		}
 		if (filter_ctx.value_count > 1)
@@ -342,6 +347,9 @@ memtx_vector_index_search(struct index *base,
 	if (control.deadline_ns == 0 || deadline < control.deadline_ns)
 		control.deadline_ns = deadline;
 	control.work_limit = 1ULL << 32;
+	work_inj = errinj(ERRINJ_VECTOR_WORK_LIMIT, ERRINJ_INT);
+	if (work_inj != NULL && work_inj->iparam > 0)
+		control.work_limit = work_inj->iparam;
 	algorithm.expansion = request->ef_search != 0 ?
 		request->ef_search : base->def->opts.vector_ef_search;
 	if (algorithm.expansion < request->limit)
@@ -356,6 +364,10 @@ memtx_vector_index_search(struct index *base,
 	if (status == ANN_TIMEOUT &&
 	    vector_index_check_deadline(deadline) != 0)
 		goto fail;
+	if (status == ANN_TIMEOUT && control.deadline_ns < deadline) {
+		diag_set(FiberSliceIsExceeded);
+		goto fail;
+	}
 	if (vector_index_diag(status, "search") != 0)
 		goto fail;
 	/* The backend orders by distance; resolve equal distances by PK. */

@@ -4022,7 +4022,7 @@ box_vector_select_ffi(uint32_t space_id, uint32_t index_id, int64_t iterator,
 		      struct port *port, double *distances)
 {
 	if (iterator != ITER_EQ && iterator != ITER_NEIGHBOR) {
-		diag_set(IllegalParams, "Invalid VECTOR iterator type");
+		diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
 		return -1;
 	}
 	struct space *space = space_cache_find(space_id);
@@ -4032,7 +4032,7 @@ box_vector_select_ffi(uint32_t space_id, uint32_t index_id, int64_t iterator,
 	if (index == NULL)
 		return -1;
 	if (index->def->type != VECTOR) {
-		diag_set(IllegalParams, "Index is not VECTOR");
+		diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
 		return -1;
 	}
 	const char *key = opts->key;

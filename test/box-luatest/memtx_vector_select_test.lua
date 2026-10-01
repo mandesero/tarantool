@@ -106,9 +106,11 @@ g.test_invalid_options = function(cg)
              filter = {field = 'bucket_id', values = {-1}}},
         }
         for _, opts in ipairs(bad) do
-            t.assert_equals(pcall(function()
+            local ok, err = pcall(function()
                 idx:select(key, opts)
-            end), false)
+            end)
+            t.assert_equals(ok, false)
+            t.assert_equals(err.code, box.error.VECTOR_INVALID)
         end
     end)
 end
@@ -162,14 +164,27 @@ g.test_timeout_and_generic_iterator_rejection = function(cg)
     cg.server:exec(function()
         local s = box.space.vector_select
         s:insert{1, {1, 0}, 1}
-        t.assert_equals(pcall(function()
+        local ok, err = pcall(function()
             s.index.vec:select({{1, 0}}, {
                 iterator = 'neighbor', limit = 1, timeout = 1e-12,
             })
-        end), false)
-        t.assert_equals(pcall(function()
+        end)
+        t.assert_equals(ok, false)
+        t.assert_equals(err.code, box.error.VECTOR_TIMEOUT)
+        ok, err = pcall(function()
             return s.index.vec:pairs({{1, 0}}, {iterator = 'neighbor'})()
-        end), false)
+        end)
+        t.assert_equals(ok, false)
+        t.assert_equals(err.code, box.error.VECTOR_UNSUPPORTED)
+        box.error.injection.set('ERRINJ_VECTOR_WORK_LIMIT', 1)
+        ok, err = pcall(function()
+            return s.index.vec:select({{1, 0}}, {
+                iterator = 'neighbor', limit = 1,
+            })
+        end)
+        box.error.injection.set('ERRINJ_VECTOR_WORK_LIMIT', -1)
+        t.assert_equals(ok, false)
+        t.assert_equals(err.code, box.error.VECTOR_WORK_LIMIT)
     end)
 end
 
@@ -206,6 +221,7 @@ g.test_heartbeat_during_selective_timeout = function(cg)
         heartbeat:join()
         t.assert_equals(ok, false)
         t.assert(result ~= nil)
+        t.assert_equals(result.code, box.error.VECTOR_TIMEOUT)
         -- A 1 ms heartbeat may be delayed, but timeout must stop within
         -- 250 ms on this 2500-row test graph, including result handling.
         t.assert(max_lag < 0.25)
