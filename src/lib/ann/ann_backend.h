@@ -152,6 +152,8 @@ struct ann_backend_ops {
 	/** Change visibility of a retained label without allocation. */
 	enum ann_status (*set_live)(struct ann_backend *backend,
 				    uint64_t label, bool live);
+	/** Query current logical visibility without allocating. */
+	bool (*is_live)(const struct ann_backend *backend, uint64_t label);
 	/** Release a retired label after external version GC permits it. */
 	enum ann_status (*reclaim)(struct ann_backend *backend,
 				   uint64_t label);

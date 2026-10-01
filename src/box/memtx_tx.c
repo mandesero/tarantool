@@ -1613,6 +1613,8 @@ memtx_tx_story_full_unlink_story_gc_step(struct memtx_story *story)
 {
 	for (uint32_t i = 0; i < story->index_count; i++) {
 		struct memtx_story_link *link = &story->link[i];
+		struct memtx_story *top = memtx_tx_story_find_top(story, i);
+		struct index *index = top->link[i].in_index;
 		if (link->newer_story == NULL) {
 			/*
 			 * We are at the top of the chain. That means
@@ -1670,6 +1672,8 @@ memtx_tx_story_full_unlink_story_gc_step(struct memtx_story *story)
 			link->older_story = NULL;
 			link->newer_story = NULL;
 		}
+		if (story->del_psn > 0 && index != NULL)
+			memtx_index_gc_tuple(index, story->tuple);
 	}
 }
 
@@ -2304,6 +2308,19 @@ memtx_tx_handle_gap_write(struct space *space, struct memtx_story *story,
 	}
 }
 
+/** Make a full-index reader depend on a tuple removed from that index. */
+static void
+memtx_tx_handle_full_scan_delete(struct space *space,
+				 struct memtx_story *story, uint32_t ind)
+{
+	struct index *index = space->index[ind];
+	struct gap_item_base *item, *tmp;
+	rlist_foreach_entry_safe(item, &index->read_gaps, in_read_gaps, tmp) {
+		if (item->type == GAP_FULL_SCAN)
+			memtx_tx_track_read_story(item->txn, space, story);
+	}
+}
+
 /**
  * Helper of memtx_tx_history_add_stmt, that sets @a result pointer to
  * @old_tuple and reference is if necessary.
@@ -2467,6 +2484,7 @@ memtx_tx_history_add_delete_stmt(struct txn_stmt *stmt,
 		struct index *index = space->index[i];
 		if (!memtx_tx_tuple_key_is_excluded(del_story->tuple, index,
 						    index->def->key_def)) {
+			memtx_tx_handle_full_scan_delete(space, del_story, i);
 			memtx_tx_handle_counted_write(space, del_story, i);
 		}
 	}

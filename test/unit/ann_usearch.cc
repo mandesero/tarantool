@@ -107,7 +107,7 @@ search(const struct ann_backend_ops *ops, struct ann_backend *backend,
 static void
 test_lifecycle(const struct ann_backend_ops *ops)
 {
-	plan(21);
+	plan(25);
 	struct owner owner = {};
 	struct ann_memory memory = owner_memory(&owner);
 	struct ann_config config = {2, ANN_L2, nullptr};
@@ -118,6 +118,7 @@ test_lifecycle(const struct ann_backend_ops *ops)
 	float second[] = {10, 0};
 	is(insert(ops, backend, 11, first), ANN_OK, "first insert");
 	is(insert(ops, backend, 22, second), ANN_OK, "second insert");
+	ok(ops->is_live(backend, 11), "inserted graph label is live");
 	struct ann_backend_stats stats;
 	ops->stat(backend, &stats);
 	ok(stats.live == 2 && stats.resident_bytes == owner.bytes,
@@ -135,8 +136,10 @@ test_lifecycle(const struct ann_backend_ops *ops)
 	size_t alloc_before = owner.calls;
 	is(ops->set_live(backend, 11, false), ANN_OK,
 	   "existing label deactivates without preparation");
+	ok(!ops->is_live(backend, 11), "deactivated graph label is not live");
 	is(ops->set_live(backend, 11, true), ANN_OK,
 	   "existing label reactivates without preparation");
+	ok(ops->is_live(backend, 11), "reactivated graph label is live");
 	is(ops->set_live(backend, 33, false), ANN_NOT_FOUND,
 	   "unknown label cannot change visibility");
 	ok(owner.calls == alloc_before,
@@ -152,6 +155,7 @@ test_lifecycle(const struct ann_backend_ops *ops)
 	   "retired label is excluded");
 	is(ops->reclaim(backend, 11), ANN_OK,
 	   "visibility GC releases the retired label");
+	ok(!ops->is_live(backend, 11), "reclaimed graph label is not live");
 	is(insert(ops, backend, 11, first), ANN_OK,
 	   "released label can be assigned to a new version");
 	ok(search(ops, backend, first, found, &count) == ANN_OK &&

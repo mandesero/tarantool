@@ -106,8 +106,10 @@ ann_tuple_map_prepare(struct ann_tuple_map *map)
 		return ANN_OUT_OF_MEMORY;
 	}
 	memset(hash, 0, hash_size);
-	for (uint32_t i = 0; i < map->count; ++i)
-		ann_tuple_hash_insert(hash, hash_capacity, tuples[i], i + 1);
+	for (uint32_t i = 0; i < map->count; ++i) {
+		if (tuples[i] != NULL)
+			ann_tuple_hash_insert(hash, hash_capacity, tuples[i], i + 1);
+	}
 	if (map->tuples != NULL)
 		map->memory.free(map->memory.ctx, (void *)map->tuples,
 				 (size_t)map->capacity * sizeof(*map->tuples));
@@ -137,4 +139,33 @@ ann_tuple_map_get(const struct ann_tuple_map *map, uint64_t label)
 {
 	return label == 0 || label > map->count ? NULL :
 	       map->tuples[label - 1];
+}
+
+uint64_t
+ann_tuple_map_remove(struct ann_tuple_map *map, const void *tuple)
+{
+	if (map->hash_capacity == 0)
+		return 0;
+	size_t mask = map->hash_capacity - 1;
+	size_t at = ann_tuple_hash(tuple) & mask;
+	while (map->hash[at] != 0) {
+		uint32_t label = map->hash[at];
+		if (map->tuples[label - 1] == tuple) {
+			map->tuples[label - 1] = NULL;
+			map->hash[at] = 0;
+			at = (at + 1) & mask;
+			while (map->hash[at] != 0) {
+				uint32_t moved = map->hash[at];
+				map->hash[at] = 0;
+				ann_tuple_hash_insert(map->hash,
+						      map->hash_capacity,
+						      map->tuples[moved - 1],
+						      moved);
+				at = (at + 1) & mask;
+			}
+			return label;
+		}
+		at = (at + 1) & mask;
+	}
+	return 0;
 }

@@ -642,6 +642,15 @@ ann_usearch_set_live(struct ann_backend *backend, uint64_t label, bool live)
 	return ANN_OK;
 }
 
+static bool
+ann_usearch_is_live(const struct ann_backend *backend, uint64_t label)
+{
+	if (backend == nullptr)
+		return false;
+	int64_t slot = ann_usearch_find(backend, label);
+	return slot >= 0 && backend->entries[slot].live;
+}
+
 static enum ann_status
 ann_usearch_reclaim(struct ann_backend *backend, uint64_t label)
 {
@@ -744,6 +753,7 @@ extern "C" const struct ann_backend_ops ann_usearch_ops = {
 	"usearch", ann_usearch_create, ann_usearch_destroy,
 	ann_usearch_reserve, ann_usearch_prepare, ann_usearch_apply,
 	ann_usearch_rollback, ann_usearch_finish, ann_usearch_set_live,
+	ann_usearch_is_live,
 	ann_usearch_reclaim,
 	ann_usearch_search, ann_usearch_stat,
 };

@@ -53,6 +53,10 @@ ann_tuple_map_insert(struct ann_tuple_map *map, const void *tuple);
 const void *
 ann_tuple_map_get(const struct ann_tuple_map *map, uint64_t label);
 
+/** Release a binding after version GC, without recycling its label. */
+uint64_t
+ann_tuple_map_remove(struct ann_tuple_map *map, const void *tuple);
+
 #if defined(__cplusplus)
 } /* extern "C" */
 #endif

@@ -57,6 +57,30 @@ struct index_vector_iterator {
 	struct mempool *pool;
 };
 
+/** Read context shared by the ANN candidate predicate. */
+struct vector_index_filter_ctx {
+	/** Index whose label map is read. */
+	struct memtx_vector_index *index;
+	/** Space needed for memtx version clarification. */
+	struct space *space;
+	/** Transaction whose visible version is selected. */
+	struct txn *txn;
+};
+
+/** Accept only a candidate's own visible tuple version. */
+static bool
+vector_index_filter(uint64_t label, void *ctx)
+{
+	struct vector_index_filter_ctx *filter =
+		(struct vector_index_filter_ctx *)ctx;
+	struct tuple *tuple = (struct tuple *)ann_tuple_map_get(
+		&filter->index->tuples, label);
+	return tuple != NULL &&
+	       ann_usearch_ops.is_live(filter->index->backend, label) &&
+	       memtx_tx_tuple_clarify(filter->txn, filter->space, tuple,
+				      &filter->index->base, 0) == tuple;
+}
+
 /** Report a backend failure through the Tarantool diagnostic area. */
 static int
 vector_index_diag(enum ann_status status, const char *what)
@@ -190,9 +214,11 @@ index_vector_iterator_next(struct iterator *i, struct tuple **ret)
 			(struct memtx_vector_index *)index;
 		struct tuple *tuple = (struct tuple *)ann_tuple_map_get(
 			&vector_index->tuples, itr->keys[itr->pos++]);
-		assert(tuple != NULL);
-		tuple = memtx_tx_tuple_clarify(txn, space, tuple, index, 0);
-		if (tuple != NULL) {
+		if (tuple == NULL)
+			continue;
+		struct tuple *visible =
+			memtx_tx_tuple_clarify(txn, space, tuple, index, 0);
+		if (visible == tuple) {
 			*ret = tuple;
 			return 0;
 		}
@@ -216,6 +242,12 @@ memtx_vector_index_create_iterator(struct index *base, enum iterator_type type,
 {
 	struct memtx_vector_index *index = (struct memtx_vector_index *)base;
 	struct memtx_engine *memtx = (struct memtx_engine *)base->engine;
+	struct txn *txn = in_txn();
+	if (txn != NULL && txn->isolation == TXN_ISOLATION_LINEARIZABLE) {
+		diag_set(UnsupportedIndexFeature, base->def,
+			 "linearizable transactions");
+		return NULL;
+	}
 
 	if (pos != NULL) {
 		diag_set(UnsupportedIndexFeature, base->def, "pagination");
@@ -245,11 +277,21 @@ memtx_vector_index_create_iterator(struct index *base, enum iterator_type type,
 		enum ann_status status = ann_vector_from_double(vector,
 			index->dimension, ANN_COSINE, query);
 		if (status == ANN_OK) {
+			struct space *space = space_by_id(base->def->space_id);
+			struct txn *txn = in_txn();
+			memtx_tx_track_full_scan(txn, space, base);
+			struct vector_index_filter_ctx filter_ctx = {
+				index, space, txn
+			};
+			struct ann_filter filter = {
+				vector_index_filter, &filter_ctx
+			};
 			struct ann_search_control control =
 				vector_index_control();
 			struct ann_search_opts opts = {};
 			opts.candidate_limit = MEMTX_VECTOR_NEIGHBOURS;
 			opts.query_dimension = index->dimension;
+			opts.filter = &filter;
 			opts.control = &control;
 			status = ann_usearch_ops.search(index->backend, query,
 						  &opts, candidates, &count);
@@ -290,6 +332,7 @@ memtx_vector_index_replace(struct index *base, struct tuple *old_tuple,
 	(void)mode;
 	struct memtx_vector_index *index = (struct memtx_vector_index *)base;
 	struct ann_change *new_change = NULL;
+	bool retain_old = false;
 	struct ann_search_control control = vector_index_control();
 	*successor = NULL;
 	if (old_tuple == new_tuple) {
@@ -329,7 +372,9 @@ memtx_vector_index_replace(struct index *base, struct tuple *old_tuple,
 		if (vector_index_diag(status, "prepare") != 0)
 			goto fail;
 	}
-	if (old_label != 0) {
+	retain_old = memtx_tx_manager_use_mvcc_engine &&
+		     new_change != NULL;
+	if (old_label != 0 && !retain_old) {
 		enum ann_status status = ann_usearch_ops.set_live(
 			index->backend, old_label, false);
 		if (vector_index_diag(status, "retire") != 0)
@@ -381,6 +426,24 @@ memtx_vector_index_bsize(struct index *base)
 	return index->memory_owner.bytes;
 }
 
+/** Retire a version only after memtx has released all dependent readers. */
+static void
+memtx_vector_index_gc_tuple(struct index *base, struct tuple *tuple)
+{
+	struct memtx_vector_index *index = (struct memtx_vector_index *)base;
+	uint64_t label = ann_tuple_map_find(&index->tuples, tuple);
+	if (label == 0)
+		return;
+	enum ann_status status = ann_usearch_ops.set_live(index->backend,
+							    label, false);
+	assert(status == ANN_OK);
+	status = ann_usearch_ops.reclaim(index->backend, label);
+	assert(status == ANN_OK);
+	uint64_t removed = ann_tuple_map_remove(&index->tuples, tuple);
+	assert(removed == label);
+	tuple_unref(tuple);
+}
+
 static void
 memtx_vector_index_destroy(struct index *base)
 {
@@ -389,7 +452,8 @@ memtx_vector_index_destroy(struct index *base)
 	for (uint32_t i = 0; i < index->tuples.count; ++i) {
 		struct tuple *tuple = (struct tuple *)ann_tuple_map_get(
 			&index->tuples, (uint64_t)i + 1);
-		tuple_unref(tuple);
+		if (tuple != NULL)
+			tuple_unref(tuple);
 	}
 	ann_tuple_map_destroy(&index->tuples);
 	assert(index->memory_owner.blocks == 0);
@@ -433,6 +497,7 @@ static const struct memtx_index_vtab memtx_vector_index_vtab = {
 	/* .reserve = */ generic_memtx_index_reserve,
 	/* .build_next = */ generic_memtx_index_build_next,
 	/* .end_build = */ generic_memtx_index_end_build,
+	/* .gc_tuple = */ memtx_vector_index_gc_tuple,
 };
 struct index *
 memtx_vector_index_new(struct memtx_engine *memtx, struct index_def *def)

@@ -57,6 +57,8 @@ struct memtx_index_vtab {
 	int (*build_next)(struct index *index, struct tuple *tuple);
 	/** Finish index build. */
 	void (*end_build)(struct index *index);
+	/** Release storage for a tuple version approved by memtx story GC. */
+	void (*gc_tuple)(struct index *index, struct tuple *tuple);
 };
 
 static inline int
@@ -76,6 +78,15 @@ memtx_index_replace(struct index *index, struct tuple *old_tuple,
 	struct memtx_index_vtab *vtab = (struct memtx_index_vtab *)index->vtab;
 	return vtab->replace(index, old_tuple, new_tuple, mode, result,
 			     successor);
+}
+
+/** Release version storage when an index implements the optional hook. */
+static inline void
+memtx_index_gc_tuple(struct index *index, struct tuple *tuple)
+{
+	struct memtx_index_vtab *vtab = (struct memtx_index_vtab *)index->vtab;
+	if (vtab->gc_tuple != NULL)
+		vtab->gc_tuple(index, tuple);
 }
 
 static inline void

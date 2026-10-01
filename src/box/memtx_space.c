@@ -319,6 +319,17 @@ memtx_space_replace_all_keys(struct space *space, struct tuple *old_tuple,
 			     enum dup_replace_mode mode,
 			     struct tuple **result)
 {
+	struct txn *txn = in_txn();
+	if (txn != NULL && txn->isolation == TXN_ISOLATION_LINEARIZABLE) {
+		for (uint32_t i = 0; i < space->index_count; ++i) {
+			struct index *index = space->index[i];
+			if (index->def->type == VECTOR) {
+				diag_set(UnsupportedIndexFeature, index->def,
+					 "linearizable transactions");
+				return -1;
+			}
+		}
+	}
 	return memtx_tx_add_stmt(space, old_tuple, new_tuple, mode, result);
 }
 

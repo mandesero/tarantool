@@ -3096,6 +3096,7 @@ static const struct memtx_index_vtab memtx_tree_disabled_index_vtab = {
 	/* .reserve = */ generic_memtx_index_reserve,
 	/* .build_next = */ memtx_tree_disabled_index_build_next,
 	/* .end_build = */ generic_memtx_index_end_build,
+	/* .gc_tuple = */ NULL,
 };
 
 /** Type of index in terms of different vtabs. */
@@ -3170,6 +3171,7 @@ get_memtx_tree_index_vtab(void)
 				    is_func ? memtx_tree_func_index_build_next :
 				    memtx_tree_index_build_next<USE_HINT>,
 		/* .end_build = */ memtx_tree_index_end_build<USE_HINT>,
+		/* .gc_tuple = */ NULL,
 	};
 	return (struct index_vtab *)&vtab;
 }

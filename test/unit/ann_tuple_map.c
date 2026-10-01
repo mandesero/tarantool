@@ -20,7 +20,7 @@ fake_tuple(uintptr_t value)
 int
 main(void)
 {
-	plan(11);
+	plan(16);
 	struct quota quota;
 	quota_init(&quota, 1024 * 1024);
 	struct ann_quota_memory owner;
@@ -58,6 +58,27 @@ main(void)
 	ok(found, "forward and reverse lookup agree after growth");
 	is(ann_tuple_map_find(&map, fake_tuple(101)), 0,
 	   "unknown tuple stays absent");
+	bool removed = true;
+	for (uintptr_t i = 1; i <= 100; i += 2)
+		removed &= ann_tuple_map_remove(&map, fake_tuple(i)) == i;
+	ok(removed, "odd labels can be released");
+	ok(ann_tuple_map_find(&map, fake_tuple(1)) == 0 &&
+	   ann_tuple_map_get(&map, 1) == NULL &&
+	   ann_tuple_map_remove(&map, fake_tuple(1)) == 0,
+	   "released binding is absent in both directions");
+	bool retained = true;
+	for (uintptr_t i = 2; i <= 100; i += 2)
+		retained &= ann_tuple_map_find(&map, fake_tuple(i)) == i;
+	ok(retained, "cluster repair preserves surviving labels");
+	for (uintptr_t i = 101; i <= 200; ++i) {
+		inserted &= ann_tuple_map_prepare(&map) == ANN_OK;
+		inserted &= ann_tuple_map_insert(&map, fake_tuple(i)) == i;
+	}
+	ok(inserted, "growth after release keeps labels monotonic");
+	ok(ann_tuple_map_find(&map, fake_tuple(200)) == 200 &&
+	   ann_tuple_map_find(&map, fake_tuple(2)) == 2 &&
+	   ann_tuple_map_find(&map, fake_tuple(1)) == 0,
+	   "rehash preserves live bindings and leaves holes absent");
 	ann_tuple_map_destroy(&map);
 	ok(owner.blocks == 0 && quota_used(&quota) == 0,
 	   "map destruction returns every quota charge");

@@ -1,0 +1,350 @@
+local server = require('luatest.server')
+local t = require('luatest')
+
+local g = t.group('memtx_vector_mvcc')
+
+g.before_all(function(cg)
+    cg.server = server:new({box_cfg = {memtx_use_mvcc_engine = true}})
+    cg.server:start()
+end)
+
+g.after_all(function(cg)
+    cg.server:drop()
+end)
+
+g.before_each(function(cg)
+    cg.server:exec(function()
+        local s = box.schema.space.create('vector_mvcc')
+        s:format({{name = 'id', type = 'unsigned'},
+                  {name = 'vec', type = 'array'}})
+        s:create_index('pk')
+        s:create_index('vec', {type = 'vector', dimension = 2,
+                               unique = false, parts = {{2, 'array'}}})
+    end)
+end)
+
+g.after_each(function(cg)
+    cg.server:exec(function()
+        box.space.vector_mvcc:drop()
+    end)
+end)
+
+g.test_reader_keeps_vector_version = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.space.vector_mvcc
+        local complete = fiber.channel(1)
+        s:insert{1, {1, 0}}
+        box.begin()
+        local before = s.index.vec:select({{1, 0}},
+                                          {iterator = 'EQ', limit = 1})
+        t.assert_equals(before[1][2], {1, 0})
+        fiber.create(function()
+            complete:put(pcall(function()
+                s:replace{1, {0, 1}}
+                local current = s.index.vec:select({{1, 0}},
+                                                   {iterator = 'EQ', limit = 2})
+                t.assert_equals(#current, 1)
+                t.assert_equals(current[1][2], {0, 1})
+            end))
+        end)
+        t.assert_equals(complete:get(), true)
+        local after = s.index.vec:select({{1, 0}},
+                                         {iterator = 'EQ', limit = 1})
+        box.rollback()
+        t.assert_equals(after[1][2], {1, 0})
+    end)
+end
+
+g.test_reader_keeps_deleted_version = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.space.vector_mvcc
+        local complete = fiber.channel(1)
+        s:insert{1, {1, 0}}
+        box.begin()
+        t.assert_equals(s.index.vec:select({{1, 0}},
+                                           {iterator = 'EQ', limit = 1})[1][1],
+                        1)
+        fiber.create(function()
+            complete:put(pcall(function()
+                s:delete{1}
+                local current = s.index.vec:select({{1, 0}},
+                                                    {iterator = 'EQ', limit = 1})
+                t.assert_equals(current, {})
+            end))
+        end)
+        t.assert_equals(complete:get(), true)
+        t.assert_equals(s.index.vec:select({{1, 0}},
+                                           {iterator = 'EQ', limit = 1})[1][1],
+                        1)
+        box.rollback()
+        box.internal.memtx_tx_gc(100)
+        t.assert_equals(s.index.vec:select({{1, 0}},
+                                           {iterator = 'EQ', limit = 1}), {})
+    end)
+end
+
+g.test_bucket_and_primary_key_versions = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.space.vector_mvcc
+        local complete = fiber.channel(1)
+        s:format({{name = 'id', type = 'unsigned'},
+                  {name = 'vec', type = 'array'},
+                  {name = 'bucket_id', type = 'unsigned'}})
+        s:insert{1, {1, 0}, 1}
+        box.begin()
+        t.assert_equals(s.index.vec:select({{1, 0}},
+                                           {iterator = 'EQ', limit = 1})[1][3],
+                        1)
+        fiber.create(function()
+            complete:put(pcall(function()
+                s:replace{1, {1, 0}, 2}
+                s:delete{1}
+                s:insert{2, {1, 0}, 3}
+                local current = s.index.vec:select({{1, 0}},
+                                                   {iterator = 'EQ', limit = 2})
+                t.assert_equals(#current, 1)
+                t.assert_equals(current[1]:totable(), {2, {1, 0}, 3})
+            end))
+        end)
+        t.assert_equals(complete:get(), true)
+        local old = s.index.vec:select({{1, 0}},
+                                       {iterator = 'EQ', limit = 2})
+        t.assert_equals(#old, 1)
+        t.assert_equals(old[1]:totable(), {1, {1, 0}, 1})
+        box.rollback()
+    end)
+end
+
+g.test_read_your_writes = function(cg)
+    cg.server:exec(function()
+        local s = box.space.vector_mvcc
+        box.begin()
+        s:insert{1, {1, 0}}
+        t.assert_equals(s.index.vec:select({{1, 0}},
+                                           {iterator = 'EQ', limit = 1})[1][1],
+                        1)
+        s:replace{1, {0, 1}}
+        local current = s.index.vec:select({{1, 0}},
+                                           {iterator = 'EQ', limit = 2})
+        t.assert_equals(#current, 1)
+        t.assert_equals(current[1][2], {0, 1})
+        s:delete{1}
+        t.assert_equals(s.index.vec:select({{1, 0}},
+                                           {iterator = 'EQ', limit = 1}), {})
+        box.rollback()
+        t.assert_equals(s.index.vec:select({{1, 0}},
+                                           {iterator = 'EQ', limit = 1}), {})
+    end)
+end
+
+g.test_uncommitted_insert_is_invisible = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.space.vector_mvcc
+        local staged = fiber.channel(1)
+        local release = fiber.channel(1)
+        local complete = fiber.channel(1)
+        local isolations = {'best-effort', 'read-committed',
+                            'read-confirmed'}
+        for id, isolation in ipairs(isolations) do
+            fiber.create(function()
+                complete:put(pcall(function()
+                    box.begin()
+                    s:insert{id, {1, 0}}
+                    staged:put(true)
+                    release:get()
+                    box.commit()
+                end))
+            end)
+            staged:get()
+            box.begin({txn_isolation = isolation})
+            local visible = s.index.vec:select({{1, 0}},
+                                                {iterator = 'EQ', limit = 3})
+            t.assert_equals(#visible, id - 1, isolation)
+            for _, tuple in ipairs(visible) do
+                t.assert_not_equals(tuple[1], id, isolation)
+            end
+            release:put(true)
+            t.assert_equals(complete:get(), true)
+            box.rollback()
+            t.assert_equals(s:get{id}[1], id)
+        end
+    end)
+end
+
+g.test_empty_search_tracks_index = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.space.vector_mvcc
+        local complete = fiber.channel(1)
+        box.begin()
+        t.assert_equals(s.index.vec:select({{1, 0}},
+                                           {iterator = 'EQ', limit = 1}), {})
+        fiber.create(function()
+            complete:put(pcall(function() s:insert{1, {1, 0}} end))
+        end)
+        t.assert_equals(complete:get(), true)
+        local after = s.index.vec:select({{1, 0}},
+                                         {iterator = 'EQ', limit = 1})
+        box.rollback()
+        t.assert_equals(after, {})
+    end)
+end
+
+g.test_distant_update_conflicts_with_index_read = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.space.vector_mvcc
+        local complete = fiber.channel(1)
+        s:insert{1, {0.8, 0.2}}
+        s:insert{2, {-1, 0}}
+        box.begin()
+        local before = s.index.vec:select({{1, 0}},
+                                          {iterator = 'EQ', limit = 1})
+        t.assert_equals(before[1][1], 1)
+        fiber.create(function()
+            complete:put(pcall(function() s:replace{2, {1, 0}} end))
+        end)
+        t.assert_equals(complete:get(), true)
+        local after = s.index.vec:select({{1, 0}},
+                                         {iterator = 'EQ', limit = 1})
+        box.rollback()
+        t.assert_equals(after[1][1], 1)
+    end)
+end
+
+g.test_two_empty_readers_cannot_both_insert = function(cg)
+    cg.server:exec(function()
+        local proxy = require('test.box.lua.txn_proxy')
+        local a = proxy.new()
+        local b = proxy.new()
+        a:begin()
+        b:begin()
+        t.assert_equals(a('box.space.vector_mvcc.index.vec:' ..
+                          'select({{1, 0}}, {iterator = "EQ", limit = 1})'),
+                        {{}})
+        t.assert_equals(b('box.space.vector_mvcc.index.vec:' ..
+                          'select({{1, 0}}, {iterator = "EQ", limit = 1})'),
+                        {{}})
+        a('box.space.vector_mvcc:insert{1, {1, 0}}')
+        b('box.space.vector_mvcc:insert{2, {0, 1}}')
+        local a_commit = a:commit()
+        local b_commit = b:commit()
+        t.assert(a_commit ~= '' or b_commit ~= '')
+    end)
+end
+
+g.test_disjoint_updates_conflict_after_index_read = function(cg)
+    cg.server:exec(function()
+        local proxy = require('test.box.lua.txn_proxy')
+        local s = box.space.vector_mvcc
+        s:insert{1, {1, 0}}
+        s:insert{2, {0, 1}}
+        local a = proxy.new()
+        local b = proxy.new()
+        a:begin()
+        b:begin()
+        t.assert_equals(a('box.space.vector_mvcc.index.vec:' ..
+                          'select({{1, 0}}, {iterator = "EQ", limit = 1})')
+                        [1][1][1], 1)
+        t.assert_equals(b('box.space.vector_mvcc.index.vec:' ..
+                          'select({{0, 1}}, {iterator = "EQ", limit = 1})')
+                        [1][1][1], 2)
+        a('box.space.vector_mvcc:replace{1, {0.9, 0.1}}')
+        b('box.space.vector_mvcc:replace{2, {0.1, 0.9}}')
+        local a_commit = a:commit()
+        local b_commit = b:commit()
+        t.assert(a_commit ~= '' or b_commit ~= '')
+    end)
+end
+
+g.test_distant_delete_conflicts_with_index_read = function(cg)
+    cg.server:exec(function()
+        local proxy = require('test.box.lua.txn_proxy')
+        local s = box.space.vector_mvcc
+        s:insert{1, {1, 0}}
+        s:insert{2, {-1, 0}}
+        local reader = proxy.new()
+        local writer = proxy.new()
+        reader:begin()
+        t.assert_equals(reader('box.space.vector_mvcc.index.vec:' ..
+                               'select({{1, 0}}, '
+                               .. '{iterator = "EQ", limit = 1})')[1][1][1], 1)
+        writer:begin()
+        writer('box.space.vector_mvcc:delete{2}')
+        t.assert_equals(writer:commit(), '')
+        reader('box.space.vector_mvcc:insert{3, {0, 1}}')
+        t.assert_not_equals(reader:commit(), '')
+    end)
+end
+
+g.test_version_gc_after_reader_finishes = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.space.vector_mvcc
+        local complete = fiber.channel(1)
+        s:insert{1, {1, 0}}
+        box.begin()
+        t.assert_equals(s.index.vec:select({{1, 0}},
+                                           {iterator = 'EQ', limit = 1})[1][2],
+                        {1, 0})
+        fiber.create(function()
+            complete:put(pcall(function() s:replace{1, {0, 1}} end))
+        end)
+        t.assert_equals(complete:get(), true)
+        box.internal.memtx_tx_gc(100)
+        t.assert_equals(s.index.vec:select({{1, 0}},
+                                           {iterator = 'EQ', limit = 1})[1][2],
+                        {1, 0})
+        box.rollback()
+        box.internal.memtx_tx_gc(100)
+        t.assert_equals(s.index.vec:select({{0, 1}},
+                                           {iterator = 'EQ', limit = 1})[1][2],
+                        {0, 1})
+        for i = 1, 64 do
+            s:replace{1, {1 / (i + 1), 1}}
+            box.internal.memtx_tx_gc(100)
+        end
+        t.assert_equals(s.index.vec:select({{0, 1}},
+                                           {iterator = 'EQ', limit = 1})[1][1],
+                        1)
+    end)
+end
+
+g.test_deleted_version_gc_and_reinsert = function(cg)
+    cg.server:exec(function()
+        local s = box.space.vector_mvcc
+        s:insert{1, {1, 0}}
+        s:delete{1}
+        box.internal.memtx_tx_gc(100)
+        t.assert_equals(s.index.vec:select({{1, 0}},
+                                           {iterator = 'EQ', limit = 1}), {})
+        s:insert{1, {0, 1}}
+        t.assert_equals(s.index.vec:select({{0, 1}},
+                                           {iterator = 'EQ', limit = 1})[1][2],
+                        {0, 1})
+    end)
+end
+
+g.test_linearizable_rejected_before_dml = function(cg)
+    cg.server:exec(function()
+        local s = box.space.vector_mvcc
+        s:insert{1, {1, 0}}
+        box.begin({txn_isolation = 'linearizable'})
+        t.assert_equals(pcall(function()
+            return s.index.vec:select({{1, 0}},
+                                      {iterator = 'EQ', limit = 1})
+        end), false)
+        t.assert_equals(pcall(function()
+            s:replace{1, {0, 1}}
+        end), false)
+        box.rollback()
+        t.assert_equals(s:get{1}:totable(), {1, {1, 0}})
+        t.assert_equals(s.index.vec:select({{1, 0}},
+                                           {iterator = 'EQ', limit = 1})[1][2],
+                        {1, 0})
+    end)
+end

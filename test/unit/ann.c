@@ -217,7 +217,7 @@ test_numeric(void)
 static void
 test_lifecycle(void)
 {
-	plan(35);
+	plan(38);
 	const struct ann_backend_ops *ops = ann_backend_find("flat");
 	ok(ops != NULL && ann_backend_find("hnsw") == NULL,
 	   "Flat is registered without a production algorithm");
@@ -234,6 +234,7 @@ test_lifecycle(void)
 	is(insert(ops, backend, 2, two), ANN_OK, "insert label two");
 	is(insert(ops, backend, 1, one), ANN_OK, "insert label one");
 	is(insert(ops, backend, 3, three), ANN_OK, "insert label three");
+	ok(ops->is_live(backend, 2), "inserted label is live");
 	is(insert(ops, other, 9, one), ANN_OK, "second owner inserts");
 	struct ann_backend_stats stats;
 	ops->stat(backend, &stats);
@@ -285,6 +286,7 @@ test_lifecycle(void)
 	   "current-view search succeeds");
 	ok(count == 2 && out[0].label == 1,
 	   "retired version hidden by default");
+	ok(!ops->is_live(backend, 2), "retired label is not live");
 	opts.filter = &filter;
 	control = search_control(100);
 	is(ops->search(backend, query, &opts, out, &count), ANN_OK,
@@ -292,6 +294,7 @@ test_lifecycle(void)
 	ok(count == 1 && out[0].label == 2,
 	   "retired version available to older visibility view");
 	is(ops->reclaim(backend, 2), ANN_OK, "retired version reclaimed");
+	ok(!ops->is_live(backend, 2), "reclaimed label is not live");
 	ops->stat(backend, &stats);
 	ok(stats.live == 2 && stats.retired == 0,
 	   "GC updates retained-version counters");
