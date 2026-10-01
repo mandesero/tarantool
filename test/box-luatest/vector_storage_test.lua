@@ -62,6 +62,7 @@ g.test_storage_envelope_and_scope = function(cg)
         t.assert_equals(result.dimension, 2)
         t.assert_equals(result.distance, 'l2')
         t.assert_equals(result.numeric_contract, 'f32_f64_v1')
+        t.assert_equals(result.covered_bucket_ids, {1, 2})
         t.assert_equals(#result.records, 2)
         t.assert_equals({result.records[1].id[1],
                          result.records[1].bucket_id,
@@ -96,8 +97,17 @@ g.test_storage_envelope_and_scope = function(cg)
         request.scope = {kind = 'buckets', bucket_ids = {}}
         result = storage.search(request, 1)
         t.assert_equals(#result.records, 0)
+        t.assert_equals(result.covered_bucket_ids, {})
         local encoded = require('msgpack').encode(result.records)
         t.assert_equals(encoded:byte(1), 0x90)
+        local old_bucket_ids = context.bucket_ids
+        context.bucket_ids = function() return {} end
+        request.scope = {kind = 'all'}
+        result = storage.search(request, 1)
+        encoded = require('msgpack').encode(result.covered_bucket_ids)
+        t.assert_equals(encoded:byte(1), 0x90)
+        context.bucket_ids = old_bucket_ids
+        request.scope = {kind = 'buckets', bucket_ids = {}}
         request.scope.bucket_ids = {[1] = 1, [3] = 2}
         assert_error('Invalid bucket set', function()
             storage.search(request, 1)
@@ -125,7 +135,6 @@ g.test_storage_envelope_and_scope = function(cg)
         assert_error('No remaining storage budget', function()
             storage.search(request, 0)
         end)
-        local old_bucket_ids = context.bucket_ids
         function context:bucket_ids(max_count)
             require('fiber').sleep(0.02)
             return old_bucket_ids(self, max_count)

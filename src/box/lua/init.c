@@ -33,6 +33,7 @@
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
+#include <unicode/uversion.h>
 
 #include "lib/core/fiber.h"
 #include "lib/core/say.h"
@@ -103,6 +104,8 @@ extern char session_lua[],
 	box_utils_lua[],
 	schema_lua[],
 	vector_search_storage_lua[],
+	vector_search_wire_lua[],
+	vector_search_router_lua[],
 	read_view_lua[],
 	load_cfg_lua[],
 	xlog_lua[],
@@ -344,6 +347,10 @@ static const char * const lua_sources_minimal[] = {
 static const char * const lua_sources_main[] = {
 	"box/session", NULL, session_lua,
 	"box/schema", NULL, schema_lua,
+	"box/vector_search/wire", "vector_search.wire",
+	vector_search_wire_lua,
+	"box/vector_search/router", "vector_search.router",
+	vector_search_router_lua,
 	"box/vector_search/storage", "vector_search.storage",
 	vector_search_storage_lua,
 	"box/healthcheck", "internal.healthcheck", healthcheck_lua,
@@ -1005,9 +1012,21 @@ static const struct luaL_Reg boxlib_backup[] = {
 	{NULL, NULL}
 };
 
+static int
+lbox_vector_icu_version(struct lua_State *L)
+{
+	UVersionInfo version;
+	char value[U_MAX_VERSION_STRING_LENGTH];
+	u_getVersion(version);
+	u_versionToString(version, value);
+	lua_pushstring(L, value);
+	return 1;
+}
+
 static const struct luaL_Reg boxlib_internal[] = {
 	{"backup_info", lbox_backup_info},
 	{"recovery_point_create", lbox_recovery_point_create},
+	{"vector_icu_version", lbox_vector_icu_version},
 	{NULL, NULL}
 };
 

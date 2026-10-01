@@ -1,6 +1,7 @@
 local fiber = require('fiber')
 local key_def = require('key_def')
 local msgpack = require('msgpack')
+local wire = require('vector_search.wire')
 
 local M = {}
 local definitions = {}
@@ -104,6 +105,8 @@ local function resolve(def)
         if part.fieldno ~= expected.fieldno or
            part.type ~= expected.type or
            part.collation ~= expected.collation or
+           part.sort_order ~= expected.sort_order or
+           part.scale ~= expected.scale or
            part.is_nullable or part.path ~= nil then
             fail('VECTOR_PROTOCOL', 'Primary key definition has changed')
         end
@@ -116,28 +119,19 @@ local function resolve(def)
 end
 
 local function metadata(def)
-    local parts = array()
-    for i, part in ipairs(def.pk_parts) do
-        parts[i] = {
-            type = part.type,
-            order = part.sort_order or 'asc',
-            fieldno = i,
-            is_nullable = false,
-            collation = part.collation,
-        }
-    end
     return {
         version = 1,
         dimension = def.dimension,
         distance = def.distance,
         scalar = 'float32',
         numeric_contract = 'f32_f64_v1',
-        pk = {parts = parts},
+        pk = def.pk_metadata,
     }
 end
 
 local function envelope(def)
     local result = metadata(def)
+    result.covered_bucket_ids = array()
     result.records = array()
     return result
 end
@@ -157,7 +151,12 @@ local function requested_buckets(request, context, max_buckets)
         if scope.bucket_id ~= nil or scope.bucket_ids ~= nil then
             fail('VECTOR_INVALID', 'Conflicting scope fields')
         end
-        return context:bucket_ids(max_buckets)
+        local protected = context:bucket_ids(max_buckets)
+        local result = array()
+        for i, id in ipairs(protected) do
+            result[i] = id
+        end
+        return result
     end
     local wanted = array()
     if scope.kind == 'bucket' then
@@ -279,16 +278,11 @@ function M.configure(name, opts)
         fail('VECTOR_INVALID', 'authorize must be a function')
     end
     local pk_parts = array()
-    local wire_parts = array()
     for i, part in ipairs(pk.parts) do
         if part.is_nullable or part.path ~= nil then
             fail('VECTOR_UNSUPPORTED', 'Unsupported primary key part')
         end
         pk_parts[i] = part
-        wire_parts[i] = {
-            fieldno = i, type = part.type,
-            collation = part.collation,
-        }
     end
     local ok, storage = pcall(require, 'vshard.storage')
     if not ok or type(storage.call_context) ~= 'function' then
@@ -296,6 +290,7 @@ function M.configure(name, opts)
     end
     vshard_storage = storage
     local stat = index:stat().config
+    local pk_metadata = wire.pk_metadata(pk_parts)
     local definition = {
         space = opts.space,
         space_id = space.id,
@@ -310,7 +305,8 @@ function M.configure(name, opts)
         dimension = stat.dimension,
         distance = stat.distance,
         pk_parts = pk_parts,
-        pk_key_def = key_def.new(wire_parts),
+        pk_metadata = pk_metadata,
+        pk_key_def = wire.key_def(pk_metadata),
         bucket_key_def = key_def.new({{
             fieldno = 1, type = 'unsigned',
         }}),
@@ -364,6 +360,7 @@ function M.search(request, remaining_timeout)
     end
     local rows = index:select({request.query}, select_opts)
     local result = envelope(def)
+    result.covered_bucket_ids = buckets
     result.records = project(rows, def, deadline)
     sort_records(result.records, def)
     remaining(deadline)
