@@ -40,6 +40,8 @@ struct ann_config {
 	uint32_t dimension;
 	/** Distance function shared by all entries and queries. */
 	enum ann_metric metric;
+	/** Optional backend-specific immutable configuration. */
+	const void *algorithm;
 };
 
 /** Allocator whose context owns all retained backend memory. */
@@ -114,6 +116,8 @@ struct ann_backend_stats {
 	uint64_t live;
 	/** Retired records still available to older views. */
 	uint64_t retired;
+	/** Reclaimed navigation slots queued for generation rebuild. */
+	uint64_t reclaimable;
 	/** Allocated entry slots, including unused capacity. */
 	uint64_t capacity;
 	/** Charged bytes currently held by the backend. */
@@ -139,7 +143,8 @@ struct ann_backend_ops {
 				   const float *vector, uint32_t dimension,
 				   struct ann_change **out);
 	/** Publish; a failure must remain safely rollbackable. */
-	enum ann_status (*apply)(struct ann_change *change);
+	enum ann_status (*apply)(struct ann_change *change,
+			 struct ann_search_control *control);
 	/** Restore the previous state without allocation. */
 	void (*rollback)(struct ann_change *change);
 	/** Discard the top undo record after commit or rollback. */

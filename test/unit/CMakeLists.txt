@@ -103,6 +103,14 @@ create_unit_test(PREFIX ann
                  SOURCES ann.c
                  LIBRARIES ann unit)
 
+create_unit_test(PREFIX ann_memory
+                 SOURCES ann_memory.c ${PROJECT_SOURCE_DIR}/src/box/ann_memory.c
+                 LIBRARIES ann unit)
+
+create_unit_test(PREFIX ann_usearch
+                 SOURCES ann_usearch.cc ${PROJECT_SOURCE_DIR}/src/box/ann_memory.c
+                 LIBRARIES ann_usearch ann unit)
+
 create_unit_test(PREFIX heap
                  SOURCES heap.c
                  LIBRARIES unit

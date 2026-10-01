@@ -91,6 +91,7 @@ ann_flat_create(const struct ann_config *config,
 	*out = NULL;
 	if (config == NULL || memory == NULL ||
 	    memory->alloc == NULL || memory->free == NULL ||
+	    config->algorithm != NULL ||
 	    config->dimension == 0 ||
 	    ((size_t)config->dimension * sizeof(float)) / sizeof(float) !=
 		config->dimension ||
@@ -225,11 +226,17 @@ ann_flat_prepare(struct ann_backend *backend, enum ann_change_kind kind,
 }
 
 static enum ann_status
-ann_flat_apply(struct ann_change *change)
+ann_flat_apply(struct ann_change *change,
+	       struct ann_search_control *control)
 {
 	if (change == NULL || change->backend->pending != change ||
 	    change->applied || change->rolled_back)
 		return ANN_INVALID;
+	if (control != NULL) {
+		enum ann_status status = ann_search_control_poll(control);
+		if (status != ANN_OK)
+			return status;
+	}
 	struct ann_backend *backend = change->backend;
 	if (change->kind == ANN_INSERT) {
 		struct ann_flat_entry *entry = &backend->entries[backend->count++];

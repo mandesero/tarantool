@@ -87,7 +87,7 @@ insert(const struct ann_backend_ops *ops, struct ann_backend *backend,
 					     vector, 2, &change);
 	if (status != ANN_OK)
 		return status;
-	status = ops->apply(change);
+	status = ops->apply(change, NULL);
 	ops->finish(change);
 	return status;
 }
@@ -224,7 +224,7 @@ test_lifecycle(void)
 	struct owner first = {0}, second = {0};
 	struct ann_memory first_mem = owner_memory(&first);
 	struct ann_memory second_mem = owner_memory(&second);
-	struct ann_config config = {2, ANN_L2};
+	struct ann_config config = {2, ANN_L2, NULL};
 	struct ann_backend *backend = NULL, *other = NULL;
 	is(ops->create(&config, &first_mem, &backend), ANN_OK,
 	   "first owner creates a backend");
@@ -266,7 +266,7 @@ test_lifecycle(void)
 	struct ann_change *change = NULL;
 	is(ops->prepare(backend, ANN_RETIRE, 2, NULL, 0, &change), ANN_OK,
 	   "retire prepared");
-	is(ops->apply(change), ANN_OK, "retire applied");
+	is(ops->apply(change, NULL), ANN_OK, "retire applied");
 	is(ops->reclaim(backend, 2), ANN_BUSY,
 	   "GC waits for a pending undo record");
 	ops->rollback(change);
@@ -278,7 +278,7 @@ test_lifecycle(void)
 	ok(count == 3, "rollback restores retired version");
 	is(ops->prepare(backend, ANN_RETIRE, 2, NULL, 0, &change), ANN_OK,
 	   "retire prepared again");
-	is(ops->apply(change), ANN_OK, "retire committed");
+	is(ops->apply(change, NULL), ANN_OK, "retire committed");
 	ops->finish(change);
 	control = search_control(100);
 	is(ops->search(backend, query, &opts, out, &count), ANN_OK,
@@ -309,7 +309,7 @@ test_lifecycle(void)
 	config.metric = ANN_L2;
 	is(ops->prepare(backend, ANN_INSERT, 4, one, 2, &change),
 	   ANN_OK, "rollback insert prepared");
-	is(ops->apply(change), ANN_OK, "rollback insert applied");
+	is(ops->apply(change, NULL), ANN_OK, "rollback insert applied");
 	allocations = first.allocations;
 	first.fail_at = allocations + 1;
 	ops->rollback(change);
@@ -331,7 +331,7 @@ test_control(void)
 	const struct ann_backend_ops *ops = ann_backend_find("flat");
 	struct owner owner = {0};
 	struct ann_memory memory = owner_memory(&owner);
-	struct ann_config config = {2, ANN_L2};
+	struct ann_config config = {2, ANN_L2, NULL};
 	struct ann_backend *backend = NULL;
 	is(ops->create(&config, &memory, &backend), ANN_OK,
 	   "control test backend created");
@@ -387,7 +387,7 @@ test_metric_search(void)
 	const struct ann_backend_ops *ops = ann_backend_find("flat");
 	struct owner owner = {0};
 	struct ann_memory memory = owner_memory(&owner);
-	struct ann_config config = {2, ANN_COSINE};
+	struct ann_config config = {2, ANN_COSINE, NULL};
 	struct ann_backend *backend = NULL;
 	is(ops->create(&config, &memory, &backend), ANN_OK,
 	   "cosine backend created");
@@ -437,7 +437,7 @@ test_compound_undo(void)
 	const struct ann_backend_ops *ops = ann_backend_find("flat");
 	struct owner owner = {0};
 	struct ann_memory memory = owner_memory(&owner);
-	struct ann_config config = {2, ANN_L2};
+	struct ann_config config = {2, ANN_L2, NULL};
 	struct ann_backend *backend = NULL;
 	is(ops->create(&config, &memory, &backend), ANN_OK,
 	   "compound backend created");
@@ -447,7 +447,7 @@ test_compound_undo(void)
 	struct ann_change *old_change = NULL, *new_change = NULL;
 	is(ops->prepare(backend, ANN_RETIRE, 1, NULL, 0, &old_change),
 	   ANN_OK, "old version retire prepared");
-	is(ops->apply(old_change), ANN_OK, "old version retired");
+	is(ops->apply(old_change, NULL), ANN_OK, "old version retired");
 	owner.fail_at = owner.allocations + 1;
 	is(ops->prepare(backend, ANN_INSERT, 2, new_vector, 2, &new_change),
 	   ANN_OUT_OF_MEMORY, "new version OOM after old retirement");
@@ -461,10 +461,10 @@ test_compound_undo(void)
 	   "old version survives failed second preparation");
 	is(ops->prepare(backend, ANN_RETIRE, 1, NULL, 0, &old_change),
 	   ANN_OK, "old retire prepared again");
-	is(ops->apply(old_change), ANN_OK, "old retire applied again");
+	is(ops->apply(old_change, NULL), ANN_OK, "old retire applied again");
 	is(ops->prepare(backend, ANN_INSERT, 2, new_vector, 2, &new_change),
 	   ANN_OK, "second change prepared while first undo is held");
-	is(ops->apply(new_change), ANN_OK, "new version published");
+	is(ops->apply(new_change, NULL), ANN_OK, "new version published");
 	ops->stat(backend, &stats);
 	ok(stats.live == 1 && stats.retired == 1,
 	   "both versions coexist before resolution");
@@ -490,7 +490,7 @@ test_failure(void)
 {
 	plan(15);
 	const struct ann_backend_ops *ops = ann_backend_find("flat");
-	struct ann_config config = {2, ANN_L2};
+	struct ann_config config = {2, ANN_L2, NULL};
 	float vector[] = {1, 0};
 	struct owner failed_owner = {.fail_at = 1};
 	struct ann_memory failed_memory = owner_memory(&failed_owner);
