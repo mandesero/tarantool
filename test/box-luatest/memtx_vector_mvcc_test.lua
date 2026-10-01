@@ -314,6 +314,57 @@ g.test_version_gc_after_reader_finishes = function(cg)
     end)
 end
 
+g.test_rebuild_preserves_reader_version = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.space.vector_mvcc
+        local complete = fiber.channel(1)
+        s:insert{1, {1, 0}}
+        box.begin()
+        t.assert_equals(s.index.vec:select({{1, 0}}, {
+            iterator = 'EQ', limit = 1,
+        })[1][2], {1, 0})
+        fiber.create(function()
+            complete:put(pcall(function()
+                s:replace{1, {0, 1}}
+                s.index.vec:rebuild()
+            end))
+        end)
+        t.assert_equals(complete:get(), true)
+        t.assert_equals(s.index.vec:select({{1, 0}}, {
+            iterator = 'EQ', limit = 1,
+        })[1][2], {1, 0})
+        box.rollback()
+        box.internal.memtx_tx_gc(100)
+        t.assert_equals(s.index.vec:select({{0, 1}}, {
+            iterator = 'EQ', limit = 1,
+        })[1][2], {0, 1})
+    end)
+end
+
+g.test_rebuild_releases_retired_capacity = function(cg)
+    cg.server:exec(function()
+        local s = box.space.vector_mvcc
+        for i = 1, 64 do
+            s:replace{1, {i, 0}}
+            box.internal.memtx_tx_gc(100)
+        end
+        local before = s.index.vec:stat()
+        local result = s.index.vec:select({{64, 0}}, {
+            iterator = 'neighbor', limit = 1,
+        })
+        t.assert_equals(result[1][1], 1)
+        s.index.vec:rebuild()
+        local after = s.index.vec:stat()
+        t.assert_equals(after.versions.live, 1)
+        t.assert(after.slots.capacity <= before.slots.capacity)
+        t.assert_lt(after.memory.total, before.memory.total)
+        t.assert_equals(s.index.vec:select({{64, 0}}, {
+            iterator = 'neighbor', limit = 1,
+        })[1][1], 1)
+    end)
+end
+
 g.test_deleted_version_gc_and_reinsert = function(cg)
     cg.server:exec(function()
         local s = box.space.vector_mvcc
@@ -346,5 +397,12 @@ g.test_linearizable_rejected_before_dml = function(cg)
         t.assert_equals(s.index.vec:select({{1, 0}},
                                            {iterator = 'EQ', limit = 1})[1][2],
                         {1, 0})
+        local plain = box.schema.space.create('plain_linearizable')
+        plain:create_index('pk')
+        plain:insert{1}
+        box.begin()
+        t.assert_equals(plain:get{1}[1], 1)
+        box.commit()
+        plain:drop()
     end)
 end

@@ -122,6 +122,12 @@ struct ann_backend_stats {
 	uint64_t capacity;
 	/** Charged bytes currently held by the backend. */
 	uint64_t resident_bytes;
+	/** Canonical vector allocations within resident_bytes. */
+	uint64_t vector_bytes;
+	/** Entry, label lookup, and reclaim arrays within resident_bytes. */
+	uint64_t lookup_bytes;
+	/** Graph and backend metadata within resident_bytes. */
+	uint64_t graph_bytes;
 };
 
 /** C-only contract implemented by Flat and algorithm adapters. */

@@ -20,6 +20,8 @@
 #include "memtx_engine.h"
 #include "ann_memory.h"
 #include "ann_tuple_map.h"
+#include "info/info.h"
+#include "error.h"
 #include "lib/ann/ann_numeric.h"
 #include "lib/ann/ann_usearch.h"
 
@@ -39,7 +41,24 @@ struct memtx_vector_index {
 	struct ann_backend *backend;
 	/** Stable labels and retained tuple addresses. */
 	struct ann_tuple_map tuples;
+	/** Process-local identifier of the active graph generation. */
+	uint64_t generation;
+	/** Cumulative local search requests. */
+	uint64_t search_requests;
+	/** Cumulative failed local search requests. */
+	uint64_t search_errors;
+	/** Cumulative request-deadline expirations. */
+	uint64_t search_timeouts;
+	/** Cumulative backend work units visited by searches. */
+	uint64_t visited_candidates;
+	/** Cumulative predicate rejections, including visibility. */
+	uint64_t filtered_candidates;
+	/** Estimated peak temporary bytes allocated by this layer. */
+	uint64_t temporary_peak;
 };
+
+/** TX-thread-local monotonic diagnostic generation counter. */
+static uint64_t vector_generation_next;
 
 /** Read context shared by the ANN candidate predicate. */
 struct vector_index_filter_ctx {
@@ -68,13 +87,17 @@ vector_index_filter(uint64_t label, void *ctx)
 	if (tuple == NULL ||
 	    !ann_usearch_ops.is_live(filter->index->backend, label) ||
 	    memtx_tx_tuple_clarify(filter->txn, filter->space, tuple,
-				   &filter->index->base, 0) != tuple)
+				   &filter->index->base, 0) != tuple) {
+		++filter->index->filtered_candidates;
 		return false;
+	}
 	if (filter->fieldno == 0)
 		return true;
 	const char *field = tuple_field(tuple, filter->fieldno - 1);
-	if (field == NULL || mp_typeof(*field) != MP_UINT)
+	if (field == NULL || mp_typeof(*field) != MP_UINT) {
+		++filter->index->filtered_candidates;
 		return false;
+	}
 	uint64_t value = mp_decode_uint(&field);
 	uint32_t lo = 0, hi = filter->value_count;
 	while (lo < hi) {
@@ -84,7 +107,11 @@ vector_index_filter(uint64_t label, void *ctx)
 		else
 			hi = mid;
 	}
-	return lo < filter->value_count && filter->values[lo] == value;
+	bool accepted = lo < filter->value_count &&
+			filter->values[lo] == value;
+	if (!accepted)
+		++filter->index->filtered_candidates;
+	return accepted;
 }
 
 static int
@@ -265,6 +292,7 @@ memtx_vector_index_search(struct index *base,
 	}
 	uint64_t deadline = vector_index_now_ns(NULL) +
 			(uint64_t)(request->timeout * 1000000000.0);
+	++index->search_requests;
 	struct region *region = &fiber()->gc;
 	size_t svp = region_used(region);
 	const char *key = request->key;
@@ -281,6 +309,7 @@ memtx_vector_index_search(struct index *base,
 	struct key_def *pk = NULL;
 	uint32_t out_count = 0;
 	struct errinj *work_inj = NULL;
+	uint64_t temporary_bytes = 0;
 	struct vector_index_filter_ctx filter_ctx = {};
 	filter_ctx.index = index;
 	filter_ctx.space = space_by_id(base->def->space_id);
@@ -338,6 +367,11 @@ memtx_vector_index_search(struct index *base,
 		region_truncate(region, svp);
 		return 0;
 	}
+	temporary_bytes = (uint64_t)filter_ctx.value_count * sizeof(uint64_t) +
+		(uint64_t)index->dimension * (sizeof(double) + sizeof(float)) +
+		(uint64_t)request->limit * sizeof(struct ann_candidate);
+	if (temporary_bytes > index->temporary_peak)
+		index->temporary_peak = temporary_bytes;
 	memtx_tx_track_full_scan(txn, filter_ctx.space, base);
 	candidates = xregion_alloc_array(region,
 					struct ann_candidate, request->limit);
@@ -361,6 +395,7 @@ memtx_vector_index_search(struct index *base,
 	opts.algorithm = &algorithm;
 	status = ann_usearch_ops.search(index->backend, query, &opts,
 					&candidates[0], &count);
+	index->visited_candidates += control.work_done;
 	if (status == ANN_TIMEOUT &&
 	    vector_index_check_deadline(deadline) != 0)
 		goto fail;
@@ -405,6 +440,123 @@ memtx_vector_index_search(struct index *base,
 	region_truncate(region, svp);
 	return 0;
 fail:
+	++index->search_errors;
+	if (box_error_code(diag_last_error(diag_get())) ==
+	    ER_VECTOR_TIMEOUT)
+		++index->search_timeouts;
+	region_truncate(region, svp);
+	return -1;
+}
+
+int
+memtx_vector_index_rebuild(struct index *base)
+{
+	struct memtx_vector_index *index = (struct memtx_vector_index *)base;
+	struct ann_usearch_config algorithm = {
+		base->def->opts.vector_m,
+		base->def->opts.vector_ef_construction,
+		base->def->opts.vector_ef_search,
+	};
+	struct ann_config config = {index->dimension, index->metric,
+				    &algorithm};
+	struct ann_memory memory = ann_quota_memory_bind(&index->memory_owner);
+	uint64_t original_bytes = index->memory_owner.bytes;
+	struct ann_backend *replacement = NULL;
+	struct ann_tuple_map replacement_map;
+	ann_tuple_map_create(&replacement_map, &memory);
+	struct region *region = &fiber()->gc;
+	size_t svp = region_used(region);
+	double *decoded = xregion_alloc_array(region, double,
+					       index->dimension);
+	float *canonical = xregion_alloc_array(region, float,
+						index->dimension);
+	struct ann_search_control control = vector_index_control();
+	enum ann_status status = ann_usearch_ops.create(&config, &memory,
+						     &replacement);
+	if (status != ANN_OK)
+		goto fail_status;
+	for (uint32_t i = 0; i < index->tuples.count; ++i) {
+		if (box_check_slice() != 0)
+			goto fail;
+		uint64_t old_label = (uint64_t)i + 1;
+		struct tuple *tuple = (struct tuple *)ann_tuple_map_get(
+			&index->tuples, old_label);
+		if (tuple == NULL)
+			continue;
+		bool live = ann_usearch_ops.is_live(index->backend,
+							old_label);
+		if (extract_vector(&decoded, tuple, base->def) != 0)
+			goto fail;
+		status = ann_vector_from_double(decoded, index->dimension,
+						index->metric, canonical);
+		if (status != ANN_OK)
+			goto fail_status;
+		status = ann_tuple_map_prepare(&replacement_map);
+		if (status != ANN_OK)
+			goto fail_status;
+		uint64_t new_label = (uint64_t)replacement_map.count + 1;
+		struct ann_change *change = NULL;
+		status = ann_usearch_ops.prepare(replacement, ANN_INSERT,
+						new_label, canonical,
+						index->dimension, &change);
+		if (status != ANN_OK)
+			goto fail_status;
+		status = ann_usearch_ops.apply(change, &control);
+		if (status != ANN_OK)
+			ann_usearch_ops.rollback(change);
+		ann_usearch_ops.finish(change);
+		if (status != ANN_OK)
+			goto fail_status;
+		if (!live) {
+			status = ann_usearch_ops.set_live(replacement,
+							 new_label, false);
+			if (status != ANN_OK)
+				goto fail_status;
+		}
+		uint64_t assigned = ann_tuple_map_insert(&replacement_map,
+							     tuple);
+		assert(assigned == new_label);
+		tuple_ref(tuple);
+		uint64_t temporary = index->memory_owner.bytes -
+				     original_bytes;
+		if (temporary > index->temporary_peak)
+			index->temporary_peak = temporary;
+	}
+	{
+		struct ann_backend *old_backend = index->backend;
+		struct ann_tuple_map old_map = index->tuples;
+		index->backend = replacement;
+		index->tuples = replacement_map;
+		index->generation = ++vector_generation_next;
+		ann_usearch_ops.destroy(old_backend);
+		for (uint32_t i = 0; i < old_map.count; ++i) {
+			struct tuple *tuple = (struct tuple *)ann_tuple_map_get(
+				&old_map, (uint64_t)i + 1);
+			if (tuple != NULL)
+				tuple_unref(tuple);
+		}
+		ann_tuple_map_destroy(&old_map);
+	}
+	region_truncate(region, svp);
+	return 0;
+fail_status:
+	vector_index_diag(status, "rebuild");
+fail:
+	if (index->memory_owner.bytes > original_bytes) {
+		uint64_t temporary = index->memory_owner.bytes -
+				     original_bytes;
+		if (temporary > index->temporary_peak)
+			index->temporary_peak = temporary;
+	}
+	for (uint32_t i = 0; i < replacement_map.count; ++i) {
+		struct tuple *tuple = (struct tuple *)ann_tuple_map_get(
+			&replacement_map, (uint64_t)i + 1);
+		if (tuple != NULL)
+			tuple_unref(tuple);
+	}
+	ann_tuple_map_destroy(&replacement_map);
+	if (replacement != NULL)
+		ann_usearch_ops.destroy(replacement);
 	region_truncate(region, svp);
 	return -1;
 }
@@ -511,6 +663,96 @@ memtx_vector_index_bsize(struct index *base)
 	return index->memory_owner.bytes;
 }
 
+/** Report current index-owned bytes and cumulative search counters. */
+static void
+memtx_vector_index_stat(struct index *base, struct info_handler *handler)
+{
+	struct memtx_vector_index *index = (struct memtx_vector_index *)base;
+	struct ann_backend_stats stats;
+	ann_usearch_ops.stat(index->backend, &stats);
+	struct space *space = space_by_id(base->def->space_id);
+	ssize_t current = index_size(space->index[0]);
+	uint64_t live = current > 0 ? (uint64_t)current : 0;
+	uint64_t retained = stats.live > live ? stats.live - live : 0;
+	uint64_t retained_vectors =
+		(retained + stats.retired) * index->dimension * sizeof(float);
+	if (retained_vectors > stats.vector_bytes)
+		retained_vectors = stats.vector_bytes;
+	uint64_t tuple_lookup =
+		(uint64_t)index->tuples.capacity * sizeof(void *) +
+		(uint64_t)index->tuples.hash_capacity * sizeof(uint32_t);
+	uint64_t lookup_bytes = stats.lookup_bytes + tuple_lookup;
+	uint64_t graph_bytes = stats.graph_bytes;
+	uint64_t classified = graph_bytes + stats.vector_bytes + lookup_bytes;
+	if (index->memory_owner.bytes > classified)
+		graph_bytes += index->memory_owner.bytes - classified;
+	const char *distance = "l2";
+	switch (base->def->opts.vector_distance) {
+	case VECTOR_INDEX_DISTANCE_L2:
+		break;
+	case VECTOR_INDEX_DISTANCE_COSINE:
+		distance = "cosine";
+		break;
+	case VECTOR_INDEX_DISTANCE_IP:
+		distance = "ip";
+		break;
+	default:
+		unreachable();
+	}
+	info_begin(handler);
+	info_table_begin(handler, "config");
+	info_append_int(handler, "dimension", index->dimension);
+	info_append_str(handler, "distance", distance);
+	info_append_str(handler, "algorithm", "hnsw");
+	info_append_int(handler, "ef_search", base->def->opts.vector_ef_search);
+	info_table_end(handler);
+	info_table_begin(handler, "versions");
+	info_append_int(handler, "live", live);
+	info_append_int(handler, "retained", retained);
+	info_append_int(handler, "retired", stats.retired);
+	info_table_end(handler);
+	info_table_begin(handler, "slots");
+	info_append_int(handler, "capacity", stats.capacity);
+	info_append_int(handler, "reusable", stats.reclaimable);
+	info_table_end(handler);
+	info_table_begin(handler, "memory");
+	info_append_int(handler, "graph", graph_bytes);
+	info_append_int(handler, "vectors",
+			stats.vector_bytes - retained_vectors);
+	info_append_int(handler, "lookup", lookup_bytes);
+	info_append_int(handler, "retained", retained_vectors);
+	info_append_int(handler, "temporary_peak", index->temporary_peak);
+	info_append_int(handler, "total", index->memory_owner.bytes);
+	info_table_begin(handler, "generations");
+	info_append_int(handler, "current", index->memory_owner.bytes);
+	info_table_end(handler);
+	info_table_end(handler);
+	info_table_begin(handler, "search");
+	info_append_int(handler, "requests", index->search_requests);
+	info_append_int(handler, "errors", index->search_errors);
+	info_append_int(handler, "timeouts", index->search_timeouts);
+	info_append_int(handler, "visited_candidates",
+			index->visited_candidates);
+	info_append_int(handler, "filtered_candidates",
+			index->filtered_candidates);
+	info_table_end(handler);
+	info_table_begin(handler, "hnsw");
+	info_append_int(handler, "generation", index->generation);
+	info_append_int(handler, "m", base->def->opts.vector_m);
+	info_append_int(handler, "ef_construction",
+			base->def->opts.vector_ef_construction);
+	info_table_end(handler);
+	info_end(handler);
+}
+
+static struct index_read_view *
+memtx_vector_index_create_read_view(struct index *base)
+{
+	(void)base;
+	diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
+	return NULL;
+}
+
 /** Retire a version only after memtx has released all dependent readers. */
 static void
 memtx_vector_index_gc_tuple(struct index *base, struct tuple *tuple)
@@ -545,6 +787,23 @@ memtx_vector_index_destroy(struct index *base)
 	free(index);
 }
 
+/** Search width reads the current definition; structural changes rebuild. */
+static bool
+memtx_vector_index_def_change_requires_rebuild(
+	struct index *base, const struct index_def *new_def)
+{
+	if (memtx_index_def_change_requires_rebuild(base, new_def))
+		return true;
+	const struct index_opts *old = &base->def->opts;
+	const struct index_opts *new_opts = &new_def->opts;
+	return old->dimension != new_opts->dimension ||
+	       old->vector_distance != new_opts->vector_distance ||
+	       old->vector_algorithm != new_opts->vector_algorithm ||
+	       old->vector_m != new_opts->vector_m ||
+	       old->vector_ef_construction !=
+		new_opts->vector_ef_construction;
+}
+
 static const struct index_vtab memtx_vector_index_vtab_base = {
 	/* .destroy = */ memtx_vector_index_destroy,
 	/* .commit_create = */ generic_index_commit_create,
@@ -554,7 +813,7 @@ static const struct index_vtab memtx_vector_index_vtab_base = {
 	/* .update_def = */ generic_index_update_def,
 	/* .depends_on_pk = */ generic_index_depends_on_pk,
 	/* .def_change_requires_rebuild = */
-		generic_index_def_change_requires_rebuild,
+		memtx_vector_index_def_change_requires_rebuild,
 	/* .size = */ memtx_vector_index_size,
 	/* .bsize = */ memtx_vector_index_bsize,
 	/* .quantile = */ generic_index_quantile,
@@ -567,9 +826,9 @@ static const struct index_vtab memtx_vector_index_vtab_base = {
 	/* .create_iterator_with_offset = */
 	generic_index_create_iterator_with_offset,
 	/* .create_arrow_stream = */ generic_index_create_arrow_stream,
-	/* .create_read_view = */ generic_index_create_read_view,
+	/* .create_read_view = */ memtx_vector_index_create_read_view,
 	/* .info = */ generic_index_info,
-	/* .stat = */ generic_index_stat,
+	/* .stat = */ memtx_vector_index_stat,
 	/* .compact = */ generic_index_compact,
 	/* .reset_stat = */ generic_index_reset_stat,
 };
@@ -634,5 +893,6 @@ memtx_vector_index_new(struct memtx_engine *memtx, struct index_def *def)
 
 	index->dimension = def->opts.dimension;
 	index->metric = config.metric;
+	index->generation = ++vector_generation_next;
 	return &index->base;
 }

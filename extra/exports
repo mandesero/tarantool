@@ -131,6 +131,7 @@ box_schema_upgrade_end
 box_schema_version
 box_select_ffi
 box_vector_select_ffi
+box_vector_rebuild_ffi
 box_sequence_current
 box_sequence_next
 box_sequence_reset

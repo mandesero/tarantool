@@ -741,12 +741,20 @@ ann_usearch_stat(const struct ann_backend *backend,
 	out->capacity = backend->capacity;
 	out->reclaimable = backend->reclaim_count;
 	out->resident_bytes = backend->retained_bytes;
+	out->lookup_bytes = (uint64_t)backend->capacity *
+		(sizeof(*backend->entries) + sizeof(*backend->reclaim_queue)) +
+		(uint64_t)backend->lookup_capacity * sizeof(*backend->lookup);
 	for (uint32_t i = 0; i < backend->graph.size(); ++i) {
+		if (backend->entries[i].vector != nullptr)
+			out->vector_bytes += (uint64_t)backend->config.dimension *
+					     sizeof(float);
 		if (backend->entries[i].live)
 			++out->live;
 		else
 			++out->retired;
 	}
+	out->graph_bytes = out->resident_bytes - out->lookup_bytes -
+			   out->vector_bytes;
 }
 
 extern "C" const struct ann_backend_ops ann_usearch_ops = {

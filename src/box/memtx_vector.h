@@ -41,6 +41,10 @@ memtx_vector_index_search(struct index *index,
 			  const struct memtx_vector_search_opts *opts,
 			  struct port *port, double *distances);
 
+/** Replace the graph and tuple-label generation after a successful replay. */
+int
+memtx_vector_index_rebuild(struct index *index);
+
 #if defined(__cplusplus)
 } /* extern "C" */
 #endif /* defined(__cplusplus) */

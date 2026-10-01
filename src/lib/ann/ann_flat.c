@@ -407,12 +407,19 @@ ann_flat_stat(const struct ann_backend *backend, struct ann_backend_stats *out)
 	memset(out, 0, sizeof(*out));
 	out->capacity = backend->capacity;
 	out->resident_bytes = backend->resident_bytes;
+	out->lookup_bytes = (uint64_t)backend->capacity *
+			    sizeof(*backend->entries);
 	for (uint32_t i = 0; i < backend->count; ++i) {
+		if (backend->entries[i].vector != NULL)
+			out->vector_bytes += (uint64_t)backend->config.dimension *
+					     sizeof(float);
 		if (backend->entries[i].live)
 			++out->live;
 		else
 			++out->retired;
 	}
+	out->graph_bytes = out->resident_bytes - out->lookup_bytes -
+			   out->vector_bytes;
 }
 
 /** Flat operations registered for the internal reference backend. */

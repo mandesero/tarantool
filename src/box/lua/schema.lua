@@ -142,6 +142,8 @@ ffi.cdef[[
                           int64_t iterator,
                           const struct memtx_vector_search_opts *opts,
                           struct port *port, double *distances);
+    int
+    box_vector_rebuild_ffi(uint32_t space_id, uint32_t index_id);
 
     enum priv_type {
         PRIV_R = 1,
@@ -2411,6 +2413,16 @@ end
 
 base_index_mt.compact = function(index)
     return internal.compact(index.space_id, index.id)
+end
+
+base_index_mt.rebuild = function(index)
+    check_index_arg(index, 'rebuild', 2)
+    if index.type ~= 'VECTOR' then
+        box.error(box.error.VECTOR_UNSUPPORTED, 2)
+    end
+    if builtin.box_vector_rebuild_ffi(index.space_id, index.id) ~= 0 then
+        box.error(box.error.last(), 2)
+    end
 end
 
 base_index_mt.drop = function(index)
