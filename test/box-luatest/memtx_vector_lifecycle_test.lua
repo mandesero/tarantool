@@ -117,6 +117,36 @@ g.test_snapshot_then_wal_updates = function(cg)
     end)
 end
 
+g.test_large_snapshot_recovers_beyond_client_slice = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('vector_recovery_large')
+        s:format({{name = 'id', type = 'unsigned'},
+                  {name = 'vec', type = 'array'}})
+        s:create_index('pk')
+        for id = 1, 1000 do
+            local vector = {}
+            for j = 1, 16 do
+                vector[j] = ((id * 37 + j * 19) % 1000) / 500 - 1
+            end
+            s:insert{id, vector}
+        end
+        fiber.set_slice(120)
+        s:create_index('vec', {type = 'vector', dimension = 16,
+                               distance = 'l2', unique = false,
+                               parts = {{2, 'array'}}})
+        fiber.set_slice(1)
+        box.snapshot()
+    end)
+    cg.server:restart()
+    cg.server:exec(function()
+        local s = box.space.vector_recovery_large
+        t.assert_equals(s:len(), 1000)
+        t.assert_equals(s.index.vec:stat().versions.live, 1000)
+        s:drop()
+    end)
+end
+
 g.test_rebuild_failure_and_generation_switch = function(cg)
     cg.server:exec(function()
         local s = box.space.vector_lifecycle
