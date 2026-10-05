@@ -1,0 +1,38 @@
+name: vector-index
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  vector-index:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: docker.io/tarantool/testing:ubuntu-focal
+      options: '--init --privileged'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/install-deps-debian
+      - name: Build pinned USearch adapter and Tarantool
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build --target tarantool ann.test \
+            ann_memory.test ann_tuple_map.test ann_usearch.test -j 8
+      - name: Run VECTOR unit and Lua contracts
+        run: |
+          ctest --test-dir build -R '^test/unit/ann.*\.test$' \
+            --output-on-failure
+          python3 test/test-run.py --builddir build \
+            --executable "$PWD/build/src/tarantool" \
+            --vardir /tmp/vector-index-tests \
+            box-luatest/memtx_vector_index_test.lua \
+            box-luatest/memtx_vector_atomic_test.lua \
+            box-luatest/memtx_vector_mvcc_test.lua \
+            box-luatest/memtx_vector_ddl_test.lua \
+            box-luatest/memtx_vector_select_test.lua \
+            box-luatest/memtx_vector_lifecycle_test.lua \
+            box-luatest/memtx_vector_sync_test.lua \
+            replication-luatest/vector_index_test.lua
