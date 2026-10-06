@@ -62,10 +62,32 @@ g.test_statistics_and_read_view_rejection = function(cg)
         local stat = s.index.vec:stat()
         t.assert_equals(stat.config.dimension, 2)
         t.assert_equals(stat.config.distance, 'l2')
+        t.assert_equals(stat.config.scalar, 'float32')
+        t.assert_equals(stat.config.numeric_contract, 'f32_f64_v1')
+        t.assert_equals(stat.limits, {
+            dimension = 4096, limit = 1024, ef_search = 8192,
+            filter_values = 65536, timeout = 30, default_timeout = 1,
+            work = 2^32,
+        })
         t.assert_equals(stat.versions.live, 2)
         t.assert(stat.slots.capacity >= 2)
         t.assert_equals(stat.search.requests, 1)
         t.assert(stat.search.filtered_candidates >= 1)
+        t.assert(stat.search.duration_ns > 0)
+        local duration = stat.search.duration_ns
+        s.index.vec:select({{1, 0}}, {iterator = 'neighbor', limit = 0})
+        t.assert(s.index.vec:stat().search.duration_ns > duration)
+        duration = s.index.vec:stat().search.duration_ns
+        local ok = pcall(function()
+            s.index.vec:select({{0/0, 0}}, {
+                iterator = 'neighbor', limit = 1,
+            })
+        end)
+        t.assert_equals(ok, false)
+        stat = s.index.vec:stat()
+        t.assert_equals(stat.search.requests, 3)
+        t.assert_equals(stat.search.errors, 1)
+        t.assert(stat.search.duration_ns > duration)
         t.assert_equals(stat.memory.total, s.index.vec:bsize())
         local categories = stat.memory.graph + stat.memory.vectors +
                            stat.memory.lookup + stat.memory.retained

@@ -49,6 +49,8 @@ struct memtx_vector_index {
 	uint64_t search_errors;
 	/** Cumulative request-deadline expirations. */
 	uint64_t search_timeouts;
+	/** Cumulative time in admitted local searches, including failures. */
+	uint64_t search_duration_ns;
 	/** Cumulative backend work units visited by searches. */
 	uint64_t visited_candidates;
 	/** Cumulative predicate rejections, including visibility. */
@@ -293,7 +295,8 @@ memtx_vector_index_search(struct index *base,
 		diag_set(ClientError, ER_VECTOR_INVALID);
 		return -1;
 	}
-	uint64_t deadline = vector_index_now_ns(NULL) +
+	uint64_t started = vector_index_now_ns(NULL);
+	uint64_t deadline = started +
 			(uint64_t)(request->timeout * 1000000000.0);
 	++index->search_requests;
 	struct region *region = &fiber()->gc;
@@ -368,6 +371,8 @@ memtx_vector_index_search(struct index *base,
 		goto fail;
 	if (request->limit == 0) {
 		region_truncate(region, svp);
+		index->search_duration_ns +=
+			vector_index_now_ns(NULL) - started;
 		return 0;
 	}
 	temporary_bytes = (uint64_t)filter_ctx.value_count * sizeof(uint64_t) +
@@ -441,6 +446,7 @@ memtx_vector_index_search(struct index *base,
 		distances[out_count++] = candidates[i].distance;
 	}
 	region_truncate(region, svp);
+	index->search_duration_ns += vector_index_now_ns(NULL) - started;
 	return 0;
 fail:
 	++index->search_errors;
@@ -448,6 +454,7 @@ fail:
 	    ER_VECTOR_TIMEOUT)
 		++index->search_timeouts;
 	region_truncate(region, svp);
+	index->search_duration_ns += vector_index_now_ns(NULL) - started;
 	return -1;
 }
 
@@ -707,7 +714,18 @@ memtx_vector_index_stat(struct index *base, struct info_handler *handler)
 	info_append_int(handler, "dimension", index->dimension);
 	info_append_str(handler, "distance", distance);
 	info_append_str(handler, "algorithm", "hnsw");
+	info_append_str(handler, "scalar", "float32");
+	info_append_str(handler, "numeric_contract", "f32_f64_v1");
 	info_append_int(handler, "ef_search", base->def->opts.vector_ef_search);
+	info_table_end(handler);
+	info_table_begin(handler, "limits");
+	info_append_int(handler, "dimension", MEMTX_VECTOR_MAX_DIMENSION);
+	info_append_int(handler, "limit", 1024);
+	info_append_int(handler, "ef_search", 8192);
+	info_append_int(handler, "filter_values", 65536);
+	info_append_double(handler, "timeout", 30);
+	info_append_double(handler, "default_timeout", 1);
+	info_append_int(handler, "work", 1ULL << 32);
 	info_table_end(handler);
 	info_table_begin(handler, "versions");
 	info_append_int(handler, "live", live);
@@ -716,7 +734,7 @@ memtx_vector_index_stat(struct index *base, struct info_handler *handler)
 	info_table_end(handler);
 	info_table_begin(handler, "slots");
 	info_append_int(handler, "capacity", stats.capacity);
-	info_append_int(handler, "reusable", stats.reclaimable);
+	info_append_int(handler, "pending_rebuild", stats.reclaimable);
 	info_table_end(handler);
 	info_table_begin(handler, "memory");
 	info_append_int(handler, "graph", graph_bytes);
@@ -734,6 +752,7 @@ memtx_vector_index_stat(struct index *base, struct info_handler *handler)
 	info_append_int(handler, "requests", index->search_requests);
 	info_append_int(handler, "errors", index->search_errors);
 	info_append_int(handler, "timeouts", index->search_timeouts);
+	info_append_int(handler, "duration_ns", index->search_duration_ns);
 	info_append_int(handler, "visited_candidates",
 			index->visited_candidates);
 	info_append_int(handler, "filtered_candidates",

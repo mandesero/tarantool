@@ -371,12 +371,19 @@ g.test_deleted_version_gc_and_reinsert = function(cg)
         s:insert{1, {1, 0}}
         s:delete{1}
         box.internal.memtx_tx_gc(100)
+        local stat = s.index.vec:stat()
+        t.assert_equals(stat.slots.pending_rebuild, 1)
+        t.assert_equals(stat.slots.reusable, nil)
         t.assert_equals(s.index.vec:select({{1, 0}},
                                            {iterator = 'EQ', limit = 1}), {})
         s:insert{1, {0, 1}}
+        t.assert_equals(s.index.vec:stat().slots.pending_rebuild, 1)
         t.assert_equals(s.index.vec:select({{0, 1}},
                                            {iterator = 'EQ', limit = 1})[1][2],
                         {0, 1})
+        s.index.vec:rebuild()
+        t.assert_equals(s.index.vec:stat().slots.pending_rebuild, 0)
+        t.assert_equals(s.index.vec:stat().versions.live, 1)
     end)
 end
 
