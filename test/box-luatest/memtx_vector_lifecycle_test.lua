@@ -98,6 +98,31 @@ g.test_statistics_and_read_view_rejection = function(cg)
     end)
 end
 
+g.test_retired_slots_wait_for_rebuild = function(cg)
+    cg.server:exec(function()
+        local s = box.space.vector_lifecycle
+        s:insert{1, {1, 0}}
+        s:delete{1}
+        local stat = s.index.vec:stat()
+        t.assert_equals(stat.slots.pending_rebuild, 1)
+        s:insert{2, {0, 1}}
+        t.assert_equals(s.index.vec:stat().slots.pending_rebuild, 1)
+        box.begin()
+        s:replace{2, {2, 0}}
+        box.rollback()
+        t.assert_equals(s.index.vec:stat().slots.pending_rebuild, 2)
+        t.assert_equals(s:get{2}[2], {0, 1})
+        s.index.vec:rebuild()
+        stat = s.index.vec:stat()
+        t.assert_equals(stat.slots.pending_rebuild, 0)
+        t.assert_equals(stat.versions.retired, 0)
+        t.assert_equals(stat.versions.live, 1)
+        t.assert_equals(s.index.vec:select({{0, 1}}, {
+            iterator = 'neighbor', limit = 1,
+        })[1][2], {0, 1})
+    end)
+end
+
 g.test_failed_metric_alter_keeps_old_index = function(cg)
     cg.server:exec(function()
         local s = box.space.vector_lifecycle
