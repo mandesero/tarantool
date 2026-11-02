@@ -2,8 +2,9 @@
 
 This branch adds a memtx VECTOR index backed by USearch HNSW. Build with
 its pinned `mandesero/USearch` submodule; allocator owner, graph undo and
-stop hooks are included in that submodule. Vinyl and native IProto SELECT
-for distance are outside this version.
+stop hooks are included in that submodule. Vinyl is outside this version.
+Native IProto SELECT returns tuples;
+rich search with distances uses Lua or CALL.
 
 Create the VECTOR index in a memtx space whose vector field has the
 `array` type. Values must be dense finite numeric arrays of exactly
@@ -19,11 +20,15 @@ s:create_index('vec', {type = 'vector', dimension = 2,
                        distance = 'l2', unique = false,
                        parts = {{2, 'array'}}})
 s:insert{1, {0.1, 0.2}}
-local rows = s.index.vec:select({{0.1, 0.2}}, {
-    iterator = 'neighbor', limit = 10, with_distance = true,
+local tuples, distances = s.index.vec:search({0.1, 0.2}, {
+    limit = 10, with_distance = true,
     timeout = 1, opts = {ef_search = 64},
 })
--- rows[1] is {tuple = <tuple>, distance = <number>}.
+-- distances[i] belongs to tuples[i].
+local rows = s.index.vec:select({{0.1, 0.2}}, {
+    iterator = 'neighbor', limit = 10,
+})
+-- The same tuple-only SELECT works through net.box.
 ```
 
 `l2` is squared Euclidean distance. `cosine` is one minus normalized
@@ -33,8 +38,8 @@ is at most 1024. A filter is an unsigned field and a finite set of
 unsigned values, applied before the result limit:
 
 ```lua
-local rows = s.index.vec:select({{0.1, 0.2}}, {
-    iterator = 'neighbor', limit = 10,
+local rows = s.index.vec:search({0.1, 0.2}, {
+    limit = 10,
     filter = {field = 'bucket_id', values = {1, 2}},
 })
 ```
@@ -43,9 +48,18 @@ The second example assumes a `bucket_id` field in the space. HNSW may
 normally return fewer than `limit`; an expired timeout or work bound is
 an error, never a partial success. `index:stat()` reports configuration,
 versions, slots, memory and search counters. `index:bsize()` excludes
-tuple storage. Retained MVCC versions and graph capacity consume memtx
+tuple storage and process RSS. Graph/vector allocations use malloc charged
+to memtx quota, rather than the slab arena. `memory.generations.current`
+and `memory.generations.transient` distinguish the active generation from
+one being built or reclaimed; `memory.total` includes both. Retained MVCC
+versions and graph capacity consume memtx
 quota. `index:rebuild()` constructs a new generation and swaps it only
-after success; plan quota for both generations. If there is not enough
+after success; plan quota for both generations. Build and rebuild yield
+between portions bounded by elapsed time. Concurrent DML, rollback, tuple
+GC or replacement of the index aborts rebuild with `MODIFY_INDEX`; retry
+when writes settle. Searches keep using the current generation. Rebuild
+is forbidden inside the calling fiber's transaction. Online creation on a
+nonempty space with a HASH primary key is rejected. If there is not enough
 headroom, schedule a maintenance drop and recreate of the index.
 
 ## Distributed search
@@ -65,5 +79,8 @@ in CRUD. No vector storage role is configured in Tarantool.
 operation, `VECTOR_TIMEOUT` an expired budget, and `VECTOR_WORK_LIMIT` a
 work or size bound. Allocation failures use the standard OutOfMemory
 diagnostic. The local timeout defaults to one second and is at most 30
-seconds. Full local bounds are in [contract.md](contract.md), and build
+seconds for `search()`. Ordinary SELECT uses the one-second server budget;
+`net.box`'s `timeout` controls transport waiting. ANN options belong only to
+`search()` and are rejected by ordinary local SELECT. Full local bounds are in
+[contract.md](contract.md), and build
 and measured results are in [report.md](report.md).

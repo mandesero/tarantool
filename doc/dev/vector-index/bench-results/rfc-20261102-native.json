@@ -1,0 +1,115 @@
+{
+  "lifecycle": {
+    "snapshot_seconds": 0.01328896638006,
+    "rebuild_seconds": 1.649904361926,
+    "memory_after_rebuild": {
+      "temporary_peak": 415253,
+      "transient": 0,
+      "generations": {
+        "transient": 0,
+        "current": 415253
+      },
+      "total": 415253,
+      "graph": 273429,
+      "retained": 0,
+      "lookup": 77824,
+      "vectors": 64000
+    },
+    "versions_after_rebuild": {
+      "live": 1000,
+      "retained": 0,
+      "retired": 0
+    },
+    "memory_after_dml": {
+      "temporary_peak": 360,
+      "transient": 0,
+      "generations": {
+        "transient": 0,
+        "current": 562345
+      },
+      "total": 562345,
+      "graph": 329897,
+      "retained": 12800,
+      "lookup": 155648,
+      "vectors": 64000
+    },
+    "peak_rss_kb": 105880,
+    "build_seconds": 1.6756503749639,
+    "updates_per_s": 331.89593834017,
+    "memory_after_build": {
+      "temporary_peak": 0,
+      "transient": 0,
+      "generations": {
+        "transient": 0,
+        "current": 415253
+      },
+      "total": 415253,
+      "graph": 273429,
+      "retained": 0,
+      "lookup": 77824,
+      "vectors": 64000
+    },
+    "inserts_per_s": 349.52897539795,
+    "rebuild_ok": true,
+    "deletes_per_s": 11227.252018307
+  },
+  "search": {
+    "exact_lua": {
+      "p50_ms": 1.8401937559247,
+      "throughput_per_s": 607.92008220331,
+      "p99_ms": 4.0730843320489,
+      "p95_ms": 2.6586623862386
+    },
+    "ann": {
+      "p50_ms": 1.4274856075644,
+      "throughput_per_s": 377.56359023635,
+      "p99_ms": 10.106989182532,
+      "p95_ms": 8.4914872422814
+    },
+    "scheduled_pk_baseline": {
+      "p50_ms": 0.12963451445103,
+      "throughput_per_s": 4840.7537630582,
+      "p99_ms": 1.0078037157655,
+      "p95_ms": 0.91452151536942
+    },
+    "scheduled_pk_with_ann": {
+      "p50_ms": 2.6843138039112,
+      "throughput_per_s": 287.46904523806,
+      "p99_ms": 9.3689588829875,
+      "p95_ms": 7.968463934958
+    },
+    "pk_get": {
+      "p50_ms": 0.01563411206007,
+      "throughput_per_s": 12543.418361321,
+      "p99_ms": 1.7780903726816,
+      "p95_ms": 0.0270064920187
+    },
+    "heartbeat_max_ms": 10.397225618362
+  },
+  "quality": {
+    "recall_at_k": 1,
+    "short_fraction": 0
+  },
+  "context": {
+    "seed": 20260930,
+    "version": "3.9.0-entrypoint-185-g8bd63fc90",
+    "filter_every_nth_query": 4,
+    "k": 10,
+    "target": "Linux-x86_64-Debug",
+    "dimension": 16,
+    "distance": "l2",
+    "checksum_sha256": "000bbe25e873a242d0bd282d41ba2951a339242ac5744996b7149ac86348f1ac",
+    "bucket_count": 10,
+    "filter_selectivity": 0.1,
+    "scalar": "float32",
+    "count": 1000,
+    "flags": " -fexceptions -funwind-tables -fasynchronous-unwind-tables -fno-common -msse2 -Wformat -Wformat-security -Werror=format-security -fstack-protector-strong -fPIC -fmacro-prefix-map=/home/ubuntu/vector-index-rfc-v3=. -std=c11 -Wall -Wextra -Wno-gnu-alignof-expression -fno-gnu89-inline -Wno-cast-function-type -Werror -g -ggdb -O0 ",
+    "oracle": "Lua exact scan over the same float32 vectors",
+    "ef_search": 128,
+    "algorithm": "hnsw",
+    "query_count": 100,
+    "source_commit": "43cff08243335275bb1cea5712a9964c0a96d25a",
+    "measured_at": "2026-11-02",
+    "source_sync": "Task sources synchronized into the existing configured Ubuntu tree; version is its older git describe label."
+  }
+}
