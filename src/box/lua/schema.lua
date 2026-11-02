@@ -127,9 +127,6 @@ ffi.cdef[[
                    struct port *port, int64_t iterator, uint64_t offset,
                    uint64_t limit);
 
-    int
-    box_vector_rebuild_ffi(uint32_t space_id, uint32_t index_id);
-
     enum priv_type {
         PRIV_R = 1,
         PRIV_W = 2,
@@ -2369,9 +2366,7 @@ base_index_mt.rebuild = function(index)
     if index.type ~= 'VECTOR' then
         box.error(box.error.VECTOR_UNSUPPORTED, 2)
     end
-    if builtin.box_vector_rebuild_ffi(index.space_id, index.id) ~= 0 then
-        box.error(box.error.last(), 2)
-    end
+    return internal.vector_rebuild(index.space_id, index.id)
 end
 
 base_index_mt.drop = function(index)

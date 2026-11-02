@@ -40,6 +40,7 @@
 #include "rmean.h"
 #include "info/info.h"
 #include "memtx_tx.h"
+#include "memtx_vector.h"
 #include "box.h"
 #include "base64.h"
 #include "scoped_guard.h"
@@ -778,6 +779,26 @@ box_index_stat(uint32_t space_id, uint32_t index_id,
 		return -1;
 	index_stat(index, info);
 	return 0;
+}
+
+int
+box_index_rebuild(uint32_t space_id, uint32_t index_id)
+{
+	struct space *space = space_cache_find(space_id);
+	if (space == NULL || access_check_space(space, PRIV_W) != 0)
+		return -1;
+	struct index *index = index_find(space, index_id);
+	if (index == NULL)
+		return -1;
+	if (index->def->type != VECTOR) {
+		diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
+		return -1;
+	}
+	if (in_txn() != NULL) {
+		diag_set(ClientError, ER_ACTIVE_TRANSACTION);
+		return -1;
+	}
+	return memtx_vector_index_rebuild(index);
 }
 
 int

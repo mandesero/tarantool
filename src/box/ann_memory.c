@@ -5,6 +5,8 @@
  */
 #include "ann_memory.h"
 #include "errinj.h"
+#include "clock.h"
+#include "fiber.h"
 
 #include <assert.h>
 #include <stddef.h>
@@ -70,6 +72,24 @@ ann_quota_free(void *ctx, void *ptr, size_t size)
 	owner->blocks--;
 	free(block);
 	quota_release(owner->quota, charged);
+	ann_quota_memory_gc_step(owner);
+}
+
+void
+ann_quota_memory_start_gc(struct ann_quota_memory *owner)
+{
+	owner->gc_deadline = clock_monotonic64() + 1000000;
+}
+
+void
+ann_quota_memory_gc_step(struct ann_quota_memory *owner)
+{
+	if (owner->gc_deadline == 0 ||
+	    clock_monotonic64() < owner->gc_deadline)
+		return;
+	/* Cleanup must finish even if the requesting fiber was cancelled. */
+	fiber_sleep(0);
+	owner->gc_deadline = clock_monotonic64() + 1000000;
 }
 
 void

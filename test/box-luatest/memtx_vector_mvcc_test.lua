@@ -433,3 +433,42 @@ g.test_linearizable_rejected_before_dml = function(cg)
         plain:drop()
     end)
 end
+
+
+g.test_gc_during_cooperative_rebuild = function(cg)
+    t.tarantool.skip_if_not_debug()
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.space.vector_mvcc
+        local idx = s.index.vec
+        s:insert{1, {1, 0}}
+        local ready, release = fiber.channel(1), fiber.channel(1)
+        local reader = fiber.new(function()
+            box.begin()
+            idx:search({1, 0}, {limit = 1})
+            ready:put(true)
+            release:get()
+            box.rollback()
+        end)
+        reader:set_joinable(true)
+        t.assert(ready:get())
+        s:replace{1, {0, 1}}
+        t.assert_gt(idx:stat().versions.retained, 0)
+        box.error.injection.set('ERRINJ_VECTOR_REBUILD_DELAY', true)
+        local builder = fiber.new(function() idx:rebuild() end)
+        builder:set_joinable(true)
+        fiber.sleep(0.01)
+        release:put(true)
+        t.assert(reader:join())
+        box.internal.memtx_tx_gc(1000)
+        t.assert_equals(idx:stat().versions.retained, 0)
+        box.error.injection.set('ERRINJ_VECTOR_REBUILD_DELAY', false)
+        local ok, err = builder:join()
+        t.assert_equals(ok, false)
+        t.assert_equals(err.code, box.error.MODIFY_INDEX)
+        t.assert_equals(idx:stat().memory.transient, 0)
+        t.assert_equals(idx:search({0, 1}, {limit = 1})[1][2], {0, 1})
+        idx:rebuild()
+        t.assert_equals(idx:stat().slots.pending_rebuild, 0)
+    end)
+end

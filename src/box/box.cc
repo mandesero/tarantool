@@ -4080,26 +4080,6 @@ box_vector_search(uint32_t space_id, uint32_t index_id,
 	return box_vector_search_impl(space, index, opts, port, distances);
 }
 
-/** Rebuild a VECTOR generation without changing its catalog definition. */
-extern "C" int
-box_vector_rebuild_ffi(uint32_t space_id, uint32_t index_id)
-{
-	struct space *space = space_cache_find(space_id);
-	if (space == NULL || access_check_space(space, PRIV_W) != 0)
-		return -1;
-	struct index *index = index_find(space, index_id);
-	if (index == NULL)
-		return -1;
-	if (index->def->type != VECTOR) {
-		diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
-		return -1;
-	}
-	if (in_txn() != NULL) {
-		diag_set(ClientError, ER_ACTIVE_TRANSACTION);
-		return -1;
-	}
-	return memtx_vector_index_rebuild(index);
-}
 
 API_EXPORT int
 box_insert(uint32_t space_id, const char *tuple, const char *tuple_end,

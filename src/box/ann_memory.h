@@ -24,6 +24,8 @@ struct ann_quota_memory {
 	size_t charged;
 	/** Number of outstanding blocks. */
 	size_t blocks;
+	/** Nonzero only while reclaiming an unreachable generation. */
+	int64_t gc_deadline;
 };
 
 /** Initialize a memory owner against the engine's shared quota. */
@@ -34,6 +36,14 @@ ann_quota_memory_create(struct ann_quota_memory *owner,
 /** Return backend allocation callbacks bound to this owner. */
 struct ann_memory
 ann_quota_memory_bind(struct ann_quota_memory *owner);
+
+/** Enable yielding frees after a generation becomes unreachable. */
+void
+ann_quota_memory_start_gc(struct ann_quota_memory *owner);
+
+/** Yield between bounded portions of private generation cleanup. */
+void
+ann_quota_memory_gc_step(struct ann_quota_memory *owner);
 
 #if defined(__cplusplus)
 } /* extern "C" */

@@ -378,3 +378,148 @@ g.test_failed_truncate_preserves_index = function(cg)
         })[1][1], 1)
     end)
 end
+
+
+g.test_rebuild_yields_and_accounts_generations = function(cg)
+    t.tarantool.skip_if_not_debug()
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local idx = box.space.vector_lifecycle.index.vec
+        for i = 1, 20 do box.space.vector_lifecycle:insert{i, {i, 0}} end
+        local generation = idx:stat().hnsw.generation
+        box.error.injection.set('ERRINJ_VECTOR_REBUILD_DELAY', true)
+        local builder = fiber.new(function() idx:rebuild() end)
+        builder:set_joinable(true)
+        fiber.sleep(0.01)
+        local stat = idx:stat()
+        t.assert_equals(stat.hnsw.generation, generation)
+        t.assert_gt(stat.memory.transient, 0)
+        t.assert_equals(stat.memory.generations.transient,
+                        stat.memory.transient)
+        t.assert_equals(stat.memory.total,
+                        stat.memory.generations.current + stat.memory.transient)
+        t.assert_equals(idx:select({{20, 0}}, {
+            iterator = 'neighbor', limit = 1,
+        })[1][1], 20)
+        local ok, err = pcall(function() idx:rebuild() end)
+        t.assert_equals(ok, false)
+        t.assert_equals(err.code, box.error.MODIFY_INDEX)
+        box.error.injection.set('ERRINJ_VECTOR_REBUILD_DELAY', false)
+        t.assert(builder:join())
+        t.assert_not_equals(idx:stat().hnsw.generation, generation)
+        t.assert_equals(idx:stat().memory.transient, 0)
+    end)
+end
+
+g.test_rebuild_conflict_cancel_and_drop = function(cg)
+    t.tarantool.skip_if_not_debug()
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.space.vector_lifecycle
+        s:insert{1, {1, 0}}
+        local actions = {'write', 'rollback', 'gc', 'truncate',
+                         'cancel', 'drop'}
+        for _, action in ipairs(actions) do
+            local idx = s.index.vec
+            local generation = idx:stat().hnsw.generation
+            box.error.injection.set('ERRINJ_VECTOR_REBUILD_DELAY', true)
+            local builder = fiber.new(function() idx:rebuild() end)
+            builder:set_joinable(true)
+            fiber.sleep(0.01)
+            if action == 'write' then
+                s:replace{1, {2, 0}}
+            elseif action == 'rollback' then
+                box.begin()
+                s:replace{1, {3, 0}}
+                box.rollback()
+            elseif action == 'gc' then
+                box.internal.memtx_tx_gc(1000)
+                s:delete{1}
+                s:insert{1, {2, 0}}
+            elseif action == 'truncate' then
+                s:truncate()
+            elseif action == 'cancel' then
+                builder:cancel()
+            else
+                idx:drop()
+            end
+            box.error.injection.set('ERRINJ_VECTOR_REBUILD_DELAY', false)
+            local ok, err = builder:join()
+            t.assert_equals(ok, false)
+            if action == 'cancel' then
+                t.assert_equals(err.type, 'FiberIsCancelled')
+            else
+                t.assert_equals(err.code, box.error.MODIFY_INDEX)
+            end
+            if action == 'truncate' then
+                t.assert_equals(s.index.vec:len(), 0)
+                s:insert{1, {2, 0}}
+            elseif action ~= 'drop' then
+                t.assert_equals(idx:stat().hnsw.generation, generation)
+                t.assert_equals(idx:stat().memory.transient, 0)
+                t.assert_equals(idx:search({2, 0}, {limit = 1})[1][2], {2, 0})
+                idx:rebuild()
+            end
+        end
+    end)
+end
+
+g.test_hash_primary_build_policy = function(cg)
+    cg.server:exec(function()
+        local s = box.schema.space.create('vector_hash_build')
+        s:create_index('pk', {type = 'hash'})
+        local opts = {type = 'vector', dimension = 2,
+                      unique = false, parts = {{2, 'array'}}}
+        s:insert{1, {1, 0}}
+        t.assert_error_covers({code = box.error.VECTOR_UNSUPPORTED},
+                              s.create_index, s, 'vec', opts)
+        t.assert_equals(s.index.vec, nil)
+        s:truncate()
+        local idx = s:create_index('vec', opts)
+        s:insert{1, {1, 0}}
+        idx:rebuild()
+        t.assert_equals(idx:search({1, 0}, {limit = 1})[1][1], 1)
+        s:drop()
+    end)
+end
+
+
+g.test_large_build_and_rebuild_complete_with_short_slice = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.schema.space.create('vector_cooperative')
+        s:create_index('pk')
+        for id = 1, 4000 do
+            local vector = {}
+            for j = 1, 16 do
+                vector[j] = ((id * 37 + j * 19) % 1000) / 500 - 1
+            end
+            s:insert{id, vector}
+        end
+        local ticks = 0
+        local running = true
+        local heartbeat = fiber.new(function()
+            while running do
+                ticks = ticks + 1
+                fiber.sleep(0)
+            end
+        end)
+        heartbeat:set_joinable(true)
+        fiber.set_slice(0.1)
+        local idx = s:create_index('vec', {
+            type = 'vector', dimension = 16, unique = false,
+            parts = {{2, 'array'}},
+        })
+        local after_build = ticks
+        idx:rebuild()
+        fiber.set_slice(1)
+        running = false
+        t.assert(heartbeat:join())
+        t.assert_gt(after_build, 1)
+        t.assert_gt(ticks, after_build + 1)
+        t.assert_equals(idx:len(), 4000)
+        t.assert_equals(idx:stat().memory.transient, 0)
+        t.assert_equals(idx:search(s:get{1}[2], {limit = 1})[1][2], s:get{1}[2])
+        s:drop()
+    end)
+end

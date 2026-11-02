@@ -42,6 +42,7 @@
 #include "memtx_rtree.h"
 #include "memtx_bitset.h"
 #include "memtx_vector.h"
+#include "clock.h"
 #include "memtx_engine.h"
 #include "column_mask.h"
 #include "sequence.h"
@@ -1597,6 +1598,11 @@ memtx_space_build_index(struct space *src_space, struct index *new_index,
 	inj = errinj(ERRINJ_BUILD_INDEX_DISABLE_YIELD, ERRINJ_BOOL);
 	if (inj != NULL && inj->bparam == true)
 		can_yield = false;
+	if (new_index->def->type == VECTOR && !can_yield) {
+		diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
+		iterator_delete(it);
+		return -1;
+	}
 
 	struct memtx_engine *memtx = (struct memtx_engine *)src_space->engine;
 	struct memtx_ddl_state state;
@@ -1638,6 +1644,7 @@ memtx_space_build_index(struct space *src_space, struct index *new_index,
 	int rc;
 	struct tuple *tuple;
 	size_t count = 0;
+	int64_t vector_yield_deadline = clock_monotonic64() + 1000000;
 	while ((rc = iterator_next_internal(it, &tuple)) == 0 &&
 	       tuple != NULL) {
 		struct key_def *key_def = new_index->def->key_def;
@@ -1685,9 +1692,13 @@ memtx_space_build_index(struct space *src_space, struct index *new_index,
 		 */
 		state.cursor = tuple;
 		tuple_ref(state.cursor);
-		if (++count % MEMTX_DDL_YIELD_LOOPS == 0 &&
-		    memtx->state == MEMTX_OK)
+		bool must_yield = new_index->def->type == VECTOR ?
+			clock_monotonic64() >= vector_yield_deadline :
+			++count % MEMTX_DDL_YIELD_LOOPS == 0;
+		if (must_yield && memtx->state == MEMTX_OK) {
 			fiber_sleep(0);
+			vector_yield_deadline = clock_monotonic64() + 1000000;
+		}
 		/*
 		 * Sleep after at least one tuple is inserted to test
 		 * on_replace triggers for index build.
