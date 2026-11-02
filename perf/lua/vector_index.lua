@@ -145,14 +145,14 @@ for i, query in ipairs(queries) do
     local start = clock.monotonic()
     local truth = exact(query, filter)
     exact_times[i] = clock.monotonic() - start
-    local opts = {iterator = 'neighbor', limit = k,
+    local opts = {limit = k,
                   with_distance = true, timeout = 10,
                   opts = {ef_search = 128}}
     if filter ~= nil then
         opts.filter = {field = 'bucket_id', values = {filter}}
     end
     start = clock.monotonic()
-    local rows = index:select({query}, opts)
+    local rows = index:search(query, opts)
     ann_times[i] = clock.monotonic() - start
     if #rows < k then short = short + 1 end
     local expected = {}
@@ -161,7 +161,7 @@ for i, query in ipairs(queries) do
         possible_hits = possible_hits + 1
     end
     for _, row in ipairs(rows) do
-        if expected[row.tuple[1]] then hits = hits + 1 end
+        if expected[row[1]] then hits = hits + 1 end
     end
     start = clock.monotonic()
     assert(space.index.pk:get{(i - 1) % count + 1} ~= nil)

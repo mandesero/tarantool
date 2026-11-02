@@ -55,8 +55,8 @@ g.test_statistics_and_read_view_rejection = function(cg)
         local s = box.space.vector_lifecycle
         s:insert{1, {1, 0}}
         s:insert{2, {0, 1}}
-        s.index.vec:select({{1, 0}}, {
-            iterator = 'neighbor', limit = 1,
+        s.index.vec:search({1, 0}, {
+            limit = 1,
             filter = {field = 'id', values = {2}},
         })
         local stat = s.index.vec:stat()
@@ -135,10 +135,10 @@ g.test_failed_metric_alter_keeps_old_index = function(cg)
         box.error.injection.set('ERRINJ_VECTOR_ALLOC', -1)
         t.assert_equals(ok, false)
         t.assert_equals(box.space._index:get{s.id, 1}[5].distance, 'l2')
-        local rows = s.index.vec:select({{1, 0}}, {
-            iterator = 'neighbor', limit = 2, with_distance = true,
+        local rows, distances = s.index.vec:search({1, 0}, {
+            limit = 2, with_distance = true,
         })
-        t.assert_equals({rows[1].tuple[1], rows[1].distance}, {1, 0})
+        t.assert_equals({rows[1][1], distances[1]}, {1, 0})
     end)
 end
 
@@ -155,12 +155,12 @@ g.test_snapshot_then_wal_updates = function(cg)
     cg.server:restart()
     cg.server:exec(function()
         local s = box.space.vector_lifecycle
-        local rows = s.index.vec:select({{1, 0}}, {
-            iterator = 'neighbor', limit = 3, with_distance = true,
+        local rows, distances = s.index.vec:search({1, 0}, {
+            limit = 3, with_distance = true,
         })
         t.assert_equals(#rows, 2)
-        t.assert_equals({rows[1].tuple[1], rows[1].distance}, {3, 0})
-        t.assert_equals(rows[2].tuple[1], 2)
+        t.assert_equals({rows[1][1], distances[1]}, {3, 0})
+        t.assert_equals(rows[2][1], 2)
     end)
 end
 
@@ -273,9 +273,10 @@ g.test_structural_alter_rebuilds = function(cg)
         t.assert_not_equals(s.index.vec:stat().hnsw.generation,
                             generation)
         t.assert_equals(s.index.vec:stat().config.distance, 'ip')
-        t.assert_equals(s.index.vec:select({{1, 0}}, {
-            iterator = 'neighbor', limit = 1, with_distance = true,
-        })[1].distance, 0)
+        local _, distances = s.index.vec:search({1, 0}, {
+            limit = 1, with_distance = true,
+        })
+        t.assert_equals(distances, {0})
         local after = s.index.vec:stat().hnsw.generation
         local ok = pcall(function()
             s.index.vec:alter({dimension = 3})

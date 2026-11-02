@@ -89,7 +89,7 @@ for i, query in ipairs(queries) do
     local expected = {}
     for j = 1, k do expected[truth[j].id] = true end
     started = clock.monotonic()
-    local rows = index:select({query}, {iterator = 'EQ', limit = k})
+    local rows = index:select({query}, {iterator = 'neighbor', limit = k})
     times[i] = clock.monotonic() - started
     if #rows < k then short = short + 1 end
     for _, row in ipairs(rows) do
@@ -105,7 +105,7 @@ print(json.encode({
         algorithm = 'prototype USearch',
         scalar = 'float64',
         distance = 'cosine',
-        iterator = 'EQ',
+        iterator = 'neighbor',
         max_candidates = 32,
         seed = seed,
         checksum_sha256 = checksum,

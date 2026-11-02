@@ -37,20 +37,21 @@ g.test_reader_keeps_vector_version = function(cg)
         s:insert{1, {1, 0}}
         box.begin()
         local before = s.index.vec:select({{1, 0}},
-                                          {iterator = 'EQ', limit = 1})
+                                          {iterator = 'neighbor', limit = 1})
         t.assert_equals(before[1][2], {1, 0})
         fiber.create(function()
             complete:put(pcall(function()
                 s:replace{1, {0, 1}}
                 local current = s.index.vec:select({{1, 0}},
-                                                   {iterator = 'EQ', limit = 2})
+                                                   {iterator = 'neighbor',
+                                                    limit = 2})
                 t.assert_equals(#current, 1)
                 t.assert_equals(current[1][2], {0, 1})
             end))
         end)
         t.assert_equals(complete:get(), true)
         local after = s.index.vec:select({{1, 0}},
-                                         {iterator = 'EQ', limit = 1})
+                                         {iterator = 'neighbor', limit = 1})
         box.rollback()
         t.assert_equals(after[1][2], {1, 0})
     end)
@@ -64,24 +65,28 @@ g.test_reader_keeps_deleted_version = function(cg)
         s:insert{1, {1, 0}}
         box.begin()
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ', limit = 1})[1][1],
+                                           {iterator = 'neighbor',
+                                            limit = 1})[1][1],
                         1)
         fiber.create(function()
             complete:put(pcall(function()
                 s:delete{1}
                 local current = s.index.vec:select({{1, 0}},
-                                                    {iterator = 'EQ', limit = 1})
+                                                    {iterator = 'neighbor',
+                                                     limit = 1})
                 t.assert_equals(current, {})
             end))
         end)
         t.assert_equals(complete:get(), true)
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ', limit = 1})[1][1],
+                                           {iterator = 'neighbor',
+                                            limit = 1})[1][1],
                         1)
         box.rollback()
         box.internal.memtx_tx_gc(100)
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ', limit = 1}), {})
+                                           {iterator = 'neighbor',
+                                            limit = 1}), {})
     end)
 end
 
@@ -96,7 +101,8 @@ g.test_bucket_and_primary_key_versions = function(cg)
         s:insert{1, {1, 0}, 1}
         box.begin()
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ', limit = 1})[1][3],
+                                           {iterator = 'neighbor',
+                                            limit = 1})[1][3],
                         1)
         fiber.create(function()
             complete:put(pcall(function()
@@ -104,14 +110,15 @@ g.test_bucket_and_primary_key_versions = function(cg)
                 s:delete{1}
                 s:insert{2, {1, 0}, 3}
                 local current = s.index.vec:select({{1, 0}},
-                                                   {iterator = 'EQ', limit = 2})
+                                                   {iterator = 'neighbor',
+                                                    limit = 2})
                 t.assert_equals(#current, 1)
                 t.assert_equals(current[1]:totable(), {2, {1, 0}, 3})
             end))
         end)
         t.assert_equals(complete:get(), true)
         local old = s.index.vec:select({{1, 0}},
-                                       {iterator = 'EQ', limit = 2})
+                                       {iterator = 'neighbor', limit = 2})
         t.assert_equals(#old, 1)
         t.assert_equals(old[1]:totable(), {1, {1, 0}, 1})
         box.rollback()
@@ -124,19 +131,22 @@ g.test_read_your_writes = function(cg)
         box.begin()
         s:insert{1, {1, 0}}
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ', limit = 1})[1][1],
+                                           {iterator = 'neighbor',
+                                            limit = 1})[1][1],
                         1)
         s:replace{1, {0, 1}}
         local current = s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ', limit = 2})
+                                           {iterator = 'neighbor', limit = 2})
         t.assert_equals(#current, 1)
         t.assert_equals(current[1][2], {0, 1})
         s:delete{1}
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ', limit = 1}), {})
+                                           {iterator = 'neighbor',
+                                            limit = 1}), {})
         box.rollback()
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ', limit = 1}), {})
+                                           {iterator = 'neighbor',
+                                            limit = 1}), {})
     end)
 end
 
@@ -162,7 +172,8 @@ g.test_uncommitted_insert_is_invisible = function(cg)
             staged:get()
             box.begin({txn_isolation = isolation})
             local visible = s.index.vec:select({{1, 0}},
-                                                {iterator = 'EQ', limit = 3})
+                                                {iterator = 'neighbor',
+                                                 limit = 3})
             t.assert_equals(#visible, id - 1, isolation)
             for _, tuple in ipairs(visible) do
                 t.assert_not_equals(tuple[1], id, isolation)
@@ -182,13 +193,14 @@ g.test_empty_search_tracks_index = function(cg)
         local complete = fiber.channel(1)
         box.begin()
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ', limit = 1}), {})
+                                           {iterator = 'neighbor',
+                                            limit = 1}), {})
         fiber.create(function()
             complete:put(pcall(function() s:insert{1, {1, 0}} end))
         end)
         t.assert_equals(complete:get(), true)
         local after = s.index.vec:select({{1, 0}},
-                                         {iterator = 'EQ', limit = 1})
+                                         {iterator = 'neighbor', limit = 1})
         box.rollback()
         t.assert_equals(after, {})
     end)
@@ -203,14 +215,14 @@ g.test_distant_update_conflicts_with_index_read = function(cg)
         s:insert{2, {-1, 0}}
         box.begin()
         local before = s.index.vec:select({{1, 0}},
-                                          {iterator = 'EQ', limit = 1})
+                                          {iterator = 'neighbor', limit = 1})
         t.assert_equals(before[1][1], 1)
         fiber.create(function()
             complete:put(pcall(function() s:replace{2, {1, 0}} end))
         end)
         t.assert_equals(complete:get(), true)
         local after = s.index.vec:select({{1, 0}},
-                                         {iterator = 'EQ', limit = 1})
+                                         {iterator = 'neighbor', limit = 1})
         box.rollback()
         t.assert_equals(after[1][1], 1)
     end)
@@ -224,10 +236,10 @@ g.test_two_empty_readers_cannot_both_insert = function(cg)
         a:begin()
         b:begin()
         t.assert_equals(a('box.space.vector_mvcc.index.vec:' ..
-                          'select({{1, 0}}, {iterator = "EQ", limit = 1})'),
+                          'select({{1, 0}}, {iterator="neighbor", limit=1})'),
                         {{}})
         t.assert_equals(b('box.space.vector_mvcc.index.vec:' ..
-                          'select({{1, 0}}, {iterator = "EQ", limit = 1})'),
+                          'select({{1, 0}}, {iterator="neighbor", limit=1})'),
                         {{}})
         a('box.space.vector_mvcc:insert{1, {1, 0}}')
         b('box.space.vector_mvcc:insert{2, {0, 1}}')
@@ -248,10 +260,10 @@ g.test_disjoint_updates_conflict_after_index_read = function(cg)
         a:begin()
         b:begin()
         t.assert_equals(a('box.space.vector_mvcc.index.vec:' ..
-                          'select({{1, 0}}, {iterator = "EQ", limit = 1})')
+                          'select({{1, 0}}, {iterator="neighbor", limit=1})')
                         [1][1][1], 1)
         t.assert_equals(b('box.space.vector_mvcc.index.vec:' ..
-                          'select({{0, 1}}, {iterator = "EQ", limit = 1})')
+                          'select({{0, 1}}, {iterator="neighbor", limit=1})')
                         [1][1][1], 2)
         a('box.space.vector_mvcc:replace{1, {0.9, 0.1}}')
         b('box.space.vector_mvcc:replace{2, {0.1, 0.9}}')
@@ -272,7 +284,8 @@ g.test_distant_delete_conflicts_with_index_read = function(cg)
         reader:begin()
         t.assert_equals(reader('box.space.vector_mvcc.index.vec:' ..
                                'select({{1, 0}}, '
-                               .. '{iterator = "EQ", limit = 1})')[1][1][1], 1)
+                               .. '{iterator="neighbor", limit=1})')[1][1][1],
+                        1)
         writer:begin()
         writer('box.space.vector_mvcc:delete{2}')
         t.assert_equals(writer:commit(), '')
@@ -289,7 +302,8 @@ g.test_version_gc_after_reader_finishes = function(cg)
         s:insert{1, {1, 0}}
         box.begin()
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ', limit = 1})[1][2],
+                                           {iterator = 'neighbor',
+                                            limit = 1})[1][2],
                         {1, 0})
         fiber.create(function()
             complete:put(pcall(function() s:replace{1, {0, 1}} end))
@@ -297,19 +311,22 @@ g.test_version_gc_after_reader_finishes = function(cg)
         t.assert_equals(complete:get(), true)
         box.internal.memtx_tx_gc(100)
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ', limit = 1})[1][2],
+                                           {iterator = 'neighbor',
+                                            limit = 1})[1][2],
                         {1, 0})
         box.rollback()
         box.internal.memtx_tx_gc(100)
         t.assert_equals(s.index.vec:select({{0, 1}},
-                                           {iterator = 'EQ', limit = 1})[1][2],
+                                           {iterator = 'neighbor',
+                                            limit = 1})[1][2],
                         {0, 1})
         for i = 1, 64 do
             s:replace{1, {1 / (i + 1), 1}}
             box.internal.memtx_tx_gc(100)
         end
         t.assert_equals(s.index.vec:select({{0, 1}},
-                                           {iterator = 'EQ', limit = 1})[1][1],
+                                           {iterator = 'neighbor',
+                                            limit = 1})[1][1],
                         1)
     end)
 end
@@ -322,7 +339,7 @@ g.test_rebuild_preserves_reader_version = function(cg)
         s:insert{1, {1, 0}}
         box.begin()
         t.assert_equals(s.index.vec:select({{1, 0}}, {
-            iterator = 'EQ', limit = 1,
+            iterator = 'neighbor', limit = 1,
         })[1][2], {1, 0})
         fiber.create(function()
             complete:put(pcall(function()
@@ -332,12 +349,12 @@ g.test_rebuild_preserves_reader_version = function(cg)
         end)
         t.assert_equals(complete:get(), true)
         t.assert_equals(s.index.vec:select({{1, 0}}, {
-            iterator = 'EQ', limit = 1,
+            iterator = 'neighbor', limit = 1,
         })[1][2], {1, 0})
         box.rollback()
         box.internal.memtx_tx_gc(100)
         t.assert_equals(s.index.vec:select({{0, 1}}, {
-            iterator = 'EQ', limit = 1,
+            iterator = 'neighbor', limit = 1,
         })[1][2], {0, 1})
     end)
 end
@@ -375,11 +392,13 @@ g.test_deleted_version_gc_and_reinsert = function(cg)
         t.assert_equals(stat.slots.pending_rebuild, 1)
         t.assert_equals(stat.slots.reusable, nil)
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ', limit = 1}), {})
+                                           {iterator = 'neighbor',
+                                            limit = 1}), {})
         s:insert{1, {0, 1}}
         t.assert_equals(s.index.vec:stat().slots.pending_rebuild, 1)
         t.assert_equals(s.index.vec:select({{0, 1}},
-                                           {iterator = 'EQ', limit = 1})[1][2],
+                                           {iterator = 'neighbor',
+                                            limit = 1})[1][2],
                         {0, 1})
         s.index.vec:rebuild()
         t.assert_equals(s.index.vec:stat().slots.pending_rebuild, 0)
@@ -394,7 +413,7 @@ g.test_linearizable_rejected_before_dml = function(cg)
         box.begin({txn_isolation = 'linearizable'})
         t.assert_equals(pcall(function()
             return s.index.vec:select({{1, 0}},
-                                      {iterator = 'EQ', limit = 1})
+                                      {iterator = 'neighbor', limit = 1})
         end), false)
         t.assert_equals(pcall(function()
             s:replace{1, {0, 1}}
@@ -402,7 +421,8 @@ g.test_linearizable_rejected_before_dml = function(cg)
         box.rollback()
         t.assert_equals(s:get{1}:totable(), {1, {1, 0}})
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ', limit = 1})[1][2],
+                                           {iterator = 'neighbor',
+                                            limit = 1})[1][2],
                         {1, 0})
         local plain = box.schema.space.create('plain_linearizable')
         plain:create_index('pk')

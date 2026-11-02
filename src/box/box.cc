@@ -3898,6 +3898,40 @@ box_iterator_position_unpack(const char *packed_pos,
 	return 0;
 }
 
+/** Both SELECT and rich Lua search use the same statement and ACL checks. */
+static int
+box_vector_search_impl(struct space *space, struct index *index,
+		       const struct memtx_vector_search_opts *opts,
+		       struct port *port, double *distances)
+{
+	const char *key = opts->key;
+	if (key == NULL || key >= opts->key_end ||
+	    mp_typeof(*key) != MP_ARRAY) {
+		diag_set(ClientError, ER_VECTOR_INVALID);
+		return -1;
+	}
+	uint32_t part_count = mp_decode_array(&key);
+	if (part_count != 1 || key >= opts->key_end ||
+	    mp_typeof(*key) != MP_ARRAY) {
+		diag_set(ClientError, ER_VECTOR_INVALID);
+		return -1;
+	}
+	if (iterator_validate(index->def, ITER_NEIGHBOR, key,
+			      part_count) != 0)
+		return -1;
+	box_run_on_select(space, index, ITER_NEIGHBOR, opts->key);
+	struct txn *txn;
+	struct txn_ro_savepoint svp;
+	if (txn_begin_ro_stmt(space, &txn, &svp) != 0)
+		return -1;
+	port_c_create(port);
+	int rc = memtx_vector_index_search(index, opts, port, distances);
+	txn_end_ro_stmt(txn, &svp);
+	if (rc != 0)
+		port_destroy(port);
+	return rc;
+}
+
 int
 box_select(uint32_t space_id, uint32_t index_id,
 	   int iterator, uint32_t offset, uint32_t limit,
@@ -3905,7 +3939,6 @@ box_select(uint32_t space_id, uint32_t index_id,
 	   const char **packed_pos, const char **packed_pos_end,
 	   bool update_pos, struct port *port)
 {
-	(void)key_end;
 	assert(!update_pos || (packed_pos != NULL && packed_pos_end != NULL));
 	assert(packed_pos == NULL || packed_pos_end != NULL);
 
@@ -3925,6 +3958,20 @@ box_select(uint32_t space_id, uint32_t index_id,
 	struct index *index = index_find(space, index_id);
 	if (index == NULL)
 		return -1;
+
+	if (index->def->type == VECTOR) {
+		if (iterator != ITER_NEIGHBOR || offset != 0 || update_pos ||
+		    (packed_pos != NULL && *packed_pos != NULL)) {
+			diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
+			return -1;
+		}
+		struct memtx_vector_search_opts opts = {};
+		opts.key = key;
+		opts.key_end = key_end;
+		opts.limit = limit;
+		opts.timeout = 1;
+		return box_vector_search_impl(space, index, &opts, port, NULL);
+	}
 
 	enum iterator_type type = (enum iterator_type) iterator;
 	const char *key_array = key;
@@ -4015,16 +4062,11 @@ box_select_ffi(uint32_t space_id, uint32_t index_id, const char *key,
 			  port);
 }
 
-/** FFI entry for the local VECTOR select contract. */
-extern "C" int
-box_vector_select_ffi(uint32_t space_id, uint32_t index_id, int64_t iterator,
-		      const struct memtx_vector_search_opts *opts,
-		      struct port *port, double *distances)
+int
+box_vector_search(uint32_t space_id, uint32_t index_id,
+		  const struct memtx_vector_search_opts *opts,
+		  struct port *port, double *distances)
 {
-	if (iterator != ITER_EQ && iterator != ITER_NEIGHBOR) {
-		diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
-		return -1;
-	}
 	struct space *space = space_cache_find(space_id);
 	if (space == NULL || access_check_space(space, PRIV_R) != 0)
 		return -1;
@@ -4035,23 +4077,7 @@ box_vector_select_ffi(uint32_t space_id, uint32_t index_id, int64_t iterator,
 		diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
 		return -1;
 	}
-	const char *key = opts->key;
-	uint32_t part_count = mp_decode_array(&key);
-	if (iterator_validate(index->def, (enum iterator_type)iterator,
-			      key, part_count) != 0)
-		return -1;
-	box_run_on_select(space, index, (enum iterator_type)iterator,
-			  opts->key);
-	struct txn *txn;
-	struct txn_ro_savepoint svp;
-	if (txn_begin_ro_stmt(space, &txn, &svp) != 0)
-		return -1;
-	port_c_create(port);
-	int rc = memtx_vector_index_search(index, opts, port, distances);
-	txn_end_ro_stmt(txn, &svp);
-	if (rc != 0)
-		port_destroy(port);
-	return rc;
+	return box_vector_search_impl(space, index, opts, port, distances);
 }
 
 /** Rebuild a VECTOR generation without changing its catalog definition. */

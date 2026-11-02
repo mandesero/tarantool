@@ -193,36 +193,23 @@ vector_index_control(void)
 	return control;
 }
 
-static inline int
-mp_decode_num(const char **data, uint32_t fieldno, double *ret)
-{
-	if (mp_read_double(data, ret) != 0) {
-		diag_set(ClientError, ER_FIELD_TYPE,
-			 int2str(fieldno + TUPLE_INDEX_BASE),
-			 field_type_strs[FIELD_TYPE_NUMBER],
-			 mp_type_strs[mp_typeof(**data)]);
-		return -1;
-	}
-	return 0;
-}
-
-static inline int
+static int
 mp_decode_vector(double **vector, unsigned dimension,
-	         const char *mp, unsigned count, const char *what)
+		 const char *mp, unsigned count, const char *what)
 {
 	(void)what;
-	double c = 0;
-    if (count == dimension) {
-        for (unsigned i = 0; i < dimension; i++) {
-            if (mp_decode_num(&mp, i, &c) < 0)
-                return -1;
-            (*vector)[i] = c;
-        }
-    } else {
-		diag_set(ClientError, ER_RTREE_RECT,
-			 what, dimension, dimension);
+	if (count != dimension) {
+		diag_set(ClientError, ER_VECTOR_INVALID,
+			 "Vector dimension does not match index dimension");
 		return -1;
-    }
+	}
+	for (unsigned i = 0; i < dimension; i++) {
+		if (mp_read_double(&mp, &(*vector)[i]) != 0) {
+			diag_set(ClientError, ER_VECTOR_INVALID,
+				 "Vector coordinates must be numbers");
+			return -1;
+		}
+	}
 	return 0;
 }
 
@@ -443,7 +430,9 @@ memtx_vector_index_search(struct index *base,
 		if (tuple == NULL)
 			continue;
 		port_c_add_tuple(port, tuple);
-		distances[out_count++] = candidates[i].distance;
+		if (distances != NULL)
+			distances[out_count] = candidates[i].distance;
+		++out_count;
 	}
 	region_truncate(region, svp);
 	index->search_duration_ns += vector_index_now_ns(NULL) - started;

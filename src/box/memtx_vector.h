@@ -25,17 +25,13 @@ struct memtx_vector_search_opts {
 	double timeout;
 };
 
-/**
- * The largest vector the index accepts. Embedding models in use today stay
- * well below it (384 to 3072 components), and the limit keeps a typo in the
- * index definition from reserving absurd amounts of memory.
- */
+/** Server resource policy, independent of any particular embedding model. */
 enum { MEMTX_VECTOR_MAX_DIMENSION = 4096 };
 
 struct index *
 memtx_vector_index_new(struct memtx_engine *memtx, struct index_def *def);
 
-/** Materialize nearest visible tuples into a caller-owned port. */
+/** Materialize visible tuples and optionally their distances. */
 int
 memtx_vector_index_search(struct index *index,
 			  const struct memtx_vector_search_opts *opts,

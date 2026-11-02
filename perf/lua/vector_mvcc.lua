@@ -40,7 +40,7 @@ local ready = fiber.channel(1)
 local release = fiber.channel(1)
 local reader = fiber.new(function()
     box.begin()
-    assert(#index:select({query}, {iterator = 'neighbor', limit = 10,
+    assert(#index:search(query, {limit = 10,
                                    timeout = 10}) > 0)
     ready:put(true)
     release:get()

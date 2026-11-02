@@ -43,11 +43,13 @@ g.test_distance_and_catalog_options = function(cg)
         s:insert{1, {10, 0}}
         s:insert{2, {1, 1}}
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ', limit = 1})[1][1],
+                                           {iterator = 'neighbor',
+                                            limit = 1})[1][1],
                         2)
         s.index.vec:alter({distance = 'cosine'})
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ', limit = 1})[1][1],
+                                           {iterator = 'neighbor',
+                                            limit = 1})[1][1],
                         1)
     end)
 end
@@ -111,7 +113,8 @@ g.test_catalog_recovery = function(cg)
         t.assert_equals(opts.opts.ef_construction, 48)
         t.assert_equals(opts.opts.ef_search, 24)
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ', limit = 1})[1][1],
+                                           {iterator = 'neighbor',
+                                            limit = 1})[1][1],
                         2)
     end)
 end
@@ -126,7 +129,8 @@ g.test_path_and_nullable = function(cg)
                                unique = false, parts = parts})
         s:insert{1, {embedding = {1, 0}}}
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ', limit = 1})[1][1],
+                                           {iterator = 'neighbor',
+                                            limit = 1})[1][1],
                         1)
         s.index.vec:drop()
         parts[1].is_nullable = true

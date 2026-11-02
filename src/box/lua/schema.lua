@@ -24,6 +24,7 @@ local check_primary_index = box.internal.check_primary_index
 local check_iterator_type = box.internal.check_iterator_type
 local check_pairs_opts = box.internal.check_pairs_opts
 local check_select_opts = box.internal.check_select_opts
+local check_vector_select_opts = box.internal.check_vector_select_opts
 local normalize_txn_isolation_level = box.internal.normalize_txn_isolation_level
 local normalize_constraint = box.internal.tuple_format.normalize_constraint
 local normalize_foreign_key = box.internal.tuple_format.normalize_foreign_key
@@ -126,22 +127,6 @@ ffi.cdef[[
                    struct port *port, int64_t iterator, uint64_t offset,
                    uint64_t limit);
 
-    struct memtx_vector_search_opts {
-        const char *key;
-        const char *key_end;
-        const char *filter;
-        const char *filter_end;
-        uint32_t limit;
-        uint32_t offset;
-        uint32_t ef_search;
-        uint32_t filter_fieldno;
-        double timeout;
-    };
-    int
-    box_vector_select_ffi(uint32_t space_id, uint32_t index_id,
-                          int64_t iterator,
-                          const struct memtx_vector_search_opts *opts,
-                          struct port *port, double *distances);
     int
     box_vector_rebuild_ffi(uint32_t space_id, uint32_t index_id);
 
@@ -2193,32 +2178,32 @@ base_index_mt.get_luac = function(index, key)
     return internal.get(index.space_id, index.id, key)
 end
 
-local function vector_select(index, key, opts)
+base_index_mt.search = function(index, query, opts)
+    check_index_arg(index, 'search', 2)
     local function invalid(message)
         box.error({code = box.error.VECTOR_INVALID, reason = message}, 3)
     end
     local function unsupported(message)
         box.error({code = box.error.VECTOR_UNSUPPORTED, reason = message}, 3)
     end
+    if index.type ~= 'VECTOR' then
+        unsupported('Search requires a VECTOR index')
+    end
+    if type(query) ~= 'table' then
+        invalid('VECTOR query must be a dense numeric array')
+    end
     if opts == nil then
         opts = {}
     end
     if type(opts) ~= 'table' then
-        invalid('VECTOR select options must be a table')
+        invalid('VECTOR search options must be a table')
     end
     for name in pairs(opts) do
-        if name ~= 'iterator' and name ~= 'limit' and
+        if name ~= 'limit' and
            name ~= 'with_distance' and name ~= 'timeout' and
            name ~= 'filter' and name ~= 'opts' then
-            invalid('Unknown VECTOR select option: ' .. tostring(name))
+            invalid('Unknown VECTOR search option: ' .. tostring(name))
         end
-    end
-    local iterator = check_iterator_type(opts, false, 3)
-    if iterator ~= box.index.EQ and iterator ~= box.index.NEIGHBOR then
-        unsupported('VECTOR does not support requested iterator type')
-    end
-    if key == nil or (type(key) == 'table' and #key == 0) then
-        invalid('VECTOR does not support requested iterator type without key')
     end
     local limit = opts.limit
     if type(limit) ~= 'number' or limit % 1 ~= 0 or
@@ -2283,55 +2268,19 @@ local function vector_select(index, key, opts)
             invalid('Too many VECTOR filter values')
         end
     end
-    local ibuf = cord_ibuf_take()
-    tuple_encode(ibuf, key, 2)
-    local key_size = ibuf:size()
-    if filter_values ~= nil then
-        tuple_encode(ibuf, filter_values, 2)
-    end
-    local request = ffi.new('struct memtx_vector_search_opts')
-    request.key = ibuf.rpos
-    request.key_end = ibuf.rpos + key_size
-    request.limit = limit
-    request.timeout = timeout
-    request.ef_search = ef_search
-    request.filter_fieldno = filter_fieldno
-    if filter_values ~= nil then
-        request.filter = ibuf.rpos + key_size
-        request.filter_end = ibuf.wpos
-    end
-    local distances = ffi.new('double[1024]')
-    local region_svp = builtin.box_region_used()
-    local rc = builtin.box_vector_select_ffi(index.space_id, index.id,
-                                              iterator, request, port,
-                                              distances)
-    builtin.box_region_truncate(region_svp)
-    cord_ibuf_put(ibuf)
-    if rc ~= 0 then
-        box.error(box.error.last(), 2)
-    end
-    local ret = {}
-    local entry = port_c.first
-    for i = 1, tonumber(port_c.size) do
-        local tuple = tuple_bless(entry.tuple)
-        ret[i] = opts.with_distance and
-                 {tuple = tuple, distance = tonumber(distances[i - 1])} or
-                 tuple
-        entry = entry.next
-    end
-    builtin.port_destroy(port)
-    return ret
+    return internal.vector_search(index.space_id, index.id, {query}, limit,
+                                  timeout, ef_search, filter_fieldno,
+                                  filter_values, opts.with_distance or false)
 end
 
 base_index_mt.select_ffi = function(index, key, opts)
     check_index_arg(index, 'select', 2)
-    if index.type == 'VECTOR' then
-        return vector_select(index, key, opts)
-    end
     if builtin.box_read_ffi_is_disabled then
         return base_index_mt.select_luac(index, key, opts)
     end
-    check_index_arg(index, 'select', 2)
+    if index.type == 'VECTOR' then
+        check_vector_select_opts(opts, nil, 2)
+    end
     -- Encode the key on cord ibuf. Note, since the ibuf may be
     -- reallocated when we encode iterator_pos, we can't use the pointers
     -- returned by tuple_encode(). Instead we remember the key size
@@ -2377,7 +2326,7 @@ end
 base_index_mt.select_luac = function(index, key, opts)
     check_index_arg(index, 'select', 2)
     if index.type == 'VECTOR' then
-        return vector_select(index, key, opts)
+        check_vector_select_opts(opts, nil, 2)
     end
     local key = keify(key)
     local key_is_nil = #key == 0

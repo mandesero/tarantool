@@ -37,10 +37,10 @@ g.test_snapshot_join_and_async_apply = function(cg)
     cg.replica:exec(function()
         local s = box.space.vector_repl
         t.assert_equals(s.index.vec:len(), 2)
-        local rows = s.index.vec:select({{1, 0}}, {
-            iterator = 'neighbor', limit = 2, with_distance = true,
+        local rows, distances = s.index.vec:search({1, 0}, {
+            limit = 2, with_distance = true,
         })
-        t.assert_equals({rows[1].tuple[1], rows[1].distance}, {1, 0})
+        t.assert_equals({rows[1][1], distances[1]}, {1, 0})
     end)
     cg.master:exec(function()
         local s = box.space.vector_repl
@@ -51,11 +51,11 @@ g.test_snapshot_join_and_async_apply = function(cg)
     cg.replica:wait_for_vclock_of(cg.master)
     cg.replica:exec(function()
         local s = box.space.vector_repl
-        local rows = s.index.vec:select({{1, 0}}, {
-            iterator = 'neighbor', limit = 3, with_distance = true,
+        local rows, distances = s.index.vec:search({1, 0}, {
+            limit = 3, with_distance = true,
         })
         t.assert_equals(#rows, 2)
-        t.assert_equals({rows[1].tuple[1], rows[1].distance}, {3, 0})
-        t.assert_equals(rows[2].tuple[1], 2)
+        t.assert_equals({rows[1][1], distances[1]}, {3, 0})
+        t.assert_equals(rows[2][1], 2)
     end)
 end

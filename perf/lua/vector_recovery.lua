@@ -12,8 +12,8 @@ local index = assert(space.index.vec)
 local query = {}
 for i = 1, dimension do query[i] = 0 end
 started = clock.monotonic()
-local rows = index:select({query}, {
-    iterator = 'neighbor', limit = 10, with_distance = true,
+local rows = index:search(query, {
+    limit = 10, with_distance = true,
     timeout = 10,
 })
 local first_search_seconds = clock.monotonic() - started

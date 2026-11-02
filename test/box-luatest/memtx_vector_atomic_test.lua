@@ -45,7 +45,7 @@ g.test_later_secondary_failure = function(cg)
         t.assert_equals(ok, false)
         t.assert_equals(s:get{1}:totable(), {1, {1, 0}, 'a'})
         local found = s.index.vec:select({{1, 0}},
-                                         {iterator = 'EQ', limit = 1})
+                                         {iterator = 'neighbor', limit = 1})
         t.assert_equals({#found, found[1][1]}, {1, 1})
         t.assert_equals(s.index.vec:len(), 2)
         s:replace{1, {0.9, 0.1}, 'c'}
@@ -62,7 +62,7 @@ g.test_transaction_rollback = function(cg)
         box.rollback()
         t.assert_equals(s:get{1}:totable(), {1, {1, 0}, 'a'})
         local found = s.index.vec:select({{1, 0}},
-                                         {iterator = 'EQ', limit = 1})
+                                         {iterator = 'neighbor', limit = 1})
         t.assert_equals({#found, found[1][1]}, {1, 1})
     end)
 end
@@ -78,7 +78,7 @@ g.test_savepoint_rollback = function(cg)
         box.commit()
         t.assert_equals(s:get{1}:totable(), {1, {1, 0}, 'a'})
         local found = s.index.vec:select({{1, 0}},
-                                         {iterator = 'EQ', limit = 1})
+                                         {iterator = 'neighbor', limit = 1})
         t.assert_equals({#found, found[1][1]}, {1, 1})
     end)
 end
@@ -92,7 +92,7 @@ g.test_invalid_replace_and_followup = function(cg)
         end), false)
         t.assert_equals(s:get{1}:totable(), {1, {1, 0}, 'a'})
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ',
+                                           {iterator = 'neighbor',
                                             limit = 1})[1][1], 1)
         s:replace{1, {0, 1}, 'b'}
         t.assert_equals(s:get{1}:totable(), {1, {0, 1}, 'b'})
@@ -105,7 +105,7 @@ g.test_primary_key_and_nonvector_update = function(cg)
         s:insert{1, {1, 0}, 'a'}
         s:update({1}, {{'=', 3, 'b'}})
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ',
+                                           {iterator = 'neighbor',
                                             limit = 1})[1]:totable(),
                         {1, {1, 0}, 'b'})
         t.assert_equals(pcall(function()
@@ -118,12 +118,12 @@ g.test_primary_key_and_nonvector_update = function(cg)
         box.commit()
         t.assert_equals(s:get{1}, nil)
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ',
+                                           {iterator = 'neighbor',
                                             limit = 1})[1]:totable(),
                         {2, {1, 0}, 'b'})
         s:replace{2, {0, 1}, 'c'}
         t.assert_equals(s.index.vec:select({{0, 1}},
-                                           {iterator = 'EQ',
+                                           {iterator = 'neighbor',
                                             limit = 1})[1][1], 2)
     end)
 end
@@ -138,7 +138,7 @@ g.test_wal_failure_restores_vector = function(cg)
         t.assert_equals(ok, false)
         t.assert_equals(s:get{1}:totable(), {1, {1, 0}, 'a'})
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ',
+                                           {iterator = 'neighbor',
                                             limit = 1})[1][1], 1)
         s:replace{1, {0, 1}, 'b'}
         t.assert_equals(s:get{1}:totable(), {1, {0, 1}, 'b'})
@@ -153,7 +153,7 @@ g.test_repeated_replacement_and_delete_rollback = function(cg)
             local vector = {1 / (i + 1), 1}
             s:replace{1, vector, 'a'}
             local found = s.index.vec:select({vector},
-                                             {iterator = 'EQ', limit = 1})
+                                             {iterator = 'neighbor', limit = 1})
             t.assert_equals({#found, found[1][1]}, {1, 1})
         end
         box.begin()
@@ -161,15 +161,17 @@ g.test_repeated_replacement_and_delete_rollback = function(cg)
         box.rollback()
         t.assert_equals(s:get{1}[1], 1)
         t.assert_equals(s.index.vec:select({{0, 1}},
-                                           {iterator = 'EQ', limit = 1})[1][1],
+                                           {iterator = 'neighbor',
+                                            limit = 1})[1][1],
                         1)
         s:delete{1}
         t.assert_equals(#s.index.vec:select({{0, 1}},
-                                            {iterator = 'EQ',
+                                            {iterator = 'neighbor',
                                             limit = 1}), 0)
         s:insert{1, {1, 0}, 'a'}
         t.assert_equals(s.index.vec:select({{1, 0}},
-                                           {iterator = 'EQ', limit = 1})[1][1],
+                                           {iterator = 'neighbor',
+                                            limit = 1})[1][1],
                         1)
     end)
 end
@@ -195,7 +197,7 @@ g.test_vector_allocation_failures = function(cg)
             errinj.set('ERRINJ_VECTOR_ALLOC', -1)
             t.assert_equals(s:get{1}:totable(), {1, {1, 0}, 'a'})
             local found = s.index.vec:select({{1, 0}},
-                                             {iterator = 'EQ', limit = 1})
+                                             {iterator = 'neighbor', limit = 1})
             t.assert_equals(found[1][1], 1)
         end
         t.assert_gt(failures, 3)

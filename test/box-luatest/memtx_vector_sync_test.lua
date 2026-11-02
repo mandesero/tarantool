@@ -31,10 +31,10 @@ g.test_timeout_rollback_preserves_vector_index = function(cg)
         t.helpers.retrying({}, function()
             t.assert_equals(box.info.synchro.queue.len, 0)
         end)
-        local rows = s.index.vec:select({{1, 0}}, {
-            iterator = 'neighbor', limit = 1, with_distance = true,
+        local rows, distances = s.index.vec:search({1, 0}, {
+            limit = 1, with_distance = true,
         })
-        t.assert_equals({rows[1].tuple[2], rows[1].distance},
+        t.assert_equals({rows[1][2], distances[1]},
                         {{1, 0}, 0})
     end)
 end
