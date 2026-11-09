@@ -53,14 +53,21 @@ to memtx quota, rather than the slab arena. `memory.generations.current`
 and `memory.generations.transient` distinguish the active generation from
 one being built or reclaimed; `memory.total` includes both. Retained MVCC
 versions and graph capacity consume memtx
-quota. `index:rebuild()` constructs a new generation and swaps it only
-after success; plan quota for both generations. Build and rebuild yield
-between portions bounded by elapsed time. Concurrent DML, rollback, tuple
-GC or replacement of the index aborts rebuild with `MODIFY_INDEX`; retry
-when writes settle. Searches keep using the current generation. Rebuild
-is forbidden inside the calling fiber's transaction. Online creation on a
-nonempty space with a HASH primary key is rejected. If there is not enough
-headroom, schedule a maintenance drop and recreate of the index.
+quota. Payload-only updates share the existing vector and graph node while
+keeping independent tuple visibility. Rebuild shares coordinates between its
+two graphs and transfers concurrent vector changes to both. DML and tuple GC
+do not restart it; index replacement or DROP still returns `MODIFY_INDEX`.
+Searches keep using the current generation, and publication is atomic.
+
+A background fiber compacts navigation tombstones automatically. Manual
+`index:rebuild()` waits for completion and is forbidden inside a transaction.
+Maintenance holds reserved memtx quota. While it builds, new embeddings have
+a fixed admission budget; exhaustion returns OutOfMemory without aborting the
+builder. Long transactions may retain old versions; quota limits still apply.
+`memory.maintenance_reserved` reports unused quota separately from allocated
+bytes. Build and cleanup yield with a 1 ms target between graph operations,
+not a strict latency guarantee for each operation. Online creation on a
+nonempty space with a HASH primary key remains rejected.
 
 ## Distributed search
 

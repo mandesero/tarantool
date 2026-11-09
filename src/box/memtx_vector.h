@@ -11,6 +11,7 @@ struct index;
 struct index_def;
 struct memtx_engine;
 struct port;
+struct tuple;
 
 /** Storage-neutral arguments of a local VECTOR search. */
 struct memtx_vector_search_opts {
@@ -36,6 +37,10 @@ int
 memtx_vector_index_search(struct index *index,
 			  const struct memtx_vector_search_opts *opts,
 			  struct port *port, double *distances);
+
+/** Provide the primary-key predecessor without changing MVCC index links. */
+void
+memtx_vector_index_set_replace_source(struct index *index, struct tuple *tuple);
 
 /** Replace the graph and tuple-label generation after a successful replay. */
 int

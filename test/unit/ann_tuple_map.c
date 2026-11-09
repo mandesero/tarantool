@@ -72,10 +72,12 @@ main(void)
 	ok(retained, "cluster repair preserves surviving labels");
 	for (uintptr_t i = 101; i <= 200; ++i) {
 		inserted &= ann_tuple_map_prepare(&map) == ANN_OK;
-		inserted &= ann_tuple_map_insert(&map, fake_tuple(i)) == i;
+		uint64_t label = ann_tuple_map_insert(&map, fake_tuple(i));
+		inserted &= ann_tuple_map_get(&map, label) == fake_tuple(i);
 	}
-	ok(inserted, "growth after release keeps labels monotonic");
-	ok(ann_tuple_map_find(&map, fake_tuple(200)) == 200 &&
+	ok(inserted && map.count == 150,
+	   "released slots are reused before growing the map");
+	ok(ann_tuple_map_find(&map, fake_tuple(200)) != 0 &&
 	   ann_tuple_map_find(&map, fake_tuple(2)) == 2 &&
 	   ann_tuple_map_find(&map, fake_tuple(1)) == 0,
 	   "rehash preserves live bindings and leaves holes absent");

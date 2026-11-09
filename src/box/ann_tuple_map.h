@@ -12,15 +12,21 @@
 extern "C" {
 #endif
 
-/** Monotonic label and tuple-address binding for one memtx VECTOR index. */
+/** Recyclable label and tuple-address binding for one memtx VECTOR index. */
 struct ann_tuple_map {
 	/** Allocation owner shared with the ANN backend. */
 	struct ann_memory memory;
 	/** Tuple addresses indexed by label minus one. */
 	const void **tuples;
+	/** Caller values for live slots; free-list links for vacant slots. */
+	uintptr_t *values;
+	/** Head of the vacant-slot list, or zero. */
+	uint32_t free_head;
+	/** Number of currently occupied bindings. */
+	uint32_t live_count;
 	/** Open-addressed table of labels indexed by tuple address. */
 	uint32_t *hash;
-	/** Number of assigned labels. */
+	/** High-water mark of assigned slots. */
 	uint32_t count;
 	/** Allocated tuple-address slots. */
 	uint32_t capacity;
@@ -53,7 +59,7 @@ ann_tuple_map_insert(struct ann_tuple_map *map, const void *tuple);
 const void *
 ann_tuple_map_get(const struct ann_tuple_map *map, uint64_t label);
 
-/** Release a binding after version GC, without recycling its label. */
+/** Release a binding after version GC and recycle its slot. */
 uint64_t
 ann_tuple_map_remove(struct ann_tuple_map *map, const void *tuple);
 

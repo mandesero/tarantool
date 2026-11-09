@@ -1,6 +1,6 @@
 # Native VECTOR implementation contract
 
-The RFC revision dated 2026-11-02 is normative. This document covers the
+The RFC revision dated 2026-11-09 is normative. This document covers the
 native index.
 The distributed API contract is maintained in the companion
 [CRUD guide](https://github.com/mandesero/crud/blob/codex/vector-search/doc/vector-search.md).
@@ -37,34 +37,53 @@ Build and verification evidence is in [report.md](report.md).
 
 ## Ownership, transactions and DDL
 
-Labels are monotonically assigned uint64 values per index generation.
-Each label resolves to a version record with a tuple reference, dense vector
-and lifecycle state. A label cannot be recycled until graph and MVCC GC
-agree. Navigation tombstones may retain vectors after tuple release.
+Labels identify immutable embeddings, not individual tuple versions.
+Several versions of the same primary key share one graph node when their
+canonical f32 vectors match. A payload-only update keeps the vector and graph
+node; visibility and filters still select the exact tuple version. GC recycles
+binding and embedding labels. Graph slots keep navigation coordinates until
+compaction. Generations share reference-counted coordinates, charged once.
 
-Each generation has a separate `ann_memory` owner. Malloc allocations
-charge graph capacity and retained vectors to the shared memtx quota; they
-do not allocate from the slab arena. Temporary searches use a bounded
-operation context.
-DML failures restore the previous index state without allocating during undo.
+Each generation has a separate `ann_memory` owner. Shared coordinates and
+version bindings have independent owners. Allocations use malloc charged to
+the shared memtx quota, not the slab arena. DML failures restore the previous
+state without allocating during undo, including failure in a later secondary
+index or either graph during rebuild. Visibility-list traversal consumes the
+same query work and time budgets as graph traversal.
 
-Changing dimension, distance, algorithm, `m` or `ef_construction` builds a
-new generation and swaps only after success. Changing default `ef_search`
-updates the search configuration. Online build and rebuild yield between
-portions bounded by elapsed time. HASH primary keys cannot support the
-normal yielding build on a nonempty space, so that operation is rejected.
-Rebuild pins the current index, constructs a private generation, and checks
-index identity plus a DML/GC revision after every yield. A conflict returns
-`ER_MODIFY_INDEX` and leaves the current generation usable. This includes
-rolled-back or failed writes; callers can retry when writes settle.
-Cancellation and allocation failure before publication discard only the
-private generation. After publication, cleanup finishes even if the caller
-is cancelled.
-A successful rebuild publishes the new generation without yielding and
-reclaims the unreachable old one cooperatively. Reads use the current
-generation throughout. Concurrent rebuilds and rebuild inside the calling
-fiber's application transaction are rejected. Both generations consume the
-same quota. A maintenance drop and recreate handles insufficient headroom.
+Changing dimension, distance, algorithm, `m` or `ef_construction` builds a new
+generation and swaps only after success. Changing default `ef_search` updates
+the search configuration. HASH primary keys cannot support normal yielding
+build on a nonempty space; that operation remains rejected.
+
+Rebuild pins the index and visits a fixed initial range of embedding labels.
+Concurrent new embeddings enter both graphs atomically; payload updates and
+version GC use their shared binding registry. DML and GC do not restart replay.
+Only index replacement or DROP invalidates its weak reference. Publication
+has no yield. Before publication, cancellation or allocation failure discards
+the private graph; afterward old-graph cleanup finishes even if cancelled.
+Manual `rebuild()` waits for completion. Simultaneous rebuilds and invocation
+inside the calling fiber's transaction are rejected. The builder and cleanup
+yield between portions with a 1 ms target; a single graph operation can take
+longer, so this is not a strict TX latency bound.
+
+A background fiber compacts when at least 64 navigation-only nodes occupy
+at least one quarter of the current graph. The ordinary write path maintains
+unused quota headroom of four times the current graph owner's charged bytes
+plus 64 KiB. Rebuild transfers this reservation to its private owner, and
+recycles temporary maintenance charges within it. Concurrent writes cannot
+consume it. New embeddings admitted during one rebuild are capped at
+`max(64, initial_embedding_count / 4)`; exceeding the cap returns OutOfMemory
+without changing the tuple or aborting rebuild. DML uses unreserved quota.
+This bounds concurrent growth while the finite initial replay progresses.
+The policy constants are internal safeguards, not measured optimal values.
+
+Successful completion requires sufficient reserved memory, allocator success
+and scheduling of the builder. Long transactions can legitimately retain old
+versions; they are not cancelled by maintenance. Quota exhaustion rejects
+new allocations rather than silently discarding needed versions. Data growth
+is still subject to memtx quota. Garbage and temporary growth are bounded by
+automatic compaction, reservation and admission limits.
 
 ## Server bounds
 
@@ -107,22 +126,29 @@ The kernel reports `ER_VECTOR_INVALID`, `ER_VECTOR_UNSUPPORTED`,
 standard OutOfMemory diagnostic.
 
 `index:stat()` returns `{config, limits, versions, slots, memory, search,
-hnsw}`.
+maintenance, hnsw}`.
 Configuration names dimension, distance, algorithm, scalar representation,
 numeric contract and effective defaults. Limits name maximum dimension,
 result count, search width, filter values, timeout and work, plus the default
 timeout. They describe production limits, excluding debug error injections.
-Versions distinguish live, retained and retired counts. Slots report capacity
-and `pending_rebuild` counts. Retired navigation nodes and their dense vectors
-remain until rebuild; insertions do not reuse these slots. Ordinary memtx
-releases obsolete tuple bindings after commit or rollback; MVCC does so in
-story GC after dependent readers finish. Memory includes graph, vectors,
-lookup, retained, temporary peak and totals by generation.
-`memory.generations.current` describes the active owner;
-`memory.generations.transient` describes one being built or reclaimed.
-`memory.transient` is the same transient byte count. `memory.total` and
-`bsize()` include both owners and exclude tuple storage, region memory,
-quota rounding and system allocator overhead. They do not represent RSS.
+`versions.live` is the current primary-index size; `versions.retained` is
+`max(retained_tuple_bindings - live, 0)`. `versions.retired` counts inactive
+graph nodes. `slots.embeddings` counts embeddings with tuple bindings.
+Slots also report graph capacity and `pending_rebuild` navigation-only nodes.
+Ordinary memtx releases obsolete bindings after commit or rollback; MVCC does
+so in story GC after dependent readers finish. Bindings and storage labels
+are reused independently of graph slots.
+
+Memory includes graph, vectors, lookup, retained, temporary peak and totals.
+`vectors` counts distinct coordinates with tuple bindings; `retained` counts
+coordinates kept only by graph navigation. `generations.current` includes the
+active graph and shared owners; `generations.transient` counts the private
+graph being built or reclaimed. Coordinates are never double counted.
+`memory.total` and `bsize()` include both generations, excluding tuple storage,
+region memory, quota rounding and system allocator overhead; they are not RSS.
+`memory.maintenance_reserved` is unused quota credit, not allocated bytes, and
+is reported separately from total and bsize. `maintenance` exposes completed
+and failed rebuild counts, running state, admitted insertions and their cap.
 Search counters are cumulative
 requests, errors, timeouts, visited and filtered candidates. `duration_ns`
 counts time in admitted C searches, including query decoding, sorting, port

@@ -463,12 +463,105 @@ g.test_gc_during_cooperative_rebuild = function(cg)
         box.internal.memtx_tx_gc(1000)
         t.assert_equals(idx:stat().versions.retained, 0)
         box.error.injection.set('ERRINJ_VECTOR_REBUILD_DELAY', false)
-        local ok, err = builder:join()
-        t.assert_equals(ok, false)
-        t.assert_equals(err.code, box.error.MODIFY_INDEX)
+        t.assert(builder:join())
         t.assert_equals(idx:stat().memory.transient, 0)
         t.assert_equals(idx:search({0, 1}, {limit = 1})[1][2], {0, 1})
         idx:rebuild()
         t.assert_equals(idx:stat().slots.pending_rebuild, 0)
+    end)
+end
+
+g.test_shared_embedding_keeps_payload_visibility = function(cg)
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.space.vector_mvcc
+        local idx = s.index.vec
+        s:format({{name = 'id', type = 'unsigned'},
+                  {name = 'vec', type = 'array'},
+                  {name = 'payload', type = 'unsigned'}})
+        s:insert{1, {1, 0}, 10}
+        local ready, release = fiber.channel(1), fiber.channel(1)
+        local reader = fiber.new(function()
+            box.begin()
+            t.assert_equals(idx:search({1, 0}, {limit = 1})[1][3], 10)
+            ready:put(true)
+            release:get()
+            t.assert_equals(idx:search({1, 0}, {
+                limit = 1, filter = {field = 'payload', values = {10}},
+            })[1][3], 10)
+            t.assert_equals(idx:search({1, 0}, {
+                limit = 1, filter = {field = 'payload', values = {20}},
+            }), {})
+            box.rollback()
+        end)
+        reader:set_joinable(true)
+        t.assert(ready:get())
+        for i = 1, 100 do s:update(1, {{'=', 3, i + 10}}) end
+        t.assert_equals(idx:stat().slots.embeddings, 1)
+        t.assert_equals(idx:stat().memory.vectors, 8)
+        t.assert_equals(idx:search({1, 0}, {limit = 1})[1][3], 110)
+        idx:rebuild()
+        release:put(true)
+        t.assert(reader:join())
+        box.internal.memtx_tx_gc(1000)
+        t.assert_equals(idx:stat().versions.retained, 0)
+        t.assert_equals(idx:stat().slots.pending_rebuild, 0)
+    end)
+end
+
+g.test_uncommitted_versions_survive_generation_switch = function(cg)
+    t.tarantool.skip_if_not_debug()
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.space.vector_mvcc
+        local idx = s.index.vec
+        s:insert{1, {1, 0}, 'before'}
+        local ready, release = fiber.channel(1), fiber.channel(1)
+        local writer = fiber.new(function()
+            box.begin()
+            s:update(1, {{'=', 3, 'uncommitted'}})
+            ready:put(true)
+            release:get()
+            t.assert_equals(idx:search({1, 0}, {limit = 1})[1][3],
+                            'uncommitted')
+            box.rollback()
+        end)
+        writer:set_joinable(true)
+        t.assert(ready:get())
+        idx:rebuild()
+        t.assert_equals(idx:search({1, 0}, {limit = 1})[1][3], 'before')
+        release:put(true)
+        t.assert(writer:join())
+        box.internal.memtx_tx_gc(1000)
+        t.assert_equals(idx:search({1, 0}, {limit = 1})[1][3], 'before')
+        t.assert_equals(idx:stat().slots.embeddings, 1)
+    end)
+end
+
+g.test_shared_version_scan_obeys_work_limit = function(cg)
+    t.tarantool.skip_if_not_debug()
+    cg.server:exec(function()
+        local fiber = require('fiber')
+        local s = box.space.vector_mvcc
+        local idx = s.index.vec
+        s:insert{1, {1, 0}, 'old'}
+        local ready, release = fiber.channel(1), fiber.channel(1)
+        local reader = fiber.new(function()
+            box.begin()
+            idx:search({1, 0}, {limit = 1})
+            ready:put(true)
+            release:get()
+            box.error.injection.set('ERRINJ_VECTOR_WORK_LIMIT', 32)
+            local ok, err = pcall(idx.search, idx, {1, 0}, {limit = 1})
+            box.error.injection.set('ERRINJ_VECTOR_WORK_LIMIT', -1)
+            t.assert_equals(ok, false)
+            t.assert_equals(err.code, box.error.VECTOR_WORK_LIMIT)
+            box.rollback()
+        end)
+        reader:set_joinable(true)
+        t.assert(ready:get())
+        for i = 1, 100 do s:update(1, {{'=', 3, tostring(i)}}) end
+        release:put(true)
+        t.assert(reader:join())
     end)
 end

@@ -32,6 +32,7 @@
 #include "memtx_tx.h"
 #include "memtx_space.h"
 #include "memtx_index.h"
+#include "memtx_vector.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -2580,6 +2581,9 @@ memtx_tx_add_stmt(struct space *space, struct tuple *old_tuple,
 	 */
 	for (i++; i < space->index_count; i++) {
 		struct index *index = space->index[i];
+		if (index->def->type == VECTOR)
+			memtx_vector_index_set_replace_source(
+				index, directly_replaced[0]);
 		if (memtx_index_replace(index,
 					use_mvcc ? NULL : directly_replaced[0],
 					new_tuple,
@@ -2630,6 +2634,8 @@ rollback:
 			unreachable();
 			panic("failed to rollback change");
 		}
+		if (index->def->type == VECTOR && new_tuple != NULL)
+			memtx_index_gc_tuple(index, new_tuple);
 	}
 	/*
 	 * Delete story created for `new_tuple`.
