@@ -114,12 +114,42 @@ test_two_generations(void)
 	check_plan();
 }
 
+static void
+test_maintenance_reserve(void)
+{
+	plan(10);
+	struct quota quota;
+	quota_init(&quota, 4096);
+	struct ann_quota_memory owner, writer;
+	ann_quota_memory_create(&owner, &quota);
+	ann_quota_memory_create(&writer, &quota);
+	struct ann_memory memory = ann_quota_memory_bind(&owner);
+	struct ann_memory other = ann_quota_memory_bind(&writer);
+	ok(ann_quota_memory_reserve(&owner, 3072), "reserve maintenance quota");
+	is(quota_used(&quota), 3072, "reservation is charged immediately");
+	void *p = other.alloc(other.ctx, 1);
+	ok(p != NULL, "writer consumes only unreserved quota");
+	is(other.alloc(other.ctx, 1), NULL, "writer cannot consume reserve");
+	owner.use_reserve = true;
+	void *q = memory.alloc(memory.ctx, 2000);
+	ok(q != NULL, "maintenance proceeds with a full shared quota");
+	is(owner.reserved, 1024, "allocation transfers reserved charge");
+	is(quota_used(&quota), 4096, "transfer does not double charge");
+	memory.free(memory.ctx, q, 2000);
+	ok(ann_quota_memory_reserve(&owner, 0), "unused reserve releases");
+	is(quota_used(&quota), 1024, "writer allocation survives cleanup");
+	other.free(other.ctx, p, 1);
+	is(quota_used(&quota), 0, "all allocations and reserve released");
+	check_plan();
+}
+
 int
 main(void)
 {
-	plan(3);
+	plan(4);
 	test_shared_quota();
 	test_backend_quota();
 	test_two_generations();
+	test_maintenance_reserve();
 	return check_plan();
 }

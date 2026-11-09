@@ -24,6 +24,10 @@ struct ann_quota_memory {
 	size_t charged;
 	/** Number of outstanding blocks. */
 	size_t blocks;
+	/** Quota held for future maintenance allocations. */
+	size_t reserved;
+	/** Maintenance allocations consume reserved quota only. */
+	bool use_reserve;
 	/** Nonzero only while reclaiming an unreachable generation. */
 	int64_t gc_deadline;
 };
@@ -32,6 +36,10 @@ struct ann_quota_memory {
 void
 ann_quota_memory_create(struct ann_quota_memory *owner,
 			struct quota *quota);
+
+/** Change the amount of unused quota reserved for maintenance. */
+bool
+ann_quota_memory_reserve(struct ann_quota_memory *owner, size_t bytes);
 
 /** Return backend allocation callbacks bound to this owner. */
 struct ann_memory

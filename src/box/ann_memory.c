@@ -37,12 +37,27 @@ ann_quota_alloc(void *ctx, size_t size)
 		return NULL;
 	ERROR_INJECT_COUNTDOWN(ERRINJ_VECTOR_ALLOC, return NULL);
 	size_t total = sizeof(union ann_quota_block) + size;
-	ssize_t charged = quota_use(owner->quota, total);
-	if (charged < 0)
+	if (total > QUOTA_MAX)
 		return NULL;
+	size_t rounded = (total + QUOTA_UNIT_SIZE - 1) /
+			 QUOTA_UNIT_SIZE * QUOTA_UNIT_SIZE;
+	ssize_t charged;
+	if (owner->use_reserve) {
+		if (rounded > owner->reserved)
+			return NULL;
+		owner->reserved -= rounded;
+		charged = rounded;
+	} else {
+		charged = quota_use(owner->quota, total);
+		if (charged < 0)
+			return NULL;
+	}
 	union ann_quota_block *block = malloc(total);
 	if (block == NULL) {
-		quota_release(owner->quota, charged);
+		if (owner->use_reserve)
+			owner->reserved += charged;
+		else
+			quota_release(owner->quota, charged);
 		return NULL;
 	}
 	block->value.owner = owner;
@@ -71,7 +86,10 @@ ann_quota_free(void *ctx, void *ptr, size_t size)
 	owner->charged -= charged;
 	owner->blocks--;
 	free(block);
-	quota_release(owner->quota, charged);
+	if (owner->use_reserve)
+		owner->reserved += charged;
+	else
+		quota_release(owner->quota, charged);
 	ann_quota_memory_gc_step(owner);
 }
 
@@ -90,6 +108,25 @@ ann_quota_memory_gc_step(struct ann_quota_memory *owner)
 	/* Cleanup must finish even if the requesting fiber was cancelled. */
 	fiber_sleep(0);
 	owner->gc_deadline = clock_monotonic64() + 1000000;
+}
+
+bool
+ann_quota_memory_reserve(struct ann_quota_memory *owner, size_t bytes)
+{
+	if (bytes > QUOTA_MAX - QUOTA_UNIT_SIZE)
+		return false;
+	bytes = (bytes + QUOTA_UNIT_SIZE - 1) /
+		QUOTA_UNIT_SIZE * QUOTA_UNIT_SIZE;
+	if (bytes > owner->reserved) {
+		ssize_t charge =
+			quota_use(owner->quota, bytes - owner->reserved);
+		if (charge < 0)
+			return false;
+	} else if (bytes < owner->reserved) {
+		quota_release(owner->quota, owner->reserved - bytes);
+	}
+	owner->reserved = bytes;
+	return true;
 }
 
 void
