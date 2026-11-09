@@ -691,10 +691,56 @@ test_generation_rebuild(void)
 	check_plan();
 }
 
+static void
+test_shared_coordinates(void)
+{
+	plan(11);
+	struct owner coordinates = {}, graphs = {};
+	struct ann_memory shared_memory = owner_memory(&coordinates);
+	struct ann_memory graph_memory = owner_memory(&graphs);
+	float data[] = {1, 2};
+	struct ann_usearch_vector *vector =
+		ann_usearch_vector_new(&shared_memory, data, 2);
+	ok(vector != nullptr, "shared vector allocates once");
+	size_t bytes = coordinates.bytes;
+	struct ann_config config = {2, ANN_L2, nullptr};
+	struct ann_backend *old = nullptr, *fresh = nullptr;
+	is(ann_usearch_ops.create(&config, &graph_memory, &old), ANN_OK,
+	   "old graph creates");
+	is(ann_usearch_ops.create(&config, &graph_memory, &fresh), ANN_OK,
+	   "new graph creates");
+	struct ann_backend *backends[] = {old, fresh};
+	for (auto *graph : backends) {
+		struct ann_change *change = nullptr;
+		enum ann_status status =
+			ann_usearch_prepare_shared(graph, 1, vector, &change);
+		is(status, ANN_OK,
+		   "shared insertion prepares without copying coordinates");
+		is(ann_usearch_ops.apply(change, nullptr), ANN_OK,
+		   "shared insertion applies");
+		ann_usearch_ops.finish(change);
+	}
+	uint64_t size = 0;
+	ok(ann_usearch_reclaimable(fresh, &size) == 0 && size == 1,
+	   "constant-time maintenance counters describe the graph");
+	ann_usearch_vector_unref(vector);
+	ann_usearch_ops.destroy(old);
+	ok(coordinates.bytes == bytes, "new graph retains the same vector");
+	struct ann_candidate found[2];
+	uint32_t count = 0;
+	ok(search(&ann_usearch_ops, fresh, data, found, &count) == ANN_OK &&
+	   count == 1 && found[0].label == 1, "replacement remains searchable");
+	ann_usearch_ops.destroy(fresh);
+	ok(coordinates.bytes == 0 && graphs.bytes == 0 &&
+	   coordinates.bad_free == 0 && graphs.bad_free == 0,
+	   "last graph releases coordinates through their original owner");
+	check_plan();
+}
+
 int
 main(void)
 {
-	plan(14);
+	plan(15);
 	test_lifecycle(ann_backend_find("flat"));
 	test_lifecycle(&ann_usearch_ops);
 	test_filtered_topk(ann_backend_find("flat"));
@@ -709,5 +755,6 @@ main(void)
 	test_shared_memtx_quota();
 	test_quota_exhaustion();
 	test_generation_rebuild();
+	test_shared_coordinates();
 	return check_plan();
 }

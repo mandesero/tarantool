@@ -107,10 +107,56 @@ using ann_graph_allocator = ann_usearch_allocator<unum::usearch::byte_t>;
 using ann_graph = unum::usearch::index_gt<double, uint64_t, uint32_t,
 					 ann_graph_allocator, ann_graph_allocator>;
 
+/** Independently owned coordinates outlive either graph generation. */
+struct ann_usearch_vector {
+	/** Allocator of the shared coordinate block. */
+	struct ann_memory memory;
+	/** Owners in the storage layer and both graph generations. */
+	uint32_t refs;
+	/** Number of coordinates following this header. */
+	uint32_t dimension;
+};
+
+extern "C" struct ann_usearch_vector *
+ann_usearch_vector_new(const struct ann_memory *memory, const float *data,
+		       uint32_t dimension)
+{
+	size_t size = sizeof(struct ann_usearch_vector) +
+		      (size_t)dimension * sizeof(float);
+	void *ptr = memory->alloc(memory->ctx, size);
+	if (ptr == nullptr)
+		return nullptr;
+	auto *vector = (struct ann_usearch_vector *)ptr;
+	vector->memory = *memory;
+	vector->refs = 1;
+	vector->dimension = dimension;
+	memcpy(vector + 1, data, (size_t)dimension * sizeof(float));
+	return vector;
+}
+
+extern "C" void
+ann_usearch_vector_unref(struct ann_usearch_vector *vector)
+{
+	if (vector == nullptr || --vector->refs != 0)
+		return;
+	struct ann_memory memory = vector->memory;
+	size_t size = sizeof(*vector) +
+		      (size_t)vector->dimension * sizeof(float);
+	memory.free(memory.ctx, vector, size);
+}
+
+extern "C" const float *
+ann_usearch_vector_data(const struct ann_usearch_vector *vector)
+{
+	return (const float *)(vector + 1);
+}
+
 /** One slot-stable graph entry. */
 struct ann_usearch_entry {
 	/** Owned canonical float32 vector. */
 	float *vector;
+	/** Shared coordinate owner, or NULL for an owned test vector. */
+	struct ann_usearch_vector *shared;
 	/** Storage-layer version label. */
 	uint64_t label;
 	/** Current-view membership. */
@@ -179,6 +225,8 @@ struct ann_change {
 	uint64_t label;
 	/** Vector awaiting transfer to the slot. */
 	float *vector;
+	/** Shared coordinate owner awaiting transfer. */
+	struct ann_usearch_vector *shared;
 	/** Graph slot affected by this change. */
 	uint32_t slot;
 	/** Whether this change altered the current view. */
@@ -211,6 +259,18 @@ ann_usearch_free(struct ann_backend *backend, void *ptr, size_t size)
 		return;
 	backend->retained_bytes -= size;
 	backend->memory.free(backend->memory.ctx, ptr, size);
+}
+
+/** Coordinates can belong to this generation or an independent owner. */
+static void
+ann_usearch_release_vector(struct ann_backend *backend, float *vector,
+			   struct ann_usearch_vector *shared)
+{
+	if (shared != nullptr)
+		ann_usearch_vector_unref(shared);
+	else
+		ann_usearch_free(backend, vector,
+				 ann_usearch_vector_size(backend));
 }
 
 /** Mix pointer-like and sequential labels before masking to table capacity. */
@@ -386,16 +446,16 @@ ann_usearch_destroy(struct ann_backend *backend)
 		return;
 	for (struct ann_change *change = backend->pending; change != nullptr;) {
 		struct ann_change *previous = change->previous;
-		ann_usearch_free(backend, change->vector,
-				 ann_usearch_vector_size(backend));
+		ann_usearch_release_vector(backend, change->vector,
+					   change->shared);
 		change->undo.commit();
 		change->~ann_change();
 		ann_usearch_free(backend, change, sizeof(*change));
 		change = previous;
 	}
 	for (uint32_t i = 0; i < backend->graph.size(); ++i)
-		ann_usearch_free(backend, backend->entries[i].vector,
-				 ann_usearch_vector_size(backend));
+		ann_usearch_release_vector(backend, backend->entries[i].vector,
+					   backend->entries[i].shared);
 	ann_usearch_free(backend, backend->entries,
 			 (size_t)backend->capacity * sizeof(*backend->entries));
 	ann_usearch_free(backend, backend->lookup,
@@ -485,9 +545,11 @@ ann_usearch_reserve(struct ann_backend *backend, uint32_t capacity)
 }
 
 static enum ann_status
-ann_usearch_prepare(struct ann_backend *backend, enum ann_change_kind kind,
+ann_usearch_prepare_impl(struct ann_backend *backend,
+			 enum ann_change_kind kind,
 		    uint64_t label, const float *vector, uint32_t dimension,
-		    struct ann_change **out)
+		    struct ann_change **out,
+		    struct ann_usearch_vector *shared)
 {
 	if (out == nullptr)
 		return ANN_INVALID;
@@ -528,7 +590,11 @@ ann_usearch_prepare(struct ann_backend *backend, enum ann_change_kind kind,
 	change->kind = kind;
 	change->label = label;
 	change->slot = kind == ANN_RETIRE ? slot : backend->graph.size();
-	if (kind == ANN_INSERT) {
+	if (kind == ANN_INSERT && shared != nullptr) {
+		++shared->refs;
+		change->shared = shared;
+		change->vector = (float *)ann_usearch_vector_data(shared);
+	} else if (kind == ANN_INSERT) {
 		change->vector = (float *)ann_usearch_alloc(
 			backend, ann_usearch_vector_size(backend));
 		if (change->vector == nullptr) {
@@ -541,6 +607,38 @@ ann_usearch_prepare(struct ann_backend *backend, enum ann_change_kind kind,
 	backend->pending = change;
 	*out = change;
 	return ANN_OK;
+}
+
+static enum ann_status
+ann_usearch_prepare(struct ann_backend *backend, enum ann_change_kind kind,
+		    uint64_t label, const float *vector, uint32_t dimension,
+		    struct ann_change **out)
+{
+	return ann_usearch_prepare_impl(backend, kind, label, vector, dimension,
+					out, nullptr);
+}
+
+extern "C" enum ann_status
+ann_usearch_prepare_shared(struct ann_backend *backend, uint64_t label,
+			   struct ann_usearch_vector *vector,
+			   struct ann_change **out)
+{
+	const float *data = ann_usearch_vector_data(vector);
+	return ann_usearch_prepare_impl(backend, ANN_INSERT, label, data,
+					vector->dimension, out, vector);
+}
+
+extern "C" bool
+ann_usearch_contains(const struct ann_backend *backend, uint64_t label)
+{
+	return backend != nullptr && ann_usearch_find(backend, label) >= 0;
+}
+
+extern "C" uint64_t
+ann_usearch_reclaimable(const struct ann_backend *backend, uint64_t *size)
+{
+	*size = backend->graph.size();
+	return backend->reclaim_count;
 }
 
 static enum ann_status
@@ -563,6 +661,7 @@ ann_usearch_apply(struct ann_change *change,
 	}
 	struct ann_usearch_entry *entry = &backend->entries[change->slot];
 	entry->vector = change->vector;
+	entry->shared = change->shared;
 	entry->label = change->label;
 	entry->live = true;
 	entry->reclaimed = false;
@@ -586,6 +685,7 @@ ann_usearch_apply(struct ann_change *change,
 		return status != ANN_OK ? status : ANN_OUT_OF_MEMORY;
 	}
 	change->vector = nullptr;
+	change->shared = nullptr;
 	ann_usearch_lookup_insert(backend->lookup, backend->lookup_capacity,
 				  change->label, change->slot);
 	change->applied = true;
@@ -608,8 +708,8 @@ ann_usearch_rollback(struct ann_change *change)
 		ann_usearch_lookup_erase(backend, change->label);
 		change->undo.rollback(backend->graph);
 		struct ann_usearch_entry *entry = &backend->entries[change->slot];
-		ann_usearch_free(backend, entry->vector,
-				 ann_usearch_vector_size(backend));
+		ann_usearch_release_vector(backend, entry->vector,
+					   entry->shared);
 		memset(entry, 0, sizeof(*entry));
 	}
 	change->applied = false;
@@ -624,8 +724,8 @@ ann_usearch_finish(struct ann_change *change)
 	assert(backend->pending == change);
 	backend->pending = change->previous;
 	change->undo.commit();
-	ann_usearch_free(backend, change->vector,
-			 ann_usearch_vector_size(backend));
+	ann_usearch_release_vector(backend, change->vector,
+				   change->shared);
 	change->~ann_change();
 	ann_usearch_free(backend, change, sizeof(*change));
 }
@@ -745,7 +845,8 @@ ann_usearch_stat(const struct ann_backend *backend,
 		(sizeof(*backend->entries) + sizeof(*backend->reclaim_queue)) +
 		(uint64_t)backend->lookup_capacity * sizeof(*backend->lookup);
 	for (uint32_t i = 0; i < backend->graph.size(); ++i) {
-		if (backend->entries[i].vector != nullptr)
+		if (backend->entries[i].vector != nullptr &&
+		    backend->entries[i].shared == nullptr)
 			out->vector_bytes += (uint64_t)backend->config.dimension *
 					     sizeof(float);
 		if (backend->entries[i].live)

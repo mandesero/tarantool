@@ -28,6 +28,36 @@ struct ann_usearch_search_opts {
 extern "C" {
 #endif
 
+/** Immutable vector shared by tuple versions and graph generations. */
+struct ann_usearch_vector;
+
+/** Allocate one reference-counted canonical vector. */
+struct ann_usearch_vector *
+ann_usearch_vector_new(const struct ann_memory *memory, const float *data,
+		       uint32_t dimension);
+
+/** Release one owner; graph references keep navigation data alive. */
+void
+ann_usearch_vector_unref(struct ann_usearch_vector *vector);
+
+/** Borrow canonical coordinates while holding a vector reference. */
+const float *
+ann_usearch_vector_data(const struct ann_usearch_vector *vector);
+
+/** Prepare an insertion borrowing an immutable vector, without copying it. */
+enum ann_status
+ann_usearch_prepare_shared(struct ann_backend *backend, uint64_t label,
+			   struct ann_usearch_vector *vector,
+			   struct ann_change **out);
+
+/** Test membership, including labels retained only for rollback. */
+bool
+ann_usearch_contains(const struct ann_backend *backend, uint64_t label);
+
+/** Read maintenance counters without scanning graph entries. */
+uint64_t
+ann_usearch_reclaimable(const struct ann_backend *backend, uint64_t *size);
+
 /** Isolated USearch implementation of the C backend contract. */
 extern const struct ann_backend_ops ann_usearch_ops;
 
