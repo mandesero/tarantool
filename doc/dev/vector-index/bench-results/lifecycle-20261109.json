@@ -1,0 +1,40 @@
+{
+  "rejected_writes": 32,
+  "rebuild_seconds": 1.4370830161497,
+  "node_capacity_before": 1024,
+  "vectors_before": 64000,
+  "slots_after": {
+    "embeddings": 1000,
+    "capacity": 2048,
+    "pending_rebuild": 250
+  },
+  "memory_after": {
+    "temporary_peak": 431251,
+    "generations": {
+      "transient": 0,
+      "current": 784595
+    },
+    "vectors": 64000,
+    "lookup": 412608,
+    "maintenance_reserved": 0,
+    "total": 784595,
+    "graph": 291987,
+    "retained": 16000,
+    "transient": 0
+  },
+  "node_capacity_after": 1024,
+  "heartbeat_ticks": 532,
+  "concurrent_writes": 250,
+  "metadata_updates": 10000,
+  "vectors_after": 64000,
+  "context": {
+    "date": "2026-11-09",
+    "code_commit": "080b5e174d08c2d5bc5d7c959d43e78fcf09f2c3",
+    "target": "Ubuntu 24.04 x86_64 GCC 13.3 Debug",
+    "count": 1000,
+    "dimension": 16,
+    "memtx_memory": 536870912,
+    "generator": "((n * 37 + j * 19) % 1000) / 500 - 1",
+    "scope": "synthetic progress probe, not a production benchmark"
+  }
+}

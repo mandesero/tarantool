@@ -1,13 +1,17 @@
 # VECTOR index implementation report
 
-Date: 2026-11-02. Base: `cee48f4b03c96a1f200644a455952b3d65d06fbb`.
-Native code: `43cff08243335275bb1cea5712a9964c0a96d25a`.
-The normative input is `vector-index-rfc-revised-red.docx`, dated
-2026-11-02, SHA-256
-`bda65fdb4477b70013bf9a278a8d266f92c1042f02aea9ebe39ac8df301f034c`.
-The supplied DOCX is external to this repository. The resulting API
-contract is recorded in [contract.md](contract.md), and installation
-examples are in [README.md](README.md).
+Date: 2026-11-09. Base: `cee48f4b03c96a1f200644a455952b3d65d06fbb`.
+Native code: `080b5e174d08c2d5bc5d7c959d43e78fcf09f2c3`.
+The normative input is the supplied November 9 Confluence export, SHA-256
+`b96306dcdd4fcb3688c9fb8bf9982fa3f2cbc6180b9220a632785ff238c1be54`.
+The minimally revised Word artifact is `vector-index-rfc-lifecycle-red.docx`,
+SHA-256
+`77809021279c328f2599668c8dc4548ea7bf802a42e74b9e414496157b58652a`.
+It changes 24 paragraphs and removes one duplicate C field. All other text,
+seven tables and three original formula images are preserved. Insertions and
+replacements are red; all 20 rendered pages and internal links were checked.
+Both Word files are external to this repository. The implemented contract is
+recorded in [contract.md](contract.md), with examples in [README.md](README.md).
 
 ## Delivered code
 
@@ -38,20 +42,25 @@ It exposes `crud.vector_search` through ordinary CRUD roles. The generic
 protected-call support remains in vshard commit
 `674cda708d957cc145aa4f0622804bb5c2f8007a`.
 
-The November update adds two code commits after `48fc827807`:
-`78e502126f` separates SELECT and rich search, and `43cff08243` makes
-build/rebuild cooperative. Each code commit was built and its applicable
-VECTOR tests passed on the selected Ubuntu host. CRUD consumes the new
-search arrays in its companion branch; vshard and USearch need no changes.
+The November 2 update separated SELECT and rich search (`78e502126f`) and
+made build/rebuild cooperative (`43cff08243`). The November 9 lifecycle update
+adds reserved maintenance quota (`ab77ec3dd8`), shared coordinates
+(`22ae9dde42`) and concurrent compaction in the native code commit above.
+The current change needs no CRUD, vshard or USearch submodule modification.
 
-Rebuild pins the index and replays into a private generation, yielding
-between portions bounded by elapsed time. DML attempts, rollback, tuple
-GC or index replacement invalidate replay; `MODIFY_INDEX` asks the caller
-to retry. Publication is atomic. Before publication, cancellation or OOM
-preserves the current generation; afterward private cleanup completes even
-if the requesting fiber is cancelled. Both generation owners are stable
-for the index lifetime and charge the same memtx quota. Statistics separate
-current and transient bytes. Nonempty HASH-primary builds are rejected.
+Tuple versions with the same primary key and canonical coordinates share
+one immutable embedding and graph node. Visibility and filters still select
+the exact tuple version. GC recycles bindings and labels independently of
+navigation slots. A failed later secondary index releases the failed tuple's
+VECTOR binding. Visibility-list scans consume the query's work/time budget.
+
+Rebuild migrates a finite initial range of labels while new embeddings enter
+both graphs atomically. DML, rollback and tuple GC preserve its progress;
+replacement or DROP invalidates the index. Automatic maintenance compacts
+navigation tombstones. Both generations share coordinates. Reserved quota
+and bounded concurrent admission protect the builder from write overload;
+excess growth returns OutOfMemory. After publication, writes use the new graph
+even while the old one is reclaimed, and cancellation cannot revert it.
 
 The yielding rebuild now enters Lua C: a warmed JIT caller could crash
 when the old FFI entry yielded. Rich search also uses Lua C. A backend
@@ -87,27 +96,44 @@ The CI workflow `.github/workflows/vector_index.yml` runs only native
 VECTOR checks and uses the pinned USearch submodule. The companion CRUD
 workflow builds this native code commit and runs its distributed checks.
 
-The final code built on Ubuntu 24.04 x86_64 with GCC 13.3 in Debug mode:
+The final code built on Ubuntu 24.04 x86_64 with GCC 13.3 in Debug mode.
+All 13 CTest entries passed: four ANN unit executables, eight native VECTOR
+Lua suites and the replication suite. They cover shared embeddings, payload
+visibility, retained readers, filters, uncommitted versions, work limits,
+allocation-failure atomicity in both graphs, automatic compaction, bounded
+admission, cooperative build and rebuild, and writes/cancellation after
+publication. The existing WAL, DDL, recovery and protocol cases also passed.
 
-- Four ANN CTest executables passed.
-- All nine VECTOR Lua suite files and the standard FFI-disable suite passed.
-- Protocol tests cover both local read paths, schema-aware and schema-free
-  net.box SELECT, async requests, malformed queries and exact return arity.
-- Lifecycle tests cover allocation failures, short slices, concurrent DML,
-  rollback, MVCC GC, truncate/drop, cancellation and simultaneous rebuilds.
-  Build and rebuild of 4000 vectors complete with a 100 ms fiber slice while
-  a heartbeat runs, without an artificial yield injection.
-- Both native patch commits passed checkpatch with zero errors.
-- LuaCheck 0.23.0 passed all 16 affected native Lua files with no diagnostics.
-- CRUD's 12 focused tests and full three-replicaset fixture passed with the
-  final binary. Distributed measurements are recorded in CRUD.
+A separate Clang 19 Debug build with AddressSanitizer, leak detection and
+UndefinedBehaviorSanitizer passed all six selected entries: three ANN units
+and the atomicity, lifecycle and MVCC Lua suites. LuaCheck 0.26.0 reported
+zero warnings and errors in both changed Lua files. Checkpatch validates the
+new commits. Full hosted CI and the complete Tarantool matrix were not run.
 
-The host reused its configured build tree after task-source synchronization.
-Its binary still reports the older `8bd63fc90` git-describe label; that label
-is not the source revision of these results. The source commit is recorded
-above and in the new measurement artifact. No hosted CI run is claimed.
+The host reuses its task build tree. Its binary reports the older
+`8bd63fc90` git-describe label, which is not the source revision of these
+results. The native code commit and measurement context above identify the
+source. The previous CRUD integration runs belong to the November 2 revision;
+this update preserves the search API and wire format but does not claim a new
+CRUD cluster run.
 
-## November control measurement
+## November 9 lifecycle probe
+
+[The resource/progress probe](bench-results/lifecycle-20261109.json) uses
+1000 vectors of dimension 16. After 10000 payload-only updates, dense
+coordinates still occupy 64000 bytes and graph capacity remains 1024.
+A rebuild completes in 1.437 s with 250 successful concurrent vector writes,
+32 admission rejections and 532 heartbeat iterations. Its new generation has
+1000 bound embeddings, 250 navigation tombstones and no transient owner.
+This is one synthetic Debug observation, not a throughput or latency promise.
+Rejections are intentional bounded admission, not successful partial writes.
+
+The automated lifecycle suite also runs repeated updates and automatic
+compactions, checks bounded graph/vector growth, and verifies both generations
+after injected allocation failures. The maintenance trigger uses constant-time
+backend counters, avoiding a full graph scan on the write path.
+
+## November 2 control measurement
 
 [The new result](bench-results/rfc-20261102-native.json) uses 1000 vectors,
 dimension 16, 100 queries, k=10, ten buckets and seed 20260930. Every fourth
@@ -181,10 +207,10 @@ their interpretation is pending rebuild, not insert-time slot reuse.
 ## Verification limits
 
 Hosted GitHub Actions and the full Tarantool matrix have not run for this
-update. The project-pinned LuaCheck 0.26.1 was unavailable; the installed
-0.23.0 check is recorded separately above. No new sanitizer run is claimed.
-Earlier full ASan/UBSan builds stopped in bundled LuaJIT before VECTOR;
-earlier focused ANN units passed sanitizers. That does not establish
-sanitizer cleanliness of the Lua integration. The complete historical
-benchmark matrix was not repeated, and no external VK Tech dataset was
-available. Current measurements use deterministic synthetic inputs.
+update. The sanitizer results above cover the selected native units and Lua
+integration suites, not every subsystem. The complete historical benchmark
+matrix was not repeated and no external VK Tech dataset was available.
+Maintenance constants are conservative internal policy, not measured optimal
+values. Completion needs allocator success and builder scheduling; long MVCC
+transactions can retain old versions. Quota exhaustion rejects new allocations.
+Yield checks target 1 ms portions but do not bound a single HNSW operation.
