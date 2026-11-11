@@ -8,6 +8,7 @@
 #include <fenv.h>
 #include <float.h>
 #include <math.h>
+#include <string.h>
 
 enum ann_status
 ann_search_control_poll(struct ann_search_control *control)
@@ -89,10 +90,46 @@ ann_vector_from_double(const double *input, uint32_t dimension,
 	return ann_vector_validate_f32(out, dimension, metric);
 }
 
+float
+ann_f32le_load(const void *data, uint32_t index)
+{
+	const unsigned char *p = (const unsigned char *)data + index * 4;
+	uint32_t bits = (uint32_t)p[0] | (uint32_t)p[1] << 8 |
+			(uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+	float value;
+	memcpy(&value, &bits, sizeof(value));
+	return value;
+}
+
+enum ann_status
+ann_vector_validate_le(const void *data, uint32_t dimension,
+		       enum ann_metric metric)
+{
+	if (data == NULL || dimension == 0 || (unsigned)metric > ANN_IP)
+		return ANN_INVALID;
+	double norm2 = 0;
+	for (uint32_t i = 0; i < dimension; ++i) {
+		double x = ann_f32le_load(data, i);
+		if (!isfinite(x))
+			return ANN_INVALID;
+		norm2 += x * x;
+	}
+	return metric == ANN_COSINE && norm2 == 0 ? ANN_INVALID : ANN_OK;
+}
+
 enum ann_status
 ann_distance(const float *query, const float *vector, uint32_t dimension,
 	     enum ann_metric metric, struct ann_search_control *control,
 	     double *out)
+{
+	return ann_distance_raw(query, false, vector, false, dimension,
+				metric, control, out);
+}
+
+enum ann_status
+ann_distance_raw(const void *query, bool query_le, const void *vector,
+		 bool vector_le, uint32_t dimension, enum ann_metric metric,
+		 struct ann_search_control *control, double *out)
 {
 	if (out == NULL || query == NULL || vector == NULL || dimension == 0 ||
 	    (unsigned)metric > ANN_IP)
@@ -107,8 +144,10 @@ ann_distance(const float *query, const float *vector, uint32_t dimension,
 			if (status != ANN_OK)
 				return status;
 		}
-		double q = query[i];
-		double x = vector[i];
+		double q = query_le ? ann_f32le_load(query, i) :
+			((const float *)query)[i];
+		double x = vector_le ? ann_f32le_load(vector, i) :
+			((const float *)vector)[i];
 		if (!isfinite(q) || !isfinite(x))
 			return ANN_INVALID;
 		if (metric == ANN_L2) {

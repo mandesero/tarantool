@@ -20,6 +20,8 @@ struct ann_quota_memory {
 	struct quota *quota;
 	/** Retained payload and per-block header bytes. */
 	size_t bytes;
+	/** Requested payload bytes, excluding allocator headers. */
+	size_t payload_bytes;
 	/** Quota units charged after rounding. */
 	size_t charged;
 	/** Number of outstanding blocks. */

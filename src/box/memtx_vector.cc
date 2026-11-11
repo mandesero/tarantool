@@ -804,7 +804,7 @@ vector_prepare_group(struct memtx_vector_index *index, struct tuple *tuple,
 	if (status != ANN_OK)
 		return status;
 	if (same_row) {
-		const float *data =
+		const void *data =
 			ann_usearch_vector_data(previous->group->vector);
 		size_t size = index->dimension * sizeof(float);
 		if (memcmp(canonical, data, size) == 0) {

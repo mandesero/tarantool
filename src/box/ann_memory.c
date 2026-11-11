@@ -64,6 +64,7 @@ ann_quota_alloc(void *ctx, size_t size)
 	block->value.size = size;
 	block->value.charge = charged;
 	owner->bytes += total;
+	owner->payload_bytes += size;
 	owner->charged += charged;
 	owner->blocks++;
 	return block + 1;
@@ -83,6 +84,7 @@ ann_quota_free(void *ctx, void *ptr, size_t size)
 	assert(owner->bytes >= total && owner->charged >= charged &&
 	       owner->blocks > 0);
 	owner->bytes -= total;
+	owner->payload_bytes -= size;
 	owner->charged -= charged;
 	owner->blocks--;
 	free(block);

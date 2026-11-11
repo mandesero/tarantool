@@ -41,8 +41,22 @@ void
 ann_usearch_vector_unref(struct ann_usearch_vector *vector);
 
 /** Borrow canonical coordinates while holding a vector reference. */
-const float *
+const void *
 ann_usearch_vector_data(const struct ann_usearch_vector *vector);
+
+/** Borrow packed coordinates; release(owner) runs after the last reference. */
+struct ann_usearch_vector *
+ann_usearch_vector_borrow(const struct ann_memory *memory, const void *data,
+			  uint32_t dimension, void *owner,
+			  void (*release)(void *));
+
+/** Whether coordinate storage belongs to an externally retained tuple. */
+bool
+ann_usearch_vector_is_borrowed(const struct ann_usearch_vector *vector);
+
+/** Bytes per coordinate-owner header, excluding optional owned payload. */
+size_t
+ann_usearch_vector_overhead(void);
 
 /** Prepare an insertion borrowing an immutable vector, without copying it. */
 enum ann_status

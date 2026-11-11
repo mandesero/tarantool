@@ -113,8 +113,14 @@ struct ann_usearch_vector {
 	struct ann_memory memory;
 	/** Owners in the storage layer and both graph generations. */
 	uint32_t refs;
-	/** Number of coordinates following this header. */
+	/** Number of referenced coordinates. */
 	uint32_t dimension;
+	/** Native owned coordinates or borrowed little-endian bytes. */
+	const void *data;
+	/** External lifetime owner, or NULL for copied coordinates. */
+	void *owner;
+	/** Release the external lifetime owner, or NULL for owned payload. */
+	void (*release)(void *owner);
 };
 
 extern "C" struct ann_usearch_vector *
@@ -130,6 +136,9 @@ ann_usearch_vector_new(const struct ann_memory *memory, const float *data,
 	vector->memory = *memory;
 	vector->refs = 1;
 	vector->dimension = dimension;
+	vector->data = vector + 1;
+	vector->owner = nullptr;
+	vector->release = nullptr;
 	memcpy(vector + 1, data, (size_t)dimension * sizeof(float));
 	return vector;
 }
@@ -140,21 +149,56 @@ ann_usearch_vector_unref(struct ann_usearch_vector *vector)
 	if (vector == nullptr || --vector->refs != 0)
 		return;
 	struct ann_memory memory = vector->memory;
-	size_t size = sizeof(*vector) +
-		      (size_t)vector->dimension * sizeof(float);
+	size_t size = sizeof(*vector);
+	if (vector->release != nullptr)
+		vector->release(vector->owner);
+	else
+		size += (size_t)vector->dimension * sizeof(float);
 	memory.free(memory.ctx, vector, size);
 }
 
-extern "C" const float *
+extern "C" const void *
 ann_usearch_vector_data(const struct ann_usearch_vector *vector)
 {
-	return (const float *)(vector + 1);
+	return vector->data;
+}
+
+extern "C" struct ann_usearch_vector *
+ann_usearch_vector_borrow(const struct ann_memory *memory, const void *data,
+			  uint32_t dimension, void *owner,
+			  void (*release)(void *))
+{
+	if (data == nullptr || release == nullptr || dimension == 0)
+		return nullptr;
+	auto *vector = (struct ann_usearch_vector *)
+		memory->alloc(memory->ctx, sizeof(struct ann_usearch_vector));
+	if (vector == nullptr)
+		return nullptr;
+	vector->memory = *memory;
+	vector->refs = 1;
+	vector->dimension = dimension;
+	vector->data = data;
+	vector->owner = owner;
+	vector->release = release;
+	return vector;
+}
+
+extern "C" bool
+ann_usearch_vector_is_borrowed(const struct ann_usearch_vector *vector)
+{
+	return vector->release != nullptr;
+}
+
+extern "C" size_t
+ann_usearch_vector_overhead(void)
+{
+	return sizeof(struct ann_usearch_vector);
 }
 
 /** One slot-stable graph entry. */
 struct ann_usearch_entry {
-	/** Owned canonical float32 vector. */
-	float *vector;
+	/** Owned native or borrowed packed coordinates. */
+	const void *vector;
 	/** Shared coordinate owner, or NULL for an owned test vector. */
 	struct ann_usearch_vector *shared;
 	/** Storage-layer version label. */
@@ -224,7 +268,7 @@ struct ann_change {
 	/** Storage-layer version label. */
 	uint64_t label;
 	/** Vector awaiting transfer to the slot. */
-	float *vector;
+	const void *vector;
 	/** Shared coordinate owner awaiting transfer. */
 	struct ann_usearch_vector *shared;
 	/** Graph slot affected by this change. */
@@ -263,13 +307,13 @@ ann_usearch_free(struct ann_backend *backend, void *ptr, size_t size)
 
 /** Coordinates can belong to this generation or an independent owner. */
 static void
-ann_usearch_release_vector(struct ann_backend *backend, float *vector,
+ann_usearch_release_vector(struct ann_backend *backend, const void *vector,
 			   struct ann_usearch_vector *shared)
 {
 	if (shared != nullptr)
 		ann_usearch_vector_unref(shared);
 	else
-		ann_usearch_free(backend, vector,
+		ann_usearch_free(backend, (void *)vector,
 				 ann_usearch_vector_size(backend));
 }
 
@@ -349,7 +393,15 @@ ann_usearch_lookup_erase(struct ann_backend *backend, uint64_t label)
 	backend->lookup[at].state = 2;
 }
 
-/** Distance bridge resolving USearch members into float32 vectors. */
+/** A coordinate reference carries its storage byte order. */
+struct ann_coordinate_ref {
+	/** Coordinates retained by the caller or graph. */
+	const void *data;
+	/** Whether bytes use the packed little-endian format. */
+	bool packed;
+};
+
+/** Distance bridge resolves graph members without copying coordinates. */
 struct ann_usearch_metric {
 	/** Graph and slot lookup owner. */
 	const struct ann_backend *backend;
@@ -357,21 +409,34 @@ struct ann_usearch_metric {
 	struct ann_search_control *control;
 	/** First distance or stop failure. */
 	enum ann_status *status;
+	/** Byte order of a raw insertion input. */
+	bool input_packed;
 
-	const float *vector(const float *value) const noexcept { return value; }
-	const float *vector(float *value) const noexcept { return value; }
-	template <class K>
-	const float *vector(unum::usearch::member_cref_gt<K> value) const noexcept
+	ann_coordinate_ref vector(const float *value) const noexcept
 	{
-		return backend->entries[value.slot].vector;
+		return {value, false};
+	}
+	ann_coordinate_ref vector(const void *value) const noexcept
+	{
+		return {value, input_packed};
 	}
 	template <class K>
-	const float *vector(unum::usearch::member_ref_gt<K> value) const noexcept
+	ann_coordinate_ref vector(unum::usearch::member_cref_gt<K> value)
+		const noexcept
 	{
-		return backend->entries[value.slot].vector;
+		const auto *entry = &backend->entries[value.slot];
+		return {entry->vector, entry->shared != nullptr &&
+			ann_usearch_vector_is_borrowed(entry->shared)};
+	}
+	template <class K>
+	ann_coordinate_ref vector(unum::usearch::member_ref_gt<K> value)
+		const noexcept
+	{
+		auto ref = static_cast<unum::usearch::member_cref_gt<K>>(value);
+		return vector(ref);
 	}
 	template <class T>
-	const float *vector(const T &value) const noexcept
+	ann_coordinate_ref vector(const T &value) const noexcept
 	{
 		return vector(*value);
 	}
@@ -381,10 +446,12 @@ struct ann_usearch_metric {
 		if (*status != ANN_OK)
 			return DBL_MAX;
 		double distance = 0;
-		*status = ann_distance(vector(left), vector(right),
-					backend->config.dimension,
-					backend->config.metric, control,
-					&distance);
+		auto a = vector(left);
+		auto b = vector(right);
+		*status = ann_distance_raw(
+			a.data, a.packed, b.data, b.packed,
+			backend->config.dimension, backend->config.metric,
+			control, &distance);
 		return *status == ANN_OK ? distance : DBL_MAX;
 	}
 };
@@ -547,7 +614,7 @@ ann_usearch_reserve(struct ann_backend *backend, uint32_t capacity)
 static enum ann_status
 ann_usearch_prepare_impl(struct ann_backend *backend,
 			 enum ann_change_kind kind,
-		    uint64_t label, const float *vector, uint32_t dimension,
+		    uint64_t label, const void *vector, uint32_t dimension,
 		    struct ann_change **out,
 		    struct ann_usearch_vector *shared)
 {
@@ -562,9 +629,14 @@ ann_usearch_prepare_impl(struct ann_backend *backend,
 	if (kind == ANN_INSERT) {
 		if (slot >= 0)
 			return ANN_EXISTS;
-		if (dimension != backend->config.dimension ||
-		    ann_vector_validate_f32(vector, dimension,
-					   backend->config.metric) != ANN_OK)
+		enum ann_status valid = shared != nullptr &&
+			ann_usearch_vector_is_borrowed(shared) ?
+			ann_vector_validate_le(vector, dimension,
+					       backend->config.metric) :
+			ann_vector_validate_f32(
+				(const float *)vector, dimension,
+				backend->config.metric);
+		if (dimension != backend->config.dimension || valid != ANN_OK)
 			return ANN_INVALID;
 		if (backend->graph.size() == UINT32_MAX)
 			return ANN_INVALID;
@@ -593,7 +665,7 @@ ann_usearch_prepare_impl(struct ann_backend *backend,
 	if (kind == ANN_INSERT && shared != nullptr) {
 		++shared->refs;
 		change->shared = shared;
-		change->vector = (float *)ann_usearch_vector_data(shared);
+		change->vector = ann_usearch_vector_data(shared);
 	} else if (kind == ANN_INSERT) {
 		change->vector = (float *)ann_usearch_alloc(
 			backend, ann_usearch_vector_size(backend));
@@ -602,7 +674,8 @@ ann_usearch_prepare_impl(struct ann_backend *backend,
 			ann_usearch_free(backend, change, sizeof(*change));
 			return ANN_OUT_OF_MEMORY;
 		}
-		memcpy(change->vector, vector, ann_usearch_vector_size(backend));
+		memcpy((void *)change->vector, vector,
+		       ann_usearch_vector_size(backend));
 	}
 	backend->pending = change;
 	*out = change;
@@ -623,7 +696,7 @@ ann_usearch_prepare_shared(struct ann_backend *backend, uint64_t label,
 			   struct ann_usearch_vector *vector,
 			   struct ann_change **out)
 {
-	const float *data = ann_usearch_vector_data(vector);
+	const void *data = ann_usearch_vector_data(vector);
 	return ann_usearch_prepare_impl(backend, ANN_INSERT, label, data,
 					vector->dimension, out, vector);
 }
@@ -666,7 +739,9 @@ ann_usearch_apply(struct ann_change *change,
 	entry->live = true;
 	entry->reclaimed = false;
 	enum ann_status status = ANN_OK;
-	ann_usearch_metric metric{backend, control, &status};
+	ann_usearch_metric metric{backend, control, &status,
+		change->shared != nullptr &&
+		ann_usearch_vector_is_borrowed(change->shared)};
 	struct ann_usearch_stop stop{control, &status};
 	unum::usearch::index_update_config_t config;
 	config.expansion = backend->options.expansion_add;
@@ -796,7 +871,7 @@ ann_usearch_search(struct ann_backend *backend, const float *query,
 		if (expansion == 0)
 			return ANN_INVALID;
 	}
-	ann_usearch_metric metric{backend, opts->control, &status};
+	ann_usearch_metric metric{backend, opts->control, &status, false};
 	struct ann_usearch_stop stop{opts->control, &status};
 	unum::usearch::index_search_config_t config;
 	config.expansion = expansion;

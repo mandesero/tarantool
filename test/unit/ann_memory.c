@@ -38,7 +38,9 @@ test_shared_quota(void)
 	b.free(b.ctx, q, 1);
 	is(second.charged, 0, "second owner releases its charge");
 	is(quota_used(&quota), 0, "shared quota returns to zero");
-	is(first.bytes + second.bytes, 0, "all owner bytes returned");
+	ok(first.bytes + second.bytes == 0 &&
+	   first.payload_bytes + second.payload_bytes == 0,
+	   "all payload and allocator bytes returned");
 	check_plan();
 }
 

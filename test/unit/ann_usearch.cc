@@ -737,10 +737,57 @@ test_shared_coordinates(void)
 	check_plan();
 }
 
+static void
+release_borrowed(void *ctx)
+{
+	++*(unsigned *)ctx;
+}
+
+static void
+test_borrowed_coordinates(void)
+{
+	plan(9);
+	struct owner coordinates = {}, graphs = {};
+	struct ann_memory memory = owner_memory(&coordinates);
+	struct ann_memory graph_memory = owner_memory(&graphs);
+	unsigned released = 0;
+	unsigned char packed[] = {0xff, 0, 0, 128, 63, 0, 0, 0, 64};
+	struct ann_usearch_vector *vector = ann_usearch_vector_borrow(
+		&memory, packed + 1, 2, &released, release_borrowed);
+	ok(vector != nullptr && ann_usearch_vector_is_borrowed(vector),
+	   "unaligned packed coordinates can be borrowed");
+	is(ann_usearch_vector_data(vector), packed + 1,
+	   "coordinate pointer is not copied");
+	is(coordinates.bytes, ann_usearch_vector_overhead(),
+	   "only a lifetime header is allocated");
+	struct ann_config config = {2, ANN_L2, nullptr};
+	struct ann_backend *backend = nullptr;
+	is(ann_usearch_ops.create(&config, &graph_memory, &backend), ANN_OK,
+	   "packed graph creates");
+	struct ann_change *change = nullptr;
+	is(ann_usearch_prepare_shared(backend, 1, vector, &change), ANN_OK,
+	   "packed insertion prepares");
+	is(ann_usearch_ops.apply(change, nullptr), ANN_OK,
+	   "packed insertion applies");
+	ann_usearch_ops.finish(change);
+	ann_usearch_vector_unref(vector);
+	is(released, 0, "graph retains the external owner");
+	float query[] = {1, 2};
+	struct ann_candidate found[2];
+	uint32_t count = 0;
+	ok(search(&ann_usearch_ops, backend, query, found, &count) == ANN_OK &&
+	   count == 1 && found[0].distance == 0,
+	   "search reads unaligned little-endian coordinates");
+	ann_usearch_ops.destroy(backend);
+	ok(released == 1 && coordinates.bytes == 0 && graphs.bytes == 0,
+	   "last graph releases external storage exactly once");
+	check_plan();
+}
+
 int
 main(void)
 {
-	plan(15);
+	plan(16);
 	test_lifecycle(ann_backend_find("flat"));
 	test_lifecycle(&ann_usearch_ops);
 	test_filtered_topk(ann_backend_find("flat"));
@@ -756,5 +803,6 @@ main(void)
 	test_quota_exhaustion();
 	test_generation_rebuild();
 	test_shared_coordinates();
+	test_borrowed_coordinates();
 	return check_plan();
 }
