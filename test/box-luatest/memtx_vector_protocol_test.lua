@@ -88,18 +88,18 @@ end
 g.test_search_contract = function(cg)
     cg.server:exec(function()
         local idx = box.space.vector_protocol.index.vec
-        local tuples, distances = idx:search({1, 0}, {
+        local tuples, _, distances = idx:search({1, 0}, {
             limit = 2, with_distance = true,
         })
         t.assert_equals(tuples, {{1, {1, 0}}, {2, {0, 1}}})
         t.assert_equals(distances, {0, 2})
-        tuples, distances = idx:search({1, 0}, {limit = 1})
+        tuples, _, distances = idx:search({1, 0}, {limit = 1})
         t.assert_equals(tuples, {{1, {1, 0}}})
         t.assert_equals(distances, nil)
         t.assert_equals(select('#', idx:search({1, 0}, {limit = 1})), 1)
         t.assert_equals(select('#', idx:search({1, 0}, {
             limit = 0, with_distance = true,
-        })), 2)
+        })), 3)
         for _, query in ipairs({{}, {1}, {{1, 0}}, {'x', 0},
                                 {a = 1}, {1, 0/0}, {1, 0, 2}}) do
             t.assert_error_covers({code = box.error.VECTOR_INVALID},

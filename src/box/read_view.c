@@ -23,6 +23,7 @@
 #include "index.h"
 #include "iterator_type.h"
 #include "msgpuck.h"
+#include "memtx_vector.h"
 #include "port.h"
 #include "salad/grp_alloc.h"
 #include "small/region.h"
@@ -156,6 +157,9 @@ space_read_view_new(struct space *space, const struct read_view_opts *opts)
 		if (space_rv->index_map[i] == NULL)
 			goto fail;
 		space_rv->index_map[i]->space = space_rv;
+		if (index->def->type == VECTOR)
+			memtx_vector_read_view_set_space(
+				space_rv->index_map[i], space_rv);
 		space_rv->index_count++;
 	}
 	return space_rv;

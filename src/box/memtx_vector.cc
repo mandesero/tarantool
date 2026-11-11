@@ -56,6 +56,8 @@ struct memtx_vector_index {
 	uint32_t builder_inserts;
 	/** Bound on concurrent graph growth while migrating initial groups. */
 	uint32_t builder_insert_limit;
+	/** Peak embedding count required by retained tuple versions. */
+	uint64_t embedding_peak;
 	/** Background maintenance worker holding an index reference. */
 	struct fiber *gc_fiber;
 	/** Primary-index replacement used only during the next DML call. */
@@ -189,6 +191,14 @@ vector_schedule_rebuild(struct memtx_vector_index *index)
 static bool
 vector_reserve_maintenance(struct memtx_vector_index *index)
 {
+	uint64_t size;
+	ann_usearch_reclaimable(index->backend, &size);
+	uint64_t peak = MAX(index->embedding_peak,
+			    (uint64_t)index->groups.live_count + 1);
+	if (size >= 2 * peak + 64) {
+		vector_schedule_rebuild(index);
+		return false;
+	}
 	if (index->builder != NULL)
 		return index->builder_inserts < index->builder_insert_limit;
 	size_t charged = index->memory_owner->charged;
@@ -392,6 +402,7 @@ extract_vector(double **vector, struct tuple *tuple,
 	const char *elems = tuple_field_by_part(tuple,
 				index_def->key_def->parts, MULTIKEY_NONE);
 	unsigned dimension = index_def->opts.dimension;
+
 	uint32_t count = mp_decode_array(&elems);
 	return mp_decode_vector(vector, dimension, elems, count, "Field");
 }
@@ -410,19 +421,26 @@ memtx_vector_index_get_internal(struct index *base, const char *key,
 	return -1;
 }
 
-/** Generic iterators cannot carry the bounded VECTOR search options. */
 static struct iterator *
 memtx_vector_index_create_iterator(struct index *base, enum iterator_type type,
 				  const char *key, uint32_t part_count,
 				  const char *pos)
 {
-	(void)base;
-	(void)type;
-	(void)key;
-	(void)part_count;
-	(void)pos;
-	diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
-	return NULL;
+	return memtx_vector_scan_iterator_new(base, type, key, part_count, pos);
+}
+
+/** VECTOR has no stable positional continuation under concurrent writes. */
+static struct iterator *
+memtx_vector_index_create_iterator_with_offset(
+	struct index *base, enum iterator_type type, const char *key,
+	uint32_t part_count, const char *pos, uint32_t offset)
+{
+	if (offset != 0) {
+		diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
+		return NULL;
+	}
+	return memtx_vector_index_create_iterator(base, type, key,
+						  part_count, pos);
 }
 
 int
@@ -769,6 +787,13 @@ vector_auto_rebuild_f(va_list ap)
 	return 0;
 }
 
+/** Navigation references may outlive the tuple binding released by MVCC. */
+static void
+vector_release_tuple(void *tuple)
+{
+	tuple_unref((struct tuple *)tuple);
+}
+
 /** Share only within one primary-key history, never between distinct rows. */
 static enum ann_status
 vector_prepare_group(struct memtx_vector_index *index, struct tuple *tuple,
@@ -794,20 +819,42 @@ vector_prepare_group(struct memtx_vector_index *index, struct tuple *tuple,
 			return ANN_OK;
 		}
 	}
-	struct region *region = &fiber()->gc;
-	double *decoded = xregion_alloc_array(region, double, index->dimension);
-	float *canonical = xregion_alloc_array(region, float, index->dimension);
-	if (extract_vector(&decoded, tuple, def) != 0)
-		return ANN_INVALID;
-	enum ann_status status = ann_vector_from_double(
-		decoded, index->dimension, index->metric, canonical);
+	const char *field = tuple_field_by_part(
+		tuple, def->key_def->parts, MULTIKEY_NONE);
+	const char *packed = NULL;
+	float *canonical = NULL;
+	enum ann_status status;
+	if (mp_typeof(*field) == MP_BIN) {
+		uint32_t size;
+		packed = mp_decode_bin(&field, &size);
+		if (size != index->dimension * sizeof(float))
+			return ANN_INVALID;
+		status = ann_vector_validate_le(packed, index->dimension,
+						index->metric);
+	} else {
+		struct region *region = &fiber()->gc;
+		double *decoded = xregion_alloc_array(region, double,
+						      index->dimension);
+		canonical = xregion_alloc_array(
+			region, float, index->dimension);
+		if (extract_vector(&decoded, tuple, def) != 0)
+			return ANN_INVALID;
+		status = ann_vector_from_double(decoded, index->dimension,
+						index->metric, canonical);
+	}
 	if (status != ANN_OK)
 		return status;
 	if (same_row) {
 		const void *data =
 			ann_usearch_vector_data(previous->group->vector);
-		size_t size = index->dimension * sizeof(float);
-		if (memcmp(canonical, data, size) == 0) {
+		bool borrowed =
+			ann_usearch_vector_is_borrowed(previous->group->vector);
+		const void *input = packed != NULL ?
+			(const void *)packed : (const void *)canonical;
+		bool equal = borrowed == (packed != NULL) &&
+			memcmp(input, data,
+			       index->dimension * sizeof(float)) == 0;
+		if (equal) {
 			*out = previous->group;
 			return ANN_OK;
 		}
@@ -826,8 +873,16 @@ vector_prepare_group(struct memtx_vector_index *index, struct tuple *tuple,
 	group->live_count = 0;
 	struct ann_memory vector_memory =
 		ann_quota_memory_bind(&index->vector_memory);
-	group->vector = ann_usearch_vector_new(&vector_memory, canonical,
-					       index->dimension);
+	if (packed != NULL) {
+		group->vector = ann_usearch_vector_borrow(
+			&vector_memory, packed, index->dimension, tuple,
+			vector_release_tuple);
+		if (group->vector != NULL)
+			tuple_ref(tuple);
+	} else {
+		group->vector = ann_usearch_vector_new(
+			&vector_memory, canonical, index->dimension);
+	}
 	if (group->vector == NULL) {
 		memory.free(memory.ctx, group, sizeof(*group));
 		return ANN_OUT_OF_MEMORY;
@@ -921,6 +976,8 @@ memtx_vector_index_replace(struct index *base, struct tuple *old_tuple,
 		index->tuples.values[label - 1] = (uintptr_t)binding;
 		tuple_ref(new_tuple);
 		vector_group_set_live(index, group);
+		index->embedding_peak = MAX(index->embedding_peak,
+					    (uint64_t)index->groups.live_count);
 		if (new_group && index->builder != NULL)
 			++index->builder_inserts;
 	}
@@ -978,10 +1035,20 @@ memtx_vector_index_stat(struct index *base, struct info_handler *handler)
 	uint64_t live = current > 0 ? (uint64_t)current : 0;
 	uint64_t retained = index->tuples.live_count > live ?
 		index->tuples.live_count - live : 0;
-	uint64_t vector_bytes = (uint64_t)index->vector_memory.blocks *
-		index->dimension * sizeof(float);
-	uint64_t active_vectors = (uint64_t)index->groups.live_count *
-		index->dimension * sizeof(float);
+	uint64_t vector_bytes = index->vector_memory.payload_bytes -
+		index->vector_memory.blocks * ann_usearch_vector_overhead();
+	uint64_t active_vectors = 0;
+	uint64_t borrowed_vectors = 0;
+	for (uint32_t i = 0; i < index->groups.count; ++i) {
+		struct vector_group *group = vector_group_get(index, i + 1);
+		if (group == NULL)
+			continue;
+		uint64_t size = index->dimension * sizeof(float);
+		if (ann_usearch_vector_is_borrowed(group->vector))
+			borrowed_vectors += size;
+		else
+			active_vectors += size;
+	}
 	uint64_t retained_vectors = vector_bytes - active_vectors;
 	uint64_t lookup_bytes = stats.lookup_bytes +
 		index->common_memory.bytes +
@@ -1035,11 +1102,17 @@ memtx_vector_index_stat(struct index *base, struct info_handler *handler)
 	info_append_int(handler, "capacity", stats.capacity);
 	info_append_int(handler, "pending_rebuild", stats.reclaimable);
 	info_append_int(handler, "embeddings", index->groups.live_count);
+	info_append_int(handler, "embedding_peak", index->embedding_peak);
+	uint64_t nodes;
+	ann_usearch_reclaimable(index->backend, &nodes);
+	info_append_int(handler, "nodes", nodes);
+	info_append_int(handler, "node_limit", 2 * index->embedding_peak + 64);
 	info_table_end(handler);
 	info_table_begin(handler, "memory");
 	info_append_int(handler, "graph", graph_bytes);
 	info_append_int(handler, "vectors",
 			active_vectors);
+	info_append_int(handler, "borrowed_vectors", borrowed_vectors);
 	info_append_int(handler, "lookup", lookup_bytes);
 	info_append_int(handler, "retained", retained_vectors);
 	info_append_int(handler, "temporary_peak", index->temporary_peak);
@@ -1082,9 +1155,7 @@ memtx_vector_index_stat(struct index *base, struct info_handler *handler)
 static struct index_read_view *
 memtx_vector_index_create_read_view(struct index *base)
 {
-	(void)base;
-	diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
-	return NULL;
+	return memtx_vector_read_view_new(base);
 }
 
 /** Retire a binding only after memtx releases its dependent readers. */
@@ -1186,7 +1257,7 @@ static const struct index_vtab memtx_vector_index_vtab_base = {
 	/* .get = */ memtx_index_get,
 	/* .create_iterator = */ memtx_vector_index_create_iterator,
 	/* .create_iterator_with_offset = */
-	generic_index_create_iterator_with_offset,
+	memtx_vector_index_create_iterator_with_offset,
 	/* .create_arrow_stream = */ generic_index_create_arrow_stream,
 	/* .create_read_view = */ memtx_vector_index_create_read_view,
 	/* .info = */ generic_index_info,
@@ -1210,7 +1281,8 @@ memtx_vector_index_new(struct memtx_engine *memtx, struct index_def *def)
 {
 	assert(def->iid > 0);
 	assert(def->key_def->part_count == 1);
-	assert(def->key_def->parts[0].type == FIELD_TYPE_ARRAY);
+	assert(def->key_def->parts[0].type == FIELD_TYPE_ARRAY ||
+	       def->key_def->parts[0].type == FIELD_TYPE_VARBINARY);
 	assert(def->opts.is_unique == false);
 
 	/* Checked by memtx_space_check_index_def(). */

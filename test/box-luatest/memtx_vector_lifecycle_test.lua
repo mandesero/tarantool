@@ -50,7 +50,7 @@ g.test_search_width_alter_avoids_rebuild = function(cg)
     end)
 end
 
-g.test_statistics_and_read_view_rejection = function(cg)
+g.test_statistics_and_read_view = function(cg)
     cg.server:exec(function()
         local s = box.space.vector_lifecycle
         s:insert{1, {1, 0}}
@@ -92,9 +92,12 @@ g.test_statistics_and_read_view_rejection = function(cg)
         local categories = stat.memory.graph + stat.memory.vectors +
                            stat.memory.lookup + stat.memory.retained
         t.assert_equals(categories, stat.memory.total)
-        local ok, err = pcall(box.read_view.open)
-        t.assert_equals(ok, false)
-        t.assert_equals(err.code, box.error.VECTOR_UNSUPPORTED)
+        local rv = box.read_view.open()
+        rv:with(function()
+            t.assert_equals(#rv.space.vector_lifecycle.index.vec:select(
+                {{1, 0}}, {iterator = 'neighbor', limit = 2}), 2)
+        end)
+        rv:close()
     end)
 end
 
@@ -135,7 +138,7 @@ g.test_failed_metric_alter_keeps_old_index = function(cg)
         box.error.injection.set('ERRINJ_VECTOR_ALLOC', -1)
         t.assert_equals(ok, false)
         t.assert_equals(box.space._index:get{s.id, 1}[5].distance, 'l2')
-        local rows, distances = s.index.vec:search({1, 0}, {
+        local rows, _, distances = s.index.vec:search({1, 0}, {
             limit = 2, with_distance = true,
         })
         t.assert_equals({rows[1][1], distances[1]}, {1, 0})
@@ -155,7 +158,7 @@ g.test_snapshot_then_wal_updates = function(cg)
     cg.server:restart()
     cg.server:exec(function()
         local s = box.space.vector_lifecycle
-        local rows, distances = s.index.vec:search({1, 0}, {
+        local rows, _, distances = s.index.vec:search({1, 0}, {
             limit = 3, with_distance = true,
         })
         t.assert_equals(#rows, 2)
@@ -273,7 +276,7 @@ g.test_structural_alter_rebuilds = function(cg)
         t.assert_not_equals(s.index.vec:stat().hnsw.generation,
                             generation)
         t.assert_equals(s.index.vec:stat().config.distance, 'ip')
-        local _, distances = s.index.vec:search({1, 0}, {
+        local _, _, distances = s.index.vec:search({1, 0}, {
             limit = 1, with_distance = true,
         })
         t.assert_equals(distances, {0})

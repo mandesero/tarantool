@@ -3965,12 +3965,6 @@ box_select(uint32_t space_id, uint32_t index_id,
 			diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
 			return -1;
 		}
-		struct memtx_vector_search_opts opts = {};
-		opts.key = key;
-		opts.key_end = key_end;
-		opts.limit = limit;
-		opts.timeout = 1;
-		return box_vector_search_impl(space, index, &opts, port, NULL);
 	}
 
 	enum iterator_type type = (enum iterator_type) iterator;
@@ -3996,8 +3990,18 @@ box_select(uint32_t space_id, uint32_t index_id,
 	if (txn_begin_ro_stmt(space, &txn, &svp) != 0)
 		return -1;
 
-	struct iterator *it = index_create_iterator_with_offset(
-		index, type, key, part_count, pos, offset);
+	struct iterator *it;
+	if (index->def->type == VECTOR) {
+		struct memtx_vector_search_opts opts = {};
+		opts.key = key_array;
+		opts.key_end = key_end;
+		opts.limit = limit;
+		opts.timeout = 1;
+		it = memtx_vector_search_iterator_new(index, &opts);
+	} else {
+		it = index_create_iterator_with_offset(
+			index, type, key, part_count, pos, offset);
+	}
 	if (it == NULL) {
 		txn_end_ro_stmt(txn, &svp);
 		return -1;
@@ -4007,7 +4011,9 @@ box_select(uint32_t space_id, uint32_t index_id,
 	uint32_t found = 0;
 	struct tuple *tuple;
 	port_c_create(port);
-	while (found < limit) {
+	if (index->def->type == VECTOR && limit == 0)
+		rc = iterator_next(it, &tuple);
+	while (rc == 0 && found < limit) {
 		rc = box_check_slice();
 		if (rc != 0)
 			break;

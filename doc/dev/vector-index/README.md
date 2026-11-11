@@ -20,7 +20,7 @@ s:create_index('vec', {type = 'vector', dimension = 2,
                        distance = 'l2', unique = false,
                        parts = {{2, 'array'}}})
 s:insert{1, {0.1, 0.2}}
-local tuples, distances = s.index.vec:search({0.1, 0.2}, {
+local tuples, _, distances = s.index.vec:search({0.1, 0.2}, {
     limit = 10, with_distance = true,
     timeout = 1, opts = {ef_search = 64},
 })
@@ -68,6 +68,27 @@ builder. Long transactions may retain old versions; quota limits still apply.
 bytes. Build and cleanup yield with a 1 ms target between graph operations,
 not a strict latency guarantee for each operation. Online creation on a
 nonempty space with a HASH primary key remains rejected.
+
+## Exact cursors and packed fields
+
+`index:pairs()` streams ALL tuples. `index:pairs({query},
+{iterator = 'neighbor'})` returns an exact distance/PK ordered traversal
+without the 1024-result cap. It retains at most 32 next results and rescans
+for each batch, so it is intended for controlled iteration rather than fast
+HNSW top-k. Public `box.read_view` uses frozen primary storage for exact
+ALL/NEIGHBOR reads that survive DML, compaction and DROP.
+
+A vector field and its index part may use `varbinary` instead of `array`.
+Insert `box.vector.pack({0.1, 0.2})` to store portable little-endian f32
+coordinates. The index borrows these bytes without another dense copy.
+`box.vector.unpack(value)` decodes the packed field. Navigation references
+may retain the original source tuple after version GC.
+
+A graph is limited to `2 * K + 64` nodes, with K the historical peak number
+of embeddings simultaneously needed by retained tuple versions. Writes
+requiring a new embedding fail with OutOfMemory at this limit until
+compaction releases space. `slots.nodes`, `slots.node_limit` and
+`slots.embedding_peak` report these values.
 
 ## Distributed search
 

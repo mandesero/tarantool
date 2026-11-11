@@ -35,5 +35,6 @@ jobs:
             box-luatest/memtx_vector_select_test.lua \
             box-luatest/memtx_vector_protocol_test.lua \
             box-luatest/memtx_vector_lifecycle_test.lua \
+            box-luatest/memtx_vector_review_test.lua \
             box-luatest/memtx_vector_sync_test.lua \
             replication-luatest/vector_index_test.lua

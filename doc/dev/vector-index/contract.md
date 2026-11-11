@@ -1,6 +1,6 @@
 # Native VECTOR implementation contract
 
-The RFC revision dated 2026-11-09 is normative. This document covers the
+The RFC revision dated 2026-11-11 is normative. This document covers the
 native index.
 The distributed API contract is maintained in the companion
 [CRUD guide](https://github.com/mandesero/crud/blob/codex/vector-search/doc/vector-search.md).
@@ -10,15 +10,16 @@ Build and verification evidence is in [report.md](report.md).
 
 - The production algorithm is memtx HNSW with a replaceable internal backend.
 - Dense vectors use f32 and distances use f64 (`f32_f64_v1`). Tuple arrays
-  remain unchanged. Inputs are dense finite arrays of the exact dimension.
+  remain unchanged. Stored fields can also use packed varbinary coordinates.
+  Queries are dense finite arrays of the exact dimension.
 - `l2` is squared Euclidean distance; `cosine` is one minus normalized
   dot product; `ip` is one minus dot product. Smaller distances rank first.
 - Ordinary local and IProto SELECT use
   `index:select({query}, {iterator = 'neighbor', limit = k})` and return tuples.
   Both local FFI and Lua C enter the shared native search statement.
 - Rich local search uses `index:search(query, {limit = k, with_distance = true,
-  timeout = seconds, filter = filter, opts = opts})`. It returns two arrays,
-  `tuples, distances`, or only `tuples` without `with_distance`.
+  timeout = seconds, filter = filter, opts = opts})`. It returns
+  `tuples, nil, distances`, or only `tuples` without `with_distance`.
 - Rich search and rebuild enter Lua C, including from JIT-compiled callers.
   Ordinary SELECT rejects ANN options, offset and cursor options. `net.box`
   keeps its standard transport options; its timeout does not set ANN work.
@@ -33,7 +34,8 @@ Build and verification evidence is in [report.md](report.md).
 - A zero limit validates input and options and returns an empty tuple array
   (and an empty distance array with `with_distance`).
   Positive-limit empty results still register an index-wide MVCC dependency.
-- Linearizable VECTOR reads and public `box.read_view` searches are rejected.
+- Linearizable VECTOR reads remain rejected. Public `box.read_view` uses
+  frozen primary storage and exact scans, independent of the mutable graph.
 
 ## Ownership, transactions and DDL
 
@@ -82,8 +84,12 @@ Successful completion requires sufficient reserved memory, allocator success
 and scheduling of the builder. Long transactions can legitimately retain old
 versions; they are not cancelled by maintenance. Quota exhaustion rejects
 new allocations rather than silently discarding needed versions. Data growth
-is still subject to memtx quota. Garbage and temporary growth are bounded by
-automatic compaction, reservation and admission limits.
+is still subject to memtx quota. A graph contains at most
+`2 * K + 64` nodes, where K is the peak number of embeddings required by
+retained tuple versions. New embeddings are rejected with OutOfMemory at
+this bound even if compaction is delayed or fails. `slots.embedding_peak`,
+`slots.nodes` and `slots.node_limit` expose this rule. Capacity rounding and
+retained MVCC versions must also be included when sizing memory.
 
 ## Server bounds
 
@@ -97,7 +103,7 @@ automatic compaction, reservation and admission limits.
 | filter values | at most 65536 |
 | timeout | positive finite, at most 30 s; default 1 s |
 | operation work | at most 2^32 component operations |
-| temporary search memory | at most 64 MiB |
+| upper-layer HNSW scratch | O(dimension + limit + filter values) |
 
 These are server policy choices. Distributed participant and reply bounds
 are enforced by CRUD and documented there.
@@ -111,13 +117,36 @@ are enforced by CRUD and documented there.
 | `select` NEIGHBOR | local and native IProto; explicit limit |
 | `search` | rich local API; flat query; optional parallel distances |
 | `get`, `min`, `max`, `random` | reject early |
-| `pairs`, keyed `count` | reject early |
+| `pairs`, keyed `count` | ALL or exact NEIGHBOR; no result limit |
 | unkeyed `count` | return `len` |
 | offset, position, continuation | reject early |
 | functional, multikey or nullable vector part | reject at DDL |
-| public `box.read_view` search | reject early |
+| public `box.read_view` | frozen ALL or exact ordered NEIGHBOR |
 
+Unbounded NEIGHBOR uses a fixed batch of 32 results and rescans the primary
+index for each batch. It does not materialize the full space. Returning R
+rows costs O(N * d * ceil(R / 32)); use bounded HNSW for efficient top-k.
+Live scans yield between rows with a 1 ms target, except inside non-MVCC
+transactions. Lua pairs/count use Lua C because yielding through a compiled
+FFI call is unsafe. Normal cursors do not freeze a changing space; use a
+transaction or public read view for the corresponding visibility guarantees.
+Read-view NEIGHBOR uses the same bounded-memory selection on stable primary
+storage and checks the fiber slice. It does not preserve or clone HNSW.
 No iterator silently ignores VECTOR-specific options.
+
+## Packed coordinates
+
+A varbinary vector field contains exactly d little-endian IEEE 754 f32
+components, without a header. Dimension and scalar type come from the index.
+`box.vector.pack(array)` uses the same ties-to-even conversion as ARRAY;
+`box.vector.unpack(varbinary)` returns the decoded values. Stored packed
+coordinates are validated, read safely when unaligned and borrowed without
+an additional dense copy. The graph retains the source tuple until the last
+coordinate reference is released, including navigation references. Updating
+other fields shares this owner; it does not replace the source tuple with
+every payload update. Borrowed source-tuple memory is accounted by memtx,
+not added a second time to VECTOR bsize. CRUD projects packed coordinates
+back to arrays, retaining the existing wire representation.
 
 ## Diagnostics and introspection
 
@@ -140,8 +169,9 @@ so in story GC after dependent readers finish. Bindings and storage labels
 are reused independently of graph slots.
 
 Memory includes graph, vectors, lookup, retained, temporary peak and totals.
-`vectors` counts distinct coordinates with tuple bindings; `retained` counts
-coordinates kept only by graph navigation. `generations.current` includes the
+`vectors` counts owned coordinates with tuple bindings; `retained` counts
+owned coordinates kept only by graph navigation. `borrowed_vectors` reports
+packed coordinate bytes in bound tuples without adding them to memory.total. `generations.current` includes the
 active graph and shared owners; `generations.transient` counts the private
 graph being built or reclaimed. Coordinates are never double counted.
 `memory.total` and `bsize()` include both generations, excluding tuple storage,
@@ -149,6 +179,7 @@ region memory, quota rounding and system allocator overhead; they are not RSS.
 `memory.maintenance_reserved` is unused quota credit, not allocated bytes, and
 is reported separately from total and bsize. `maintenance` exposes completed
 and failed rebuild counts, running state, admitted insertions and their cap.
+Exact cursors and public read-view scans do not increment ANN search counters.
 Search counters are cumulative
 requests, errors, timeouts, visited and filtered candidates. `duration_ns`
 counts time in admitted C searches, including query decoding, sorting, port

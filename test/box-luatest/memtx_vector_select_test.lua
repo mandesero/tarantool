@@ -39,7 +39,7 @@ g.test_limits_and_distance = function(cg)
         end
         local query = {0, 0}
         for _, limit in ipairs({0, 1, 32, 33, 100, 1024}) do
-            local rows, distances = s.index.vec:search(query, {
+            local rows, _, distances = s.index.vec:search(query, {
                 limit = limit,
                 with_distance = true,
             })
@@ -125,7 +125,7 @@ g.test_equal_distance_and_unsigned_filter = function(cg)
         s:insert{large, {1, 0}, value}
         s:insert{smaller, {1, 0}, value}
         s:insert{2, {1, 0}, 1}
-        local rows, distances = s.index.vec:search({1, 0}, {
+        local rows, _, distances = s.index.vec:search({1, 0}, {
             limit = 3, with_distance = true,
             filter = {field = 'bucket_id', values = {value}},
         })
@@ -172,11 +172,10 @@ g.test_timeout_and_generic_iterator_rejection = function(cg)
         end)
         t.assert_equals(ok, false)
         t.assert_equals(err.code, box.error.VECTOR_TIMEOUT)
-        ok, err = pcall(function()
-            return s.index.vec:pairs({{1, 0}}, {iterator = 'neighbor'})()
+        ok = pcall(function()
+            return s.index.vec:pairs({{1, 0}}, {iterator = 'neighbor'}):head()
         end)
-        t.assert_equals(ok, false)
-        t.assert_equals(err.code, box.error.VECTOR_UNSUPPORTED)
+        t.assert_equals(ok, true)
         box.error.injection.set('ERRINJ_VECTOR_WORK_LIMIT', 1)
         ok, err = pcall(function()
             return s.index.vec:search({1, 0}, {

@@ -56,6 +56,7 @@
 #include "mpstream/mpstream.h"
 #include "small/region.h"
 #include "small/rlist.h"
+#include "lib/ann/ann_numeric.h"
 
 /** {{{ Miscellaneous utils **/
 
@@ -429,6 +430,66 @@ lbox_prepare_auth(lua_State *L)
 
 /** {{{ Lua/C implementation of index:select(): used only by Vinyl **/
 
+/** Encode portable packed coordinates without changing the numeric contract. */
+static int
+lbox_vector_pack(lua_State *L)
+{
+	luaL_checktype(L, 1, LUA_TTABLE);
+	uint32_t count = lua_objlen(L, 1);
+	if (count == 0 || count > MEMTX_VECTOR_MAX_DIMENSION)
+		return luaL_error(L, "vector dimension must be in [1, 4096]");
+	lua_pushnil(L);
+	while (lua_next(L, 1) != 0) {
+		double key = lua_tonumber(L, -2);
+		if (lua_type(L, -2) != LUA_TNUMBER || key < 1 || key > count ||
+		    key != (uint32_t)key)
+			return luaL_error(L,
+					  "vector must be a dense numeric array");
+		lua_pop(L, 1);
+	}
+	struct region *region = &fiber()->gc;
+	size_t svp = region_used(region);
+	char *packed = xregion_alloc_array(region, char, count * sizeof(float));
+	for (uint32_t i = 0; i < count; ++i) {
+		lua_rawgeti(L, 1, i + 1);
+		float value;
+		if (lua_type(L, -1) != LUA_TNUMBER ||
+		    ann_f32_from_double(lua_tonumber(L, -1),
+					&value) != ANN_OK) {
+			region_truncate(region, svp);
+			return luaL_error(L,
+					  "vector coordinates must be finite float32");
+		}
+		lua_pop(L, 1);
+		uint32_t bits;
+		memcpy(&bits, &value, sizeof(bits));
+		for (uint32_t j = 0; j < 4; ++j)
+			packed[i * 4 + j] = (char)(bits >> (j * 8));
+	}
+	luaT_pushvarbinary(L, packed, count * sizeof(float));
+	region_truncate(region, svp);
+	return 1;
+}
+
+/** Decode packed coordinates for projection and client-side inspection. */
+static int
+lbox_vector_unpack(lua_State *L)
+{
+	uint32_t size;
+	const char *data = luaT_tovarbinary(L, 1, &size);
+	if (data == NULL || size == 0 || size % sizeof(float) != 0 ||
+	    size / sizeof(float) > MEMTX_VECTOR_MAX_DIMENSION ||
+	    ann_vector_validate_le(data, size / sizeof(float), ANN_L2) != ANN_OK)
+		return luaL_error(L,
+				  "expected packed finite float32 coordinates");
+	lua_createtable(L, size / sizeof(float), 0);
+	for (uint32_t i = 0; i < size / sizeof(float); ++i) {
+		lua_pushnumber(L, ann_f32le_load(data, i));
+		lua_rawseti(L, -2, i + 1);
+	}
+	return 1;
+}
+
 /** Lua C entry for rich VECTOR search and parallel distance results. */
 static int
 lbox_vector_search(lua_State *L)
@@ -473,6 +534,7 @@ lbox_vector_search(lua_State *L)
 	port_dump_lua(&port, L, PORT_DUMP_LUA_MODE_TABLE);
 	port_destroy(&port);
 	if (with_distance) {
+		lua_pushnil(L);
 		lua_createtable(L, count, 0);
 		for (uint32_t i = 0; i < count; ++i) {
 			lua_pushnumber(L, distances[i]);
@@ -480,7 +542,7 @@ lbox_vector_search(lua_State *L)
 		}
 	}
 	region_truncate(region, svp);
-	return with_distance ? 2 : 1;
+	return with_distance ? 3 : 1;
 fail:
 	region_truncate(region, svp);
 	return luaT_error(L);
@@ -598,6 +660,8 @@ box_lua_misc_init(struct lua_State *L)
 		{"prepare_auth", lbox_prepare_auth},
 		{"select", lbox_select},
 		{"vector_search", lbox_vector_search},
+		{"vector_pack", lbox_vector_pack},
+		{"vector_unpack", lbox_vector_unpack},
 		{"txn_set_isolation", lbox_txn_set_isolation},
 		{"generate_space_id", lbox_generate_space_id},
 		{"generate_func_id", lbox_generate_func_id},
