@@ -587,10 +587,18 @@ box_index_read_view_select(
 					 type, &pos, &pos_end) != 0)
 		return -1;
 	struct index_read_view_iterator it;
-	if (index_read_view_create_iterator_with_offset(index, type, key,
-							part_count, pos,
-							offset, &it) != 0)
+	if (index->def->type == VECTOR && type == ITER_NEIGHBOR) {
+		if (pos != NULL || offset != 0 || update_pos) {
+			diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
+			return -1;
+		}
+		if (memtx_vector_read_view_select(index, key, part_count,
+						  limit, &it) != 0)
+			return -1;
+	} else if (index_read_view_create_iterator_with_offset(
+		index, type, key, part_count, pos, offset, &it) != 0) {
 		return -1;
+	}
 	int rc = 0;
 	uint32_t found = 0;
 	port_c_create(port);

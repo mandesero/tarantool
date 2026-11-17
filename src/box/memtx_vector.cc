@@ -39,8 +39,10 @@ struct memtx_vector_index {
 	unsigned dimension;
 	/** Numeric distance function configured for this index. */
 	enum ann_metric metric;
-	/** Stable allocation owners for the active and private generations. */
-	struct ann_quota_memory memory_owners[2];
+	/** All generation allocators, including ones pinned by read views. */
+	struct rlist generations;
+	/** Read-view headers charged separately from shared graph tapes. */
+	struct rlist read_views;
 	/** All backend allocations are charged to the memtx quota. */
 	struct ann_quota_memory *memory_owner;
 	/** Private generation being built or reclaimed, if any. */
@@ -92,6 +94,70 @@ struct memtx_vector_index {
 	/** Estimated peak temporary bytes allocated by this layer. */
 	uint64_t temporary_peak;
 };
+
+/** A generation allocator survives rebuild while a snapshot retains it. */
+struct vector_generation_memory {
+	/** Stable allocator context stored in graph and persistent pages. */
+	struct ann_quota_memory base;
+	/** Link in the owning index's generation list. */
+	struct rlist link;
+	/** Current or transient generation and read-view references. */
+	uint32_t refs;
+};
+
+/** Frozen backend with a storage-lifetime and quota pin. */
+struct memtx_vector_snapshot {
+	/** Index pin keeps borrowed coordinate allocator contexts alive. */
+	struct memtx_vector_index *index;
+	/** Snapshot metadata allocator. */
+	struct ann_quota_memory memory;
+	/** Allocator of tapes and persistent pages shared with the source. */
+	struct ann_quota_memory *source_memory;
+	/** Immutable backend; each search uses its own temporary context. */
+	struct ann_backend *backend;
+	/** Link used for index memory statistics. */
+	struct rlist link;
+};
+
+static struct ann_quota_memory *
+vector_generation_new(struct memtx_vector_index *index, struct quota *quota)
+{
+	auto *owner = (struct vector_generation_memory *)
+		xcalloc(1, sizeof(struct vector_generation_memory));
+	ann_quota_memory_create(&owner->base, quota);
+	owner->refs = 1;
+	rlist_add_tail_entry(&index->generations, owner, link);
+	return &owner->base;
+}
+
+/** Views keep allocator contexts alive after the generation is retired. */
+static void
+vector_generation_unref(struct ann_quota_memory *memory)
+{
+	auto *owner = (struct vector_generation_memory *)memory;
+	if (--owner->refs != 0)
+		return;
+	assert(memory->blocks == 0 && memory->reserved == 0);
+	rlist_del_entry(owner, link);
+	free(owner);
+}
+
+/** Count each retained generation once, irrespective of snapshot count. */
+static uint64_t
+vector_snapshot_bytes(struct memtx_vector_index *index)
+{
+	uint64_t bytes = 0;
+	struct vector_generation_memory *owner;
+	rlist_foreach_entry(owner, &index->generations, link) {
+		if (&owner->base != index->memory_owner &&
+		    &owner->base != index->transient_memory)
+			bytes += owner->base.bytes;
+	}
+	struct memtx_vector_snapshot *view;
+	rlist_foreach_entry(view, &index->read_views, link)
+		bytes += view->memory.bytes;
+	return bytes;
+}
 
 /** TX-thread-local monotonic diagnostic generation counter. */
 static uint64_t vector_generation_next;
@@ -661,9 +727,7 @@ memtx_vector_index_rebuild(struct index *base)
 		return -1;
 	}
 	struct ann_quota_memory *owner =
-		index->memory_owner == &index->memory_owners[0] ?
-		&index->memory_owners[1] : &index->memory_owners[0];
-	ann_quota_memory_create(owner, index->memory_owner->quota);
+		vector_generation_new(index, index->memory_owner->quota);
 	owner->reserved = index->maintenance.reserved;
 	index->maintenance.reserved = 0;
 	owner->use_reserve = true;
@@ -760,8 +824,8 @@ out:
 	ann_quota_memory_start_gc(owner);
 	ERROR_INJECT_YIELD(ERRINJ_VECTOR_REBUILD_GC_DELAY);
 	index->ops->destroy(replacement);
-	assert(owner->blocks == 0);
 	index->transient_memory = NULL;
+	vector_generation_unref(owner);
 	if (rc == 0) {
 		++index->rebuilds;
 		if (index_weak_ref_check(&ref))
@@ -986,6 +1050,72 @@ fail:
 	return -1;
 }
 
+struct memtx_vector_snapshot *
+memtx_vector_snapshot_new(struct index *base)
+{
+	auto *index = (struct memtx_vector_index *)base;
+	auto *view = (struct memtx_vector_snapshot *)
+		xcalloc(1, sizeof(struct memtx_vector_snapshot));
+	view->index = index;
+	view->source_memory = index->memory_owner;
+	ann_quota_memory_create(&view->memory, index->memory_owner->quota);
+	struct ann_memory memory = ann_quota_memory_bind(&view->memory);
+	enum ann_status status = index->ops->snapshot(index->backend, &memory,
+						     &view->backend);
+	if (vector_index_diag(status, "read view") != 0) {
+		assert(view->memory.blocks == 0);
+		free(view);
+		return NULL;
+	}
+	index_ref(base);
+	auto *owner = (struct vector_generation_memory *)view->source_memory;
+	assert(owner->refs < UINT32_MAX);
+	++owner->refs;
+	rlist_add_tail_entry(&index->read_views, view, link);
+	return view;
+}
+
+void
+memtx_vector_snapshot_delete(struct memtx_vector_snapshot *view)
+{
+	struct memtx_vector_index *index = view->index;
+	index->ops->destroy(view->backend);
+	assert(view->memory.blocks == 0);
+	rlist_del_entry(view, link);
+	vector_generation_unref(view->source_memory);
+	free(view);
+	index_unref(&index->base);
+}
+
+int
+memtx_vector_snapshot_search(struct memtx_vector_snapshot *view,
+			     const float *query,
+			     const struct ann_search_opts *opts,
+			     struct ann_candidate *out, uint32_t *count)
+{
+	struct ann_quota_memory scratch;
+	ann_quota_memory_create(&scratch, view->memory.quota);
+	struct ann_memory memory = ann_quota_memory_bind(&scratch);
+	struct ann_search_opts request = *opts;
+	request.memory = &memory;
+	struct ann_search_control slice = vector_index_control();
+	uint64_t deadline = opts->control->deadline_ns;
+	if (slice.deadline_ns != 0 && slice.deadline_ns < deadline)
+		opts->control->deadline_ns = slice.deadline_ns;
+	opts->control->should_stop = vector_index_should_stop;
+	struct errinj *inj = errinj(ERRINJ_VECTOR_WORK_LIMIT, ERRINJ_INT);
+	if (inj != NULL && inj->iparam > 0)
+		opts->control->work_limit = inj->iparam;
+	enum ann_status status = view->index->ops->search(view->backend,
+		query, &request, out, count);
+	assert(scratch.blocks == 0);
+	if (status == ANN_TIMEOUT && opts->control->deadline_ns < deadline) {
+		diag_set(FiberSliceIsExceeded);
+		return -1;
+	}
+	return vector_index_diag(status, "read view search");
+}
+
 static ssize_t
 memtx_vector_index_size(struct index *base)
 {
@@ -999,9 +1129,10 @@ static ssize_t
 memtx_vector_index_bsize(struct index *base)
 {
 	struct memtx_vector_index *index = (struct memtx_vector_index *)base;
-	return index->common_memory.bytes + index->vector_memory.bytes +
-		index->memory_owner->bytes + (index->transient_memory == NULL ?
-		0 : index->transient_memory->bytes);
+	return vector_snapshot_bytes(index) + index->common_memory.bytes +
+		index->vector_memory.bytes + index->memory_owner->bytes +
+		(index->transient_memory == NULL ? 0 :
+		 index->transient_memory->bytes);
 }
 
 /** Report current index-owned bytes and cumulative search counters. */
@@ -1040,6 +1171,7 @@ memtx_vector_index_stat(struct index *base, struct info_handler *handler)
 		index->common_memory.bytes + index->vector_memory.bytes;
 	uint64_t transient = index->transient_memory == NULL ? 0 :
 		index->transient_memory->bytes;
+	uint64_t read_views = vector_snapshot_bytes(index);
 	uint64_t reserved = index->maintenance.reserved +
 		(index->transient_memory == NULL ? 0 :
 		 index->transient_memory->reserved);
@@ -1099,11 +1231,13 @@ memtx_vector_index_stat(struct index *base, struct info_handler *handler)
 	info_append_int(handler, "temporary_peak", index->temporary_peak);
 	info_append_int(handler, "maintenance_reserved", reserved);
 	info_append_int(handler, "transient", transient);
+	info_append_int(handler, "read_views", read_views);
 	info_append_int(handler, "total",
-			current_bytes + transient);
+			current_bytes + transient + read_views);
 	info_table_begin(handler, "generations");
 	info_append_int(handler, "current", current_bytes);
 	info_append_int(handler, "transient", transient);
+	info_append_int(handler, "read_views", read_views);
 	info_table_end(handler);
 	info_table_end(handler);
 	info_table_begin(handler, "search");
@@ -1195,7 +1329,9 @@ memtx_vector_index_destroy(struct index *base)
 	}
 	ann_tuple_map_destroy(&index->tuples);
 	ann_tuple_map_destroy(&index->groups);
-	assert(index->memory_owner->blocks == 0);
+	assert(rlist_empty(&index->read_views));
+	vector_generation_unref(index->memory_owner);
+	assert(rlist_empty(&index->generations));
 	assert(index->common_memory.blocks == 0);
 	assert(index->vector_memory.blocks == 0);
 	free(index);
@@ -1273,11 +1409,12 @@ memtx_vector_index_new(struct memtx_engine *memtx, struct index_def *def)
 		(struct memtx_vector_index *)xcalloc(1, sizeof(*index));
 	index->ops = ann_backend_find("hnsw");
 	assert(index->ops != NULL);
-	index->memory_owner = &index->memory_owners[0];
+	rlist_create(&index->generations);
+	rlist_create(&index->read_views);
+	index->memory_owner = vector_generation_new(index, &memtx->quota);
 	index_create(&index->base, (struct engine *)memtx,
 		     &memtx_vector_index_vtab.base, def);
 
-	ann_quota_memory_create(index->memory_owner, &memtx->quota);
 	ann_quota_memory_create(&index->common_memory, &memtx->quota);
 	ann_quota_memory_create(&index->vector_memory, &memtx->quota);
 	ann_quota_memory_create(&index->maintenance, &memtx->quota);

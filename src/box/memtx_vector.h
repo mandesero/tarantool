@@ -16,7 +16,11 @@ struct port;
 struct tuple;
 struct iterator;
 struct index_read_view;
+struct index_read_view_iterator;
 struct space_read_view;
+struct ann_search_opts;
+struct ann_candidate;
+struct memtx_vector_snapshot;
 
 /** Storage-neutral arguments of a local VECTOR search. */
 struct memtx_vector_search_opts {
@@ -61,9 +65,31 @@ struct iterator *
 memtx_vector_search_iterator_new(struct index *index,
 				 const struct memtx_vector_search_opts *opts);
 
-/** Freeze primary storage for stable exact reads through VECTOR. */
+/** Freeze HNSW topology and primary tuple visibility through CoW. */
 struct index_read_view *
 memtx_vector_read_view_new(struct index *index);
+
+/** Pin a backend snapshot and the coordinate allocation owner. */
+struct memtx_vector_snapshot *
+memtx_vector_snapshot_new(struct index *index);
+
+/** Release a snapshot and its generation and coordinate pins. */
+void
+memtx_vector_snapshot_delete(struct memtx_vector_snapshot *view);
+
+/** Search frozen topology through the backend-independent contract. */
+int
+memtx_vector_snapshot_search(struct memtx_vector_snapshot *view,
+			     const float *query,
+			     const struct ann_search_opts *opts,
+			     struct ann_candidate *out, uint32_t *count);
+
+/** Materialize a bounded NEIGHBOR result from a read-view HNSW snapshot. */
+int
+memtx_vector_read_view_select(struct index_read_view *view,
+			      const char *key, uint32_t part_count,
+			      uint32_t limit,
+			      struct index_read_view_iterator *it);
 
 /** Attach the parent space before the view is exposed to other threads. */
 void

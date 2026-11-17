@@ -114,6 +114,71 @@ g.test_read_view_with_hash_primary = function(cg)
     end)
 end
 
+g.test_cow_generations_and_limits = function(cg)
+    cg.server:exec(function()
+        local embedding = require('embedding')
+        local s = box.space.vector_review
+        local idx = s.index.vec
+        for i = 1, 100 do s:insert{i, embedding.new({i, 0}), 'v1'} end
+        local first = box.read_view.open()
+        s:update({1}, {{'=', 3, 'v2'}})
+        s:replace{2, embedding.new({200, 0}), 'v2'}
+        local second = box.read_view.open()
+        s:delete{3}
+        idx:rebuild()
+        s:replace{4, embedding.new({400, 0}), 'v3'}
+        idx:rebuild()
+        local stat = idx:stat().memory
+        t.assert_gt(stat.read_views, 0)
+        box.error.injection.set('ERRINJ_VECTOR_ALLOC', 0)
+        local opened = pcall(box.read_view.open)
+        box.error.injection.set('ERRINJ_VECTOR_ALLOC', -1)
+        t.assert_not(opened)
+        t.assert_equals(idx:stat().memory.read_views, stat.read_views)
+        t.assert_equals(stat.total, stat.generations.current +
+            stat.transient + stat.read_views)
+        t.assert_equals(idx:bsize(), stat.total)
+        first:with(function()
+            local rv_idx = first.space.vector_review.index.vec
+            local rows = rv_idx:select({{0, 0}},
+                {iterator = 'neighbor', limit = 4})
+            t.assert_equals({rows[1][1], rows[2][1], rows[3][1], rows[4][1]},
+                            {1, 2, 3, 4})
+            t.assert_equals(rows[1][3], 'v1')
+            t.assert_error_covers({code = box.error.VECTOR_UNSUPPORTED},
+                rv_idx.select, rv_idx, {{0, 0}}, {iterator = 'neighbor'})
+            for _, opts in ipairs({
+                {iterator = 'neighbor', limit = 1025},
+                {iterator = 'neighbor', limit = 1, offset = 1},
+                {iterator = 'neighbor', limit = 1, fetch_pos = true},
+            }) do
+                t.assert_error_covers({code = box.error.VECTOR_UNSUPPORTED},
+                    rv_idx.select, rv_idx, {{0, 0}}, opts)
+            end
+            t.assert_equals(rv_idx:select({{0, 0}},
+                {iterator = 'neighbor', limit = 0}), {})
+            box.error.injection.set('ERRINJ_VECTOR_WORK_LIMIT', 1)
+            local ok, err = pcall(rv_idx.select, rv_idx, {{0, 0}},
+                {iterator = 'neighbor', limit = 1})
+            box.error.injection.set('ERRINJ_VECTOR_WORK_LIMIT', -1)
+            t.assert_not(ok)
+            t.assert_equals(err.code, box.error.VECTOR_WORK_LIMIT)
+        end)
+        first:close()
+        second:with(function()
+            local rows = second.space.vector_review.index.vec:select({{0, 0}},
+                {iterator = 'neighbor', limit = 4})
+            t.assert_equals({rows[1][1], rows[2][1], rows[3][1], rows[4][1]},
+                            {1, 3, 4, 5})
+            t.assert_equals(rows[1][3], 'v2')
+        end)
+        second:close()
+        t.assert_equals(idx:stat().memory.read_views, 0)
+        idx:rebuild()
+        t.assert_equals(idx:search({0, 0}, {limit = 1})[1][3], 'v2')
+    end)
+end
+
 g.test_reuse_with_delayed_maintenance = function(cg)
     cg.server:exec(function()
         local embedding = require('embedding')

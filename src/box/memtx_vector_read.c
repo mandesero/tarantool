@@ -18,6 +18,8 @@
 #include "txn.h"
 #include "small/region.h"
 #include "lib/ann/ann_numeric.h"
+#include "lib/ann/ann_vector.h"
+#include "lib/ann/ann_hnsw.h"
 
 /** Bounded top-k is exposed through the same next/free cursor contract. */
 struct vector_search_iterator {
@@ -112,65 +114,60 @@ memtx_vector_index_count(struct index *index, enum iterator_type type,
 	return index_count(space->index[0], ITER_ALL, NULL, 0);
 }
 
-enum { VECTOR_SCAN_BATCH = 32 };
+/** Frozen topology and primary tuple visibility form one read view. */
+struct vector_read_view {
+	/** Public index read-view interface. */
+	struct index_read_view base;
+	/** Point lookups resolve frozen tuple versions for graph candidates. */
+	struct index_read_view *primary;
+	/** Independently pinned CoW graph root and search contexts. */
+	struct memtx_vector_snapshot *snapshot;
+};
 
-/** One retained result in a bounded exact-search batch. */
-struct vector_scan_row {
+/** One materialized result of a bounded snapshot search. */
+struct vector_read_view_row {
 	/** Owned copy of frozen tuple data. */
 	struct read_view_tuple raw;
-	/** Distance in the common numeric contract. */
+	/** Shared numeric distance, used before primary-key tie breaking. */
 	double distance;
 };
 
-/** Exact ordered scan with memory independent of the number of rows. */
-struct vector_scan {
-	/** Frozen primary index for a public read view. */
-	struct index_read_view *view;
-	/** Owned primary-key comparator operating on raw tuple data. */
-	struct key_def *pk;
-	/** Owned vector field definition. */
-	struct key_def *key_def;
-	/** Configured scalar dimension. */
-	uint32_t dimension;
-	/** Configured distance function. */
-	enum ann_metric metric;
-	/** Whether the source has been exhausted. */
-	bool exhausted;
-	/** Results retained between calls to next. */
-	struct vector_scan_row rows[VECTOR_SCAN_BATCH];
-	/** Number of retained rows. */
+/** Private bounded search result; no primary-index scan is performed. */
+struct vector_read_view_result {
+	/** Number of retained tuple copies. */
 	uint32_t count;
-	/** Next row in the current batch. */
+	/** Next row to return. */
 	uint32_t pos;
-	/** Last emitted row, retained as the next scan's lower bound. */
-	struct vector_scan_row last;
-	/** Canonical query. */
-	float query[MEMTX_VECTOR_MAX_DIMENSION];
+	/** At most the explicitly requested limit rows. */
+	struct vector_read_view_row rows[];
 };
 
-/** A result owns a copy of frozen tuple data. */
-static void
-vector_scan_row_clear(struct vector_scan_row *row)
-{
-	free((void *)row->raw.data);
-	memset(row, 0, sizeof(*row));
-}
+/** Visibility is resolved through the frozen primary index, never live maps. */
+struct vector_read_view_filter {
+	/** Frozen index definitions and tuple lookup. */
+	struct vector_read_view *view;
+	/** Request budget shared by lookups and coordinate comparisons. */
+	struct ann_search_control *control;
+	/** First failure raised by the predicate. */
+	int rc;
+};
 
-static void
-vector_scan_delete(struct vector_scan *scan)
-{
-	for (uint32_t i = 0; i < scan->count; ++i)
-		vector_scan_row_clear(&scan->rows[i]);
-	vector_scan_row_clear(&scan->last);
-	key_def_delete(scan->pk);
-	key_def_delete(scan->key_def);
-	free(scan);
-}
+/** The opaque cursor holds either a bounded ANN result or a primary cursor. */
+struct vector_read_view_iterator {
+	/** Public read-view iterator interface. */
+	struct index_read_view_iterator_base base;
+	/** Materialized bounded search, or NULL for an ALL iterator. */
+	struct vector_read_view_result *result;
+	/** Primary ALL iterator when no distance order is requested. */
+	struct index_read_view_iterator *source;
+};
 
-/** Exact iteration must use the same canonical coordinates as HNSW. */
+static_assert(sizeof(struct vector_read_view_iterator) <=
+	      INDEX_READ_VIEW_ITERATOR_SIZE, "vector read-view iterator size");
+
 static int
-vector_scan_decode(const char *data, uint32_t dimension,
-		   enum ann_metric metric, float *out)
+vector_read_view_decode(const char *data, uint32_t dimension,
+			enum ann_metric metric, float *out)
 {
 	if (data == NULL)
 		goto invalid;
@@ -200,38 +197,87 @@ invalid:
 	return -1;
 }
 
-static struct vector_scan *
-vector_scan_new(struct index_read_view *view, struct index_def *def,
-		struct key_def *pk, const char *key, uint32_t part_count)
+/** Resolve a coordinate owner to its tuple in this snapshot. */
+static int
+vector_read_view_lookup(struct vector_read_view_filter *filter,
+			const struct ann_vector *vector,
+			struct read_view_tuple *raw)
 {
-	if (part_count != 1) {
-		diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
-		return NULL;
+	*raw = read_view_tuple_none();
+	struct tuple *owner = ann_vector_owner(vector);
+	assert(owner != NULL);
+	struct index_read_view *primary = filter->view->primary;
+	uint32_t key_size;
+	const char *key = tuple_extract_key(owner, primary->def->key_def,
+					    MULTIKEY_NONE, &key_size);
+	if (key == NULL)
+		return -1;
+	uint32_t part_count = mp_decode_array(&key);
+	if (index_read_view_get_raw(primary, key, part_count, raw) != 0)
+		return -1;
+	if (raw->data == NULL)
+		return 0;
+	const char *field = tuple_field_raw_by_part(
+		tuple_format_runtime, raw->data, NULL,
+		filter->view->base.def->key_def->parts, MULTIKEY_NONE);
+	uint32_t dimension;
+	const char *bytes = field == NULL ? NULL :
+		mp_decode_embedding(&field, &dimension);
+	if (bytes == NULL || dimension != ann_vector_dimension(vector)) {
+		*raw = read_view_tuple_none();
+		return 0;
 	}
-	struct vector_scan *scan = xcalloc(1, sizeof(*scan));
-	scan->view = view;
-	scan->dimension = def->opts.dimension;
-	scan->metric = (enum ann_metric)def->opts.vector_distance;
-	scan->pk = key_def_dup(pk);
-	scan->key_def = key_def_dup(def->key_def);
-	if (vector_scan_decode(key, scan->dimension, scan->metric,
-			       scan->query) != 0) {
-		vector_scan_delete(scan);
-		return NULL;
+	const char *expected = ann_vector_data(vector);
+	for (uint32_t i = 0; i < dimension; ++i) {
+		enum ann_status status =
+			ann_search_control_step(filter->control);
+		if (status != ANN_OK) {
+			if (status == ANN_STOPPED) {
+				diag_set(FiberIsCancelled);
+			} else {
+				int code = ER_VECTOR_WORK_LIMIT;
+				if (status == ANN_TIMEOUT)
+					code = ER_VECTOR_TIMEOUT;
+				diag_set(ClientError, code);
+			}
+			return -1;
+		}
+		if (memcmp(bytes + i * sizeof(float), expected + i * sizeof(float),
+			   sizeof(float)) != 0) {
+			*raw = read_view_tuple_none();
+			return 0;
+		}
 	}
-	return scan;
+	return 0;
+}
+
+/** Rejected versions may still be used to navigate the frozen graph. */
+static bool
+vector_read_view_accept(uint64_t label, const struct ann_vector *vector,
+			void *ctx)
+{
+	(void)label;
+	struct vector_read_view_filter *filter = ctx;
+	if (filter->rc != 0)
+		return false;
+	size_t svp = region_used(&fiber()->gc);
+	struct read_view_tuple raw;
+	filter->rc = vector_read_view_lookup(filter, vector, &raw);
+	bool accept = filter->rc == 0 && raw.data != NULL;
+	region_truncate(&fiber()->gc, svp);
+	return accept;
 }
 
 /** Use the complete primary-key contract to resolve equal distances. */
 static int
-vector_scan_compare(struct vector_scan *scan,
-		    const struct vector_scan_row *a,
-		    const struct vector_scan_row *b)
+vector_read_view_compare(struct key_def *pk,
+			 const struct vector_read_view_row *a,
+			 const struct vector_read_view_row *b)
 {
 	if (a->distance != b->distance)
 		return a->distance < b->distance ? -1 : 1;
-	for (uint32_t i = 0; i < scan->pk->part_count; ++i) {
-		struct key_part *part = &scan->pk->parts[i];
+	for (uint32_t i = 0; i < pk->part_count; ++i) {
+		struct key_part *part = &pk->parts[i];
 		const char *left = tuple_field_raw_by_part(
 			tuple_format_runtime, a->raw.data, NULL,
 			part, MULTIKEY_NONE);
@@ -246,127 +292,20 @@ vector_scan_compare(struct vector_scan *scan,
 	return 0;
 }
 
-/** Keep only the next batch; no array proportional to the space is built. */
-static int
-vector_scan_offer(struct vector_scan *scan, struct vector_scan_row *row)
+static void
+vector_read_view_result_delete(struct vector_read_view_result *result)
 {
-	const char *field = tuple_field_raw_by_part(
-		tuple_format_runtime, row->raw.data, NULL,
-		scan->key_def->parts, MULTIKEY_NONE);
-	enum ann_status status;
-	uint32_t dimension;
-	const char *bytes = field == NULL ? NULL :
-		mp_decode_embedding(&field, &dimension);
-	status = bytes == NULL || dimension != scan->dimension ? ANN_INVALID :
-		ann_distance_raw(scan->query, false, bytes, true,
-				 scan->dimension, scan->metric, NULL,
-				 &row->distance);
-	if (status != ANN_OK) {
-		diag_set(ClientError, ER_VECTOR_INVALID);
-		return -1;
-	}
-	if (scan->last.raw.data != NULL &&
-	    vector_scan_compare(scan, row, &scan->last) <= 0)
-		return 0;
-	uint32_t pos = 0;
-	while (pos < scan->count &&
-	       vector_scan_compare(scan, &scan->rows[pos], row) < 0)
-		++pos;
-	if (pos == VECTOR_SCAN_BATCH)
-		return 0;
-	char *copy = xmalloc(row->raw.size);
-	memcpy(copy, row->raw.data, row->raw.size);
-	row->raw.data = copy;
-	row->raw.ptr = NULL;
-	if (scan->count == VECTOR_SCAN_BATCH)
-		vector_scan_row_clear(&scan->rows[--scan->count]);
-	memmove(scan->rows + pos + 1, scan->rows + pos,
-		(scan->count - pos) * sizeof(*row));
-	scan->rows[pos] = *row;
-	++scan->count;
-	return 0;
+	for (uint32_t i = 0; i < result->count; ++i)
+		free((void *)result->rows[i].raw.data);
+	free(result);
 }
-
-/** Rescanning trades CPU work for space independent of the result count. */
-static int
-vector_scan_refill(struct vector_scan *scan)
-{
-	scan->count = 0;
-	scan->pos = 0;
-	struct index_read_view_iterator it;
-	if (index_read_view_create_iterator(scan->view, ITER_ALL,
-					    NULL, 0, &it) != 0)
-		return -1;
-	int rc = 0;
-	int64_t slice = clock_monotonic64() + 1000000;
-	while (true) {
-		size_t svp = region_used(&fiber()->gc);
-		struct vector_scan_row row = {0};
-		rc = index_read_view_iterator_next_raw(&it, &row.raw);
-		if (rc != 0 || row.raw.data == NULL)
-			break;
-		rc = vector_scan_offer(scan, &row);
-		region_truncate(&fiber()->gc, svp);
-		if (rc != 0)
-			break;
-		if (clock_monotonic64() < slice)
-			continue;
-		if (box_check_slice() != 0) {
-			rc = -1;
-			break;
-		}
-		slice = clock_monotonic64() + 1000000;
-	}
-	index_read_view_iterator_destroy(&it);
-	if (scan->count == 0 || rc != 0)
-		scan->exhausted = true;
-	return rc;
-}
-
-/** Retain the last row as an exclusive lower bound for the next batch. */
-static int
-vector_scan_next(struct vector_scan *scan, struct vector_scan_row **out)
-{
-	*out = NULL;
-	if (scan->exhausted)
-		return 0;
-	if (scan->pos == scan->count && vector_scan_refill(scan) != 0)
-		return -1;
-	if (scan->exhausted)
-		return 0;
-	vector_scan_row_clear(&scan->last);
-	scan->last = scan->rows[scan->pos];
-	memset(&scan->rows[scan->pos++], 0, sizeof(scan->last));
-	*out = &scan->last;
-	return 0;
-}
-
-/** Frozen primary storage supplies stable tuples without copying a graph. */
-struct vector_read_view {
-	/** Public index read-view interface. */
-	struct index_read_view base;
-	/** Independently pinned primary-index snapshot. */
-	struct index_read_view *primary;
-};
-
-/** The opaque read-view iterator only stores a pointer to its scan. */
-struct vector_read_view_iterator {
-	/** Public read-view iterator interface. */
-	struct index_read_view_iterator_base base;
-	/** Incremental exact scan, or NULL for an ALL iterator. */
-	struct vector_scan *scan;
-	/** Primary ALL iterator when no distance order is requested. */
-	struct index_read_view_iterator *source;
-};
-
-static_assert(sizeof(struct vector_read_view_iterator) <=
-	      INDEX_READ_VIEW_ITERATOR_SIZE, "vector read-view iterator size");
 
 static void
 vector_read_view_free(struct index_read_view *base)
 {
 	struct vector_read_view *view = (struct vector_read_view *)base;
 	index_read_view_delete(view->primary);
+	memtx_vector_snapshot_delete(view->snapshot);
 	free(view);
 }
 
@@ -375,15 +314,14 @@ vector_read_view_iterator_destroy(struct index_read_view_iterator *base)
 {
 	struct vector_read_view_iterator *it =
 		(struct vector_read_view_iterator *)base;
-	if (it->scan != NULL)
-		vector_scan_delete(it->scan);
+	if (it->result != NULL)
+		vector_read_view_result_delete(it->result);
 	if (it->source != NULL) {
 		index_read_view_iterator_destroy(it->source);
 		free(it->source);
 	}
 }
 
-/** Read-view results remain valid until the next cursor operation. */
 static int
 vector_read_view_next(struct index_read_view_iterator *base,
 		      struct read_view_tuple *out)
@@ -392,45 +330,159 @@ vector_read_view_next(struct index_read_view_iterator *base,
 		(struct vector_read_view_iterator *)base;
 	if (it->source != NULL)
 		return index_read_view_iterator_next_raw(it->source, out);
-	struct vector_scan_row *row;
-	int rc = vector_scan_next(it->scan, &row);
-	*out = row == NULL ? read_view_tuple_none() : row->raw;
-	return rc;
+	struct vector_read_view_result *result = it->result;
+	*out = result->pos == result->count ? read_view_tuple_none() :
+		result->rows[result->pos++].raw;
+	return 0;
 }
 
-/** Freeze data through the primary index rather than a mutable HNSW graph. */
+static void
+vector_read_view_iterator_create(struct index_read_view *view,
+				 struct index_read_view_iterator *iterator)
+{
+	struct vector_read_view_iterator *it =
+		(struct vector_read_view_iterator *)iterator;
+	memset(it, 0, sizeof(*it));
+	it->base.index = view;
+	it->base.destroy = vector_read_view_iterator_destroy;
+	it->base.next_raw = vector_read_view_next;
+	it->base.position = generic_index_read_view_iterator_position;
+}
+
+static uint64_t
+vector_read_view_now_ns(void *ctx)
+{
+	(void)ctx;
+	return clock_monotonic64();
+}
+
+int
+memtx_vector_read_view_select(struct index_read_view *base,
+			      const char *key, uint32_t part_count,
+			      uint32_t limit,
+			      struct index_read_view_iterator *iterator)
+{
+	if (part_count != 1 || limit > 1024) {
+		diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
+		return -1;
+	}
+	struct vector_read_view *view = (struct vector_read_view *)base;
+	struct ann_search_control control = {
+		.deadline_ns = clock_monotonic64() + 1000000000,
+		.work_limit = 1ULL << 32,
+		.now_ns = vector_read_view_now_ns,
+	};
+	float query[MEMTX_VECTOR_MAX_DIMENSION];
+	enum ann_metric metric =
+		(enum ann_metric)base->def->opts.vector_distance;
+	if (vector_read_view_decode(key, base->def->opts.dimension,
+				    metric, query) != 0)
+		return -1;
+	vector_read_view_iterator_create(base, iterator);
+	struct vector_read_view_iterator *it =
+		(struct vector_read_view_iterator *)iterator;
+	it->result = xcalloc(1, sizeof(*it->result) +
+			     limit * sizeof(*it->result->rows));
+	struct ann_candidate *candidates = xcalloc(MAX(limit, 1),
+						   sizeof(*candidates));
+	struct vector_read_view_filter ctx = {view, &control, 0};
+	struct ann_filter filter = {vector_read_view_accept, &ctx};
+	struct ann_hnsw_search_opts algorithm = {
+		.expansion = MAX(limit, base->def->opts.vector_ef_search),
+	};
+	struct ann_search_opts opts = {
+		.candidate_limit = limit,
+		.query_dimension = base->def->opts.dimension,
+		.filter = &filter,
+		.control = &control,
+		.algorithm = &algorithm,
+	};
+	uint32_t count;
+	int rc = memtx_vector_snapshot_search(view->snapshot, query, &opts,
+					      candidates, &count);
+	if (rc != 0 || ctx.rc != 0)
+		goto fail;
+	for (uint32_t i = 0; i < count; ++i) {
+		size_t svp = region_used(&fiber()->gc);
+		struct vector_read_view_row row = {
+			.distance = candidates[i].distance,
+		};
+		rc = vector_read_view_lookup(&ctx, candidates[i].vector,
+					     &row.raw);
+		if (rc != 0) {
+			region_truncate(&fiber()->gc, svp);
+			goto fail;
+		}
+		if (row.raw.data == NULL) {
+			region_truncate(&fiber()->gc, svp);
+			continue;
+		}
+		uint32_t pos = 0;
+		struct vector_read_view_result *result = it->result;
+		struct key_def *pk = view->primary->def->key_def;
+		while (pos < result->count) {
+			if (box_check_slice() != 0) {
+				region_truncate(&fiber()->gc, svp);
+				goto fail;
+			}
+			uint64_t now = clock_monotonic64();
+			if (now >= control.deadline_ns) {
+				diag_set(ClientError, ER_VECTOR_TIMEOUT);
+				region_truncate(&fiber()->gc, svp);
+				goto fail;
+			}
+			if (vector_read_view_compare(pk, &result->rows[pos],
+						     &row) >= 0)
+				break;
+			++pos;
+		}
+		int cmp = pos == result->count ? -1 :
+			vector_read_view_compare(pk, &result->rows[pos], &row);
+		if (cmp == 0) {
+			region_truncate(&fiber()->gc, svp);
+			continue;
+		}
+		char *copy = xmalloc(row.raw.size);
+		memcpy(copy, row.raw.data, row.raw.size);
+		row.raw.data = copy;
+		row.raw.ptr = NULL;
+		region_truncate(&fiber()->gc, svp);
+		memmove(result->rows + pos + 1, result->rows + pos,
+			(result->count - pos) * sizeof(row));
+		result->rows[pos] = row;
+		++result->count;
+	}
+	free(candidates);
+	return 0;
+fail:
+	free(candidates);
+	vector_read_view_iterator_destroy(iterator);
+	return -1;
+}
+
 static int
 vector_read_view_create_iterator(struct index_read_view *base,
 				 enum iterator_type type, const char *key,
 				 uint32_t part_count, const char *pos,
 				 struct index_read_view_iterator *iterator)
 {
-	if (pos != NULL || (type != ITER_ALL && type != ITER_NEIGHBOR)) {
+	(void)key;
+	if (pos != NULL || type != ITER_ALL || part_count != 0) {
 		diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
 		return -1;
 	}
 	struct vector_read_view *view = (struct vector_read_view *)base;
+	vector_read_view_iterator_create(base, iterator);
 	struct vector_read_view_iterator *it =
 		(struct vector_read_view_iterator *)iterator;
-	memset(it, 0, sizeof(*it));
-	it->base.index = base;
-	it->base.destroy = vector_read_view_iterator_destroy;
-	it->base.next_raw = vector_read_view_next;
-	it->base.position = generic_index_read_view_iterator_position;
-	if (type == ITER_ALL) {
-		it->source = xmalloc(sizeof(*it->source));
-		if (index_read_view_create_iterator(view->primary, ITER_ALL,
-						    NULL, 0, it->source) != 0) {
-			free(it->source);
-			it->source = NULL;
-			return -1;
-		}
-		return 0;
+	it->source = xmalloc(sizeof(*it->source));
+	if (index_read_view_create_iterator(view->primary, ITER_ALL,
+					    NULL, 0, it->source) != 0) {
+		free(it->source);
+		it->source = NULL;
+		return -1;
 	}
-	it->scan = vector_scan_new(view->primary, base->def,
-				   view->primary->def->key_def,
-				   key, part_count);
-	return it->scan == NULL ? -1 : 0;
+	return 0;
 }
 
 static int
@@ -462,6 +514,12 @@ memtx_vector_read_view_new(struct index *index)
 	struct space *space = space_by_id(index->def->space_id);
 	view->primary = index_create_read_view(space->index[0]);
 	if (view->primary == NULL) {
+		free(view);
+		return NULL;
+	}
+	view->snapshot = memtx_vector_snapshot_new(index);
+	if (view->snapshot == NULL) {
+		index_read_view_delete(view->primary);
 		free(view);
 		return NULL;
 	}

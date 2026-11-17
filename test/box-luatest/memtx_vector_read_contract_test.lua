@@ -185,11 +185,12 @@ g.test_read_view_embedding_cursor = function(cg)
         s:drop()
         rv:with(function()
             local idx = rv.space.vector_read_contract.index.vec
-            local rows = {}
-            for _, row in idx:pairs({embedding.new({0, 0})},
-                                    {iterator = 'NEIGHBOR'}) do
-                table.insert(rows, row)
-            end
+            t.assert_error_covers({code = box.error.VECTOR_UNSUPPORTED},
+                function()
+                    idx:pairs({embedding.new({0, 0})}, {iterator = 'NEIGHBOR'})
+                end)
+            local rows = idx:select({embedding.new({0, 0})},
+                                    {iterator = 'NEIGHBOR', limit = 70})
             t.assert_equals(#rows, 70)
             for i, row in ipairs(rows) do
                 t.assert_equals(row[1], i)

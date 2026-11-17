@@ -1,6 +1,6 @@
 # Native VECTOR implementation contract
 
-The RFC revision dated 2026-11-17 is normative. This document covers the
+The RFC revision dated 2026-11-18 is normative. This document covers the
 native index.
 The distributed API contract is maintained in the companion
 [CRUD guide](https://github.com/mandesero/crud/blob/codex/vector-search/doc/vector-search.md).
@@ -18,6 +18,10 @@ for search, mutations, membership, reclamation and statistics. `ann_vector`
 owns shared coordinates independently of the library. HNSW configuration is
 algorithm-specific, with no USearch types in the storage layer. The same C
 contract tests run against Flat and USearch. Flat remains a test oracle.
+Production backends also implement immutable graph snapshots. The snapshot
+operation retains a persistent root without copying coordinates or walking
+nodes. Snapshot search receives a storage visibility predicate and uses a
+request-local allocator for its private search context.
 
 The current contract provides bounded top-k, with no continuing search state.
 This does not prohibit streaming HNSW traversal. A future cursor contract must
@@ -53,7 +57,7 @@ yield and concurrent mutations; a cursor over materialized top-k is insufficient
   (and an empty distance array with `with_distance`).
   Positive-limit empty results still register an index-wide MVCC dependency.
 - Linearizable VECTOR reads remain rejected. Public `box.read_view` uses
-  frozen primary storage and exact scans, independent of the mutable graph.
+  a frozen CoW HNSW graph and point lookups in frozen primary storage.
 
 ## Ownership, transactions and DDL
 
@@ -139,12 +143,29 @@ are enforced by CRUD and documented there.
 | unkeyed `count` | visible primary-index row count |
 | offset, position, continuation | reject early |
 | functional, multikey or nullable vector part | reject at DDL |
-| public `box.read_view` | frozen ALL or exact ordered NEIGHBOR |
+| public `box.read_view` | frozen ALL or bounded ANN NEIGHBOR |
 
-Public read-view NEIGHBOR uses a batch of 32 results and rescans frozen
-primary storage for each batch. Returning R rows costs
-O(N * d * ceil(R / 32)). It checks the fiber slice without cloning HNSW.
-Ordinary VECTOR pairs does not expose this exact-scan implementation.
+Public read-view NEIGHBOR is approximate bounded top-k. It requires an
+explicit limit from 0 through 1024, with the same one-second request budget,
+work limit, cancellation and fiber-slice checks as ordinary select.
+NEIGHBOR pairs and pagination are unsupported. ALL delegates to frozen
+primary iteration without HNSW.
+
+Opening a read view retains a persistent radix root and graph entry metadata
+in constant time. A graph write copies only affected node tapes and shared
+radix paths; coordinates remain shared. Candidate coordinate owners supply
+primary keys for point lookups in the frozen primary index. A candidate is
+accepted only when its coordinates match the frozen tuple version. There
+is no primary scan or exact fallback for NEIGHBOR. Results are ordered by
+distance and primary key among the candidates found.
+
+DML, slot reuse, rollback, rebuild and DROP cannot change an existing
+snapshot. Undo restores retained tape pointers without allocation or writing
+through a snapshot, including a snapshot created before the transaction
+rolls back. Read views pin allocation owners until their final release.
+Long-lived snapshots can retain additional graph versions and tuples; the
+shared memtx quota remains the allocation bound. The node cap applies to
+each working graph, not to the sum of retained CoW versions.
 
 ## Embedding coordinates
 
@@ -186,12 +207,15 @@ owned coordinates kept only by graph navigation. `borrowed_vectors` reports
 packed coordinate bytes in bound tuples without adding them to memory.total. `generations.current` includes the
 active graph and shared owners; `generations.transient` counts the private
 graph being built or reclaimed. Coordinates are never double counted.
-`memory.total` and `bsize()` include both generations, excluding tuple storage,
+`generations.read_views` and `memory.read_views` count snapshot headers and
+retired generations retained by read views. Shared pages are counted once
+under their allocation owner: current, transient or read_views.
+`memory.total` and `bsize()` sum these three categories, excluding tuple storage,
 region memory, quota rounding and system allocator overhead; they are not RSS.
 `memory.maintenance_reserved` is unused quota credit, not allocated bytes, and
 is reported separately from total and bsize. `maintenance` exposes completed
 and failed rebuild counts, running state, admitted insertions and their cap.
-Public read-view scans do not increment ANN search counters.
+Public read-view searches do not increment ordinary ANN search counters.
 Search counters are cumulative
 requests, errors, timeouts, visited and filtered candidates. `duration_ns`
 counts time in admitted C searches, including query decoding, sorting, port
