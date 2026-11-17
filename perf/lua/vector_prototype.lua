@@ -1,7 +1,9 @@
+local embedding = require('embedding')
 local bit = require('bit')
 local clock = require('clock')
 local digest = require('digest')
 local fio = require('fio')
+local ffi = require('ffi')
 local json = require('json')
 local msgpack = require('msgpack')
 local tarantool = require('tarantool')
@@ -24,12 +26,16 @@ local vectors = {}
 local queries = {}
 for i = 1, count do
     local vector = {}
-    for j = 1, dimension do vector[j] = random() * 2 - 1 end
+    for j = 1, dimension do
+        vector[j] = tonumber(ffi.cast('float', random() * 2 - 1))
+    end
     vectors[i] = vector
 end
 for i = 1, query_count do
     local query = {}
-    for j = 1, dimension do query[j] = random() * 2 - 1 end
+    for j = 1, dimension do
+        query[j] = tonumber(ffi.cast('float', random() * 2 - 1))
+    end
     queries[i] = query
 end
 local checksum = digest.sha256_hex(msgpack.encode({vectors, queries}))
@@ -72,13 +78,13 @@ fio.mktree(work_dir)
 box.cfg({work_dir = work_dir, log_level = 'error'})
 local space = box.schema.space.create('prototype_bench')
 space:format({{name = 'id', type = 'unsigned'},
-              {name = 'embedding', type = 'array'}})
+              {name = 'embedding', type = 'embedding'}})
 space:create_index('pk')
-for id, vector in ipairs(vectors) do space:insert{id, vector} end
+for id, vector in ipairs(vectors) do space:insert{id, embedding.new(vector)} end
 local started = clock.monotonic()
 local index = space:create_index('vec', {
     type = 'vector', dimension = dimension,
-    unique = false, parts = {{2, 'array'}},
+    unique = false, parts = {{2, 'embedding'}},
 })
 local build_seconds = clock.monotonic() - started
 local times = {}

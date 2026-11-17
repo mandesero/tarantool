@@ -983,11 +983,10 @@ memtx_space_check_index_def(struct space *space, struct index_def *index_def)
 				 "Vector index can not be unique");
 			return -1;
 		}
-		if (key_def->parts[0].type != FIELD_TYPE_ARRAY &&
-		    key_def->parts[0].type != FIELD_TYPE_VARBINARY) {
+		if (key_def->parts[0].type != FIELD_TYPE_EMBEDDING) {
 			diag_set(ClientError, ER_MODIFY_INDEX,
 				 index_def->name, space_name(space),
-				 "Vector index field type must be ARRAY or VARBINARY");
+				 "Vector index field type must be EMBEDDING");
 			return -1;
 		}
 		if (key_def->is_multikey) {

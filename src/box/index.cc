@@ -44,6 +44,7 @@
 #include "box.h"
 #include "base64.h"
 #include "scoped_guard.h"
+#include "mp_embedding.h"
 
 struct rlist box_on_select = RLIST_HEAD_INITIALIZER(box_on_select);
 
@@ -169,8 +170,12 @@ iterator_validate(struct index_def *index_def, enum iterator_type type,
 			}
 		}
 	} else if (index_def->type == VECTOR) {
-		if (part_count != 1 || mp_typeof(*key) != MP_ARRAY ||
-		    mp_decode_array(&key) != index_def->opts.dimension) {
+		uint32_t dimension = 0;
+		if (part_count == 1 && mp_typeof(*key) == MP_ARRAY)
+			dimension = mp_decode_array(&key);
+		else if (part_count == 1 && mp_typeof(*key) == MP_EXT)
+			mp_decode_embedding(&key, &dimension);
+		if (dimension != index_def->opts.dimension) {
 			diag_set(ClientError, ER_VECTOR_INVALID);
 			return -1;
 		}

@@ -2075,7 +2075,7 @@ end
 base_index_mt.pairs_ffi = function(index, key, opts)
     check_index_arg(index, 'pairs', 2)
     if index.type == 'VECTOR' then
-        return base_index_mt.pairs_luac(index, key, opts)
+        box.error(box.error.VECTOR_UNSUPPORTED, 2)
     end
     -- Encode the key on cord ibuf. Note, since the ibuf may be
     -- reallocated when we encode iterator_pos, we can't use the pointers
@@ -2105,12 +2105,8 @@ base_index_mt.pairs_ffi = function(index, key, opts)
 end
 base_index_mt.pairs_luac = function(index, key, opts)
     check_index_arg(index, 'pairs', 2)
-    if index.type == 'VECTOR' and type(opts) == 'table' then
-        for name in pairs(opts) do
-            if name ~= 'iterator' then
-                box.error(box.error.VECTOR_UNSUPPORTED, 2)
-            end
-        end
+    if index.type == 'VECTOR' then
+        box.error(box.error.VECTOR_UNSUPPORTED, 2)
     end
     key = keify(key)
     local itype, after, offset = check_pairs_opts(opts, #key == 0, 2)
@@ -2125,9 +2121,6 @@ end
 -- index subtree size
 base_index_mt.count_ffi = function(index, key, opts)
     check_index_arg(index, 'count', 2)
-    if index.type == 'VECTOR' then
-        return base_index_mt.count_luac(index, key, opts)
-    end
     local ibuf = cord_ibuf_take()
     local pkey, pkey_end = tuple_encode(ibuf, key, 2)
     local itype = check_iterator_type(opts, pkey + 1 >= pkey_end, 2);
@@ -2188,8 +2181,6 @@ base_index_mt.get_luac = function(index, key)
     return internal.get(index.space_id, index.id, key)
 end
 
-box.vector = {pack = internal.vector_pack, unpack = internal.vector_unpack}
-
 base_index_mt.search = function(index, query, opts)
     check_index_arg(index, 'search', 2)
     local function invalid(message)
@@ -2201,8 +2192,8 @@ base_index_mt.search = function(index, query, opts)
     if index.type ~= 'VECTOR' then
         unsupported('Search requires a VECTOR index')
     end
-    if type(query) ~= 'table' then
-        invalid('VECTOR query must be a dense numeric array')
+    if type(query) ~= 'table' and not require('embedding').is(query) then
+        invalid('VECTOR query must be a dense numeric array or embedding')
     end
     if opts == nil then
         opts = {}

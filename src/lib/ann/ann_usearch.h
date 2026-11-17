@@ -68,7 +68,10 @@ ann_usearch_prepare_shared(struct ann_backend *backend, uint64_t label,
 bool
 ann_usearch_contains(const struct ann_backend *backend, uint64_t label);
 
-/** Read maintenance counters without scanning graph entries. */
+/**
+ * Return GC-safe reusable slots and write the allocated node count to size.
+ * A nonzero return permits insertion without increasing that node count.
+ */
 uint64_t
 ann_usearch_reclaimable(const struct ann_backend *backend, uint64_t *size);
 

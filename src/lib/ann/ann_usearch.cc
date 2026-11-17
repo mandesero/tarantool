@@ -209,13 +209,13 @@ struct ann_usearch_entry {
 	bool reclaimed;
 };
 
-/** Open-addressed label lookup; state 2 preserves probe chains. */
+/** Open-addressed label lookup with backward-shift deletion. */
 struct ann_usearch_lookup_entry {
 	/** Version label. */
 	uint64_t label;
 	/** Graph slot corresponding to the label. */
 	uint32_t slot;
-	/** Empty, occupied, or deleted. */
+	/** Empty or occupied. */
 	uint8_t state;
 };
 
@@ -233,9 +233,9 @@ struct ann_backend {
 	ann_graph graph;
 	/** Slot-indexed vector lookup. */
 	struct ann_usearch_entry *entries;
-	/** Label-to-slot lookup with tombstones. */
+	/** Label-to-slot lookup without historical tombstones. */
 	struct ann_usearch_lookup_entry *lookup;
-	/** Reclaimed graph slots awaiting generation rebuild. */
+	/** GC-safe slots reusable without growing the graph. */
 	uint32_t *reclaim_queue;
 	/** Number of reclaimed slots in the queue. */
 	uint32_t reclaim_count;
@@ -277,7 +277,13 @@ struct ann_change {
 	bool applied;
 	/** Whether allocation-free undo consumed this change. */
 	bool rolled_back;
-	/** Reverse-link snapshots retained until finish. */
+	/** Whether insertion replaces an externally reclaimed graph node. */
+	bool reused;
+	/** Whether this change exclusively reserves a reusable slot. */
+	bool slot_reserved;
+	/** Previous navigation owner retained until successful finish. */
+	struct ann_usearch_entry old_entry;
+	/** Own and reverse-link snapshots retained until finish. */
 	ann_graph::add_undo_t undo;
 };
 
@@ -328,7 +334,7 @@ ann_usearch_hash(uint64_t value)
 	return value ^ (value >> 31);
 }
 
-/** Find one occupied hash slot, preserving deleted probe chains. */
+/** Find a label before reaching the first empty bucket. */
 static size_t
 ann_usearch_lookup_find(const struct ann_usearch_lookup_entry *lookup,
 			size_t capacity, uint64_t label)
@@ -346,30 +352,18 @@ ann_usearch_lookup_find(const struct ann_usearch_lookup_entry *lookup,
 	return SIZE_MAX;
 }
 
-/** Insert into a table whose live load is at most one half. */
+/** Insert into a table whose occupied load is at most one half. */
 static void
 ann_usearch_lookup_insert(struct ann_usearch_lookup_entry *lookup,
 			  size_t capacity, uint64_t label, uint32_t slot)
 {
 	assert(capacity != 0);
-	size_t offset = ann_usearch_hash(label) & (capacity - 1);
-	size_t deleted = SIZE_MAX;
-	for (size_t i = 0; i < capacity; ++i) {
-		size_t at = (offset + i) & (capacity - 1);
-		if (lookup[at].state == 2 && deleted == SIZE_MAX)
-			deleted = at;
-		if (lookup[at].state != 0)
-			continue;
-		at = deleted == SIZE_MAX ? at : deleted;
-		lookup[at].label = label;
-		lookup[at].slot = slot;
-		lookup[at].state = 1;
-		return;
-	}
-	assert(deleted != SIZE_MAX);
-	lookup[deleted].label = label;
-	lookup[deleted].slot = slot;
-	lookup[deleted].state = 1;
+	size_t at = ann_usearch_hash(label) & (capacity - 1);
+	while (lookup[at].state != 0)
+		at = (at + 1) & (capacity - 1);
+	lookup[at].label = label;
+	lookup[at].slot = slot;
+	lookup[at].state = 1;
 }
 
 /** Finds a retained label; graph slots remain stable until rebuilding. */
@@ -383,14 +377,24 @@ ann_usearch_find(const struct ann_backend *backend, uint64_t label)
 	return backend->lookup[at].slot;
 }
 
-/** Forget a label while the graph retains its navigation vector. */
+/** Close the deleted probe gap without retaining historical tombstones. */
 static void
 ann_usearch_lookup_erase(struct ann_backend *backend, uint64_t label)
 {
-	size_t at = ann_usearch_lookup_find(backend->lookup,
-					    backend->lookup_capacity, label);
-	assert(at != SIZE_MAX);
-	backend->lookup[at].state = 2;
+	struct ann_usearch_lookup_entry *lookup = backend->lookup;
+	size_t capacity = backend->lookup_capacity;
+	size_t mask = capacity - 1;
+	size_t hole = ann_usearch_lookup_find(lookup, capacity, label);
+	assert(hole != SIZE_MAX);
+	for (size_t at = (hole + 1) & mask; lookup[at].state != 0;
+	     at = (at + 1) & mask) {
+		size_t home = ann_usearch_hash(lookup[at].label) & mask;
+		if (((at - home) & mask) >= ((at - hole) & mask)) {
+			lookup[hole] = lookup[at];
+			hole = at;
+		}
+	}
+	lookup[hole].state = 0;
 }
 
 /** A coordinate reference carries its storage byte order. */
@@ -515,6 +519,11 @@ ann_usearch_destroy(struct ann_backend *backend)
 		struct ann_change *previous = change->previous;
 		ann_usearch_release_vector(backend, change->vector,
 					   change->shared);
+		if (change->reused && change->applied) {
+			ann_usearch_release_vector(backend,
+						   change->old_entry.vector,
+						   change->old_entry.shared);
+		}
 		change->undo.commit();
 		change->~ann_change();
 		ann_usearch_free(backend, change, sizeof(*change));
@@ -638,9 +647,11 @@ ann_usearch_prepare_impl(struct ann_backend *backend,
 				backend->config.metric);
 		if (dimension != backend->config.dimension || valid != ANN_OK)
 			return ANN_INVALID;
-		if (backend->graph.size() == UINT32_MAX)
+		if (backend->reclaim_count == 0 &&
+		    backend->graph.size() == UINT32_MAX)
 			return ANN_INVALID;
-		if (backend->graph.size() == backend->capacity) {
+		if (backend->reclaim_count == 0 &&
+		    backend->graph.size() == backend->capacity) {
 			uint32_t next = backend->capacity == 0 ? 4 :
 				backend->capacity > UINT32_MAX / 2 ?
 				UINT32_MAX : backend->capacity * 2;
@@ -661,7 +672,10 @@ ann_usearch_prepare_impl(struct ann_backend *backend,
 	change->previous = backend->pending;
 	change->kind = kind;
 	change->label = label;
-	change->slot = kind == ANN_RETIRE ? slot : backend->graph.size();
+	change->reused = kind == ANN_INSERT && backend->reclaim_count != 0;
+	change->slot = kind == ANN_RETIRE ? slot : change->reused ?
+		backend->reclaim_queue[backend->reclaim_count - 1] :
+		backend->graph.size();
 	if (kind == ANN_INSERT && shared != nullptr) {
 		++shared->refs;
 		change->shared = shared;
@@ -676,6 +690,12 @@ ann_usearch_prepare_impl(struct ann_backend *backend,
 		}
 		memcpy((void *)change->vector, vector,
 		       ann_usearch_vector_size(backend));
+	}
+	if (change->reused) {
+		change->old_entry = backend->entries[change->slot];
+		assert(change->old_entry.reclaimed && !change->old_entry.live);
+		--backend->reclaim_count;
+		change->slot_reserved = true;
 	}
 	backend->pending = change;
 	*out = change;
@@ -749,14 +769,21 @@ ann_usearch_apply(struct ann_change *change,
 		config.should_stop = ann_usearch_should_stop;
 		config.stop_context = &stop;
 	}
-	auto result = backend->graph.add(change->label, change->vector, metric,
-		config, [](auto) {}, [](auto, auto) {}, &change->undo);
+	auto result = change->reused ?
+		backend->graph.update(backend->graph.iterator_at(change->slot),
+			change->label, change->vector, metric, config,
+			[](auto) {}, [](auto, auto) {}, &change->undo) :
+		backend->graph.add(change->label, change->vector, metric,
+			config, [](auto) {}, [](auto, auto) {}, &change->undo);
 	if (result && status == ANN_OK && control != nullptr)
 		status = ann_search_control_poll(control);
 	if (!result || status != ANN_OK) {
 		result.error.release();
 		change->undo.rollback(backend->graph);
-		memset(entry, 0, sizeof(*entry));
+		if (change->reused)
+			*entry = change->old_entry;
+		else
+			memset(entry, 0, sizeof(*entry));
 		return status != ANN_OK ? status : ANN_OUT_OF_MEMORY;
 	}
 	change->vector = nullptr;
@@ -775,6 +802,11 @@ ann_usearch_rollback(struct ann_change *change)
 	struct ann_backend *backend = change->backend;
 	assert(backend->pending == change);
 	change->rolled_back = true;
+	if (change->slot_reserved) {
+		assert(backend->reclaim_count < backend->capacity);
+		backend->reclaim_queue[backend->reclaim_count++] = change->slot;
+		change->slot_reserved = false;
+	}
 	if (!change->applied)
 		return;
 	if (change->kind == ANN_RETIRE) {
@@ -785,7 +817,10 @@ ann_usearch_rollback(struct ann_change *change)
 		struct ann_usearch_entry *entry = &backend->entries[change->slot];
 		ann_usearch_release_vector(backend, entry->vector,
 					   entry->shared);
-		memset(entry, 0, sizeof(*entry));
+		if (change->reused)
+			*entry = change->old_entry;
+		else
+			memset(entry, 0, sizeof(*entry));
 	}
 	change->applied = false;
 }
@@ -799,6 +834,13 @@ ann_usearch_finish(struct ann_change *change)
 	assert(backend->pending == change);
 	backend->pending = change->previous;
 	change->undo.commit();
+	if (change->reused && change->applied) {
+		ann_usearch_release_vector(backend, change->old_entry.vector,
+					   change->old_entry.shared);
+	} else if (change->slot_reserved) {
+		assert(backend->reclaim_count < backend->capacity);
+		backend->reclaim_queue[backend->reclaim_count++] = change->slot;
+	}
 	ann_usearch_release_vector(backend, change->vector,
 				   change->shared);
 	change->~ann_change();
@@ -836,7 +878,7 @@ ann_usearch_reclaim(struct ann_backend *backend, uint64_t label)
 	int64_t slot = ann_usearch_find(backend, label);
 	if (slot < 0 || backend->entries[slot].live)
 		return ANN_NOT_FOUND;
-	/* The graph still navigates through this slot until generation rebuild. */
+	/* Navigation remains valid until a successful slot update. */
 	ann_usearch_lookup_erase(backend, label);
 	backend->entries[slot].reclaimed = true;
 	assert(backend->reclaim_count < backend->capacity);

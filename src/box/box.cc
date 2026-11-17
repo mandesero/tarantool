@@ -3912,7 +3912,7 @@ box_vector_search_impl(struct space *space, struct index *index,
 	}
 	uint32_t part_count = mp_decode_array(&key);
 	if (part_count != 1 || key >= opts->key_end ||
-	    mp_typeof(*key) != MP_ARRAY) {
+	    (mp_typeof(*key) != MP_ARRAY && mp_typeof(*key) != MP_EXT)) {
 		diag_set(ClientError, ER_VECTOR_INVALID);
 		return -1;
 	}

@@ -122,6 +122,8 @@ create_unit_test(PREFIX ann_usearch
                  SOURCES ann_usearch.cc ann_errinj.c core_test_utils.c
                          ${PROJECT_SOURCE_DIR}/src/box/ann_memory.c
                  LIBRARIES ann_usearch ann core unit)
+target_include_directories(ann_usearch.test SYSTEM PRIVATE
+                           ${PROJECT_SOURCE_DIR}/third_party/USearch/include)
 
 create_unit_test(PREFIX heap
                  SOURCES heap.c

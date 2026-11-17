@@ -10,6 +10,9 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <usearch/index.hpp>
+
+#include "trivia/util.h"
 
 #define UNIT_TAP_COMPATIBLE 1
 #include "unit.h"
@@ -629,7 +632,7 @@ test_quota_exhaustion(void)
 static void
 test_generation_rebuild(void)
 {
-	plan(9);
+	plan(10);
 	struct quota quota;
 	quota_init(&quota, 8 * 1024 * 1024);
 	struct ann_quota_memory old_owner, new_owner;
@@ -660,14 +663,16 @@ test_generation_rebuild(void)
 		retired &= ann_usearch_ops.reclaim(old_graph, label) == ANN_OK;
 	}
 	ok(retired, "half the old labels retire and reclaim");
+	is(ann_usearch_ops.reserve(old_graph, 64), ANN_OK,
+	   "capacity growth preserves the reclaimed-slot queue");
 	float extra[] = {33, 1};
 	is(insert(&ann_usearch_ops, old_graph, 33, extra), ANN_OK,
-	   "capacity growth preserves the reclaimed-slot queue");
+	   "insertion reuses a reclaimed slot after reserve");
 	struct ann_backend_stats stats;
 	ann_usearch_ops.stat(old_graph, &stats);
-	ok(stats.live == 17 && stats.retired == 16 &&
-	   stats.reclaimable == 16,
-	   "reclaimed navigation slots queue in old generation");
+	ok(stats.live == 17 && stats.retired == 15 &&
+	   stats.reclaimable == 15,
+	   "successful reuse consumes exactly one reclaimed slot");
 	is(ann_usearch_ops.create(&config, &new_memory, &new_graph), ANN_OK,
 	   "replacement generation creates under shared quota");
 	bool replayed = true;
@@ -784,10 +789,308 @@ test_borrowed_coordinates(void)
 	check_plan();
 }
 
+/** External GC grants reuse only after a label leaves every visible view. */
+static bool
+reclaim_label(struct ann_backend *backend, uint64_t label)
+{
+	return ann_usearch_ops.set_live(backend, label, false) == ANN_OK &&
+		ann_usearch_ops.reclaim(backend, label) == ANN_OK;
+}
+
+static void
+test_slot_reuse(void)
+{
+	plan(10);
+	struct owner owner = {};
+	struct ann_memory memory = owner_memory(&owner);
+	struct ann_config config = {2, ANN_L2, nullptr};
+	struct ann_backend *backend = nullptr;
+	is(ann_usearch_ops.create(&config, &memory, &backend), ANN_OK,
+	   "reuse backend creates");
+	bool inserted = true;
+	for (uint64_t label = 1; label <= 16; ++label) {
+		float vector[] = {(float)label, 0};
+		inserted &= insert(&ann_usearch_ops, backend, label, vector) ==
+			ANN_OK;
+	}
+	ok(inserted, "initial graph contains sixteen distinct nodes");
+	ok(reclaim_label(backend, 16), "GC grants reuse of one retired node");
+	uint64_t size = 0;
+	ok(ann_usearch_reclaimable(backend, &size) == 1 && size == 16,
+	   "one navigation slot is available without graph growth");
+	float vector[] = {17, 0};
+	struct ann_change *change = nullptr;
+	is(ann_usearch_ops.prepare(backend, ANN_INSERT, 17, vector, 2,
+				   &change), ANN_OK, "reuse reserves a slot");
+	ok(ann_usearch_reclaimable(backend, &size) == 0 && size == 16,
+	   "prepared reuse exclusively reserves the slot");
+	ann_usearch_ops.finish(change);
+	ok(ann_usearch_reclaimable(backend, &size) == 1 && size == 16,
+	   "discarding an unapplied change returns the slot");
+	bool reused = true;
+	for (uint64_t label = 17; label <= 1040; ++label) {
+		float next[] = {(float)label, (float)(label % 3)};
+		reused &= insert(&ann_usearch_ops, backend, label, next) ==
+			ANN_OK;
+		struct ann_candidate found[2];
+		uint32_t count = 0;
+		reused &= search(&ann_usearch_ops, backend, next,
+				 found, &count) == ANN_OK && count != 0 &&
+			found[0].label == label &&
+			found[0].distance == 0;
+		reused &= reclaim_label(backend, label);
+		for (uint64_t retained = 1; retained < 16; ++retained)
+			reused &= ann_usearch_contains(backend, retained);
+		if (!reused)
+			break;
+	}
+	ok(reused, "repeated reuse keeps new values reachable");
+	ok(ann_usearch_reclaimable(backend, &size) == 1 && size == 16,
+	   "a thousand replacements do not accumulate graph nodes");
+	ann_usearch_ops.destroy(backend);
+	ok(owner.bytes == 0 && owner.bad_free == 0,
+	   "reused graph returns all allocation charges");
+	check_plan();
+}
+
+/** Probe failures at each allocation or traversal budget of a reused node. */
+static void
+test_reuse_failures(bool allocation)
+{
+	plan(4);
+	bool consistent = true, completed = false, stopped_late = false;
+	unsigned failed = 0;
+	uint64_t limit = allocation ? 128 : 8192;
+	for (uint64_t fail = 1; fail <= limit; ++fail) {
+		struct owner owner = {};
+		struct ann_memory memory = owner_memory(&owner);
+		struct ann_config config = {2, ANN_L2, nullptr};
+		struct ann_backend *backend = nullptr;
+		if (ann_usearch_ops.create(&config, &memory, &backend) !=
+		    ANN_OK) {
+			consistent = false;
+			break;
+		}
+		for (uint64_t label = 1; label <= 16; ++label) {
+			float vector[] = {(float)label, 0};
+			consistent &= insert(&ann_usearch_ops, backend, label,
+					     vector) == ANN_OK;
+		}
+		consistent &= reclaim_label(backend, 8);
+		if (allocation)
+			owner.fail_at = owner.calls + fail;
+		float vector[] = {100, 0};
+		struct ann_change *change = nullptr;
+		enum ann_status status = ann_usearch_ops.prepare(
+			backend, ANN_INSERT, 100, vector, 2, &change);
+		struct ann_search_control control = {};
+		control.work_limit = fail;
+		if (status == ANN_OK)
+			status = ann_usearch_ops.apply(change,
+				allocation ? nullptr : &control);
+		if (status != ANN_OK) {
+			++failed;
+			enum ann_status expected = allocation ?
+				ANN_OUT_OF_MEMORY : ANN_WORK_LIMIT;
+			consistent &= status == expected;
+			stopped_late |= allocation ? fail >= 3 : fail > 100;
+			size_t calls = owner.calls;
+			ann_usearch_ops.rollback(change);
+			ann_usearch_ops.finish(change);
+			consistent &= owner.calls == calls;
+			uint64_t size = 0;
+			consistent &= ann_usearch_reclaimable(backend, &size) ==
+				1 && size == 16 &&
+				!ann_usearch_contains(backend, 100) &&
+				!ann_usearch_contains(backend, 8);
+			owner.fail_at = 0;
+			for (uint64_t label = 1; label <= 16; ++label) {
+				if (label == 8)
+					continue;
+				float query[] = {(float)label, 0};
+				struct ann_candidate found[2];
+				uint32_t count = 0;
+				consistent &= search(&ann_usearch_ops, backend,
+					query, found, &count) == ANN_OK &&
+					count != 0 && found[0].label == label;
+			}
+			consistent &= insert(&ann_usearch_ops, backend, 100,
+					     vector) == ANN_OK;
+		} else {
+			ann_usearch_ops.finish(change);
+			completed = true;
+		}
+		ann_usearch_ops.destroy(backend);
+		consistent &= owner.bytes == 0 && owner.bad_free == 0;
+		if (completed || !consistent)
+			break;
+	}
+	ok(failed != 0, "%s can interrupt node reuse",
+	   allocation ? "allocation failure" : "work limit");
+	ok(stopped_late, "reuse is interrupted beyond its initial preparation");
+	ok(completed, "sufficient resources let reused-node update finish");
+	ok(consistent, "failed reuse restores slots, labels and ownership");
+	check_plan();
+}
+
+static void
+test_reuse_borrowed_owner(void)
+{
+	plan(14);
+	struct owner coordinates = {}, graphs = {};
+	struct ann_memory memory = owner_memory(&coordinates);
+	struct ann_memory graph_memory = owner_memory(&graphs);
+	unsigned released = 0;
+	unsigned char packed[] = {0, 0, 128, 63, 0, 0, 0, 64};
+	struct ann_usearch_vector *vector = ann_usearch_vector_borrow(
+		&memory, packed, 2, &released, release_borrowed);
+	struct ann_config config = {2, ANN_L2, nullptr};
+	struct ann_backend *backend = nullptr;
+	is(ann_usearch_ops.create(&config, &graph_memory, &backend), ANN_OK,
+	   "borrowed reuse backend creates");
+	struct ann_change *change = nullptr;
+	is(ann_usearch_prepare_shared(backend, 1, vector, &change), ANN_OK,
+	   "borrowed navigation vector prepares");
+	is(ann_usearch_ops.apply(change, nullptr), ANN_OK,
+	   "borrowed navigation vector applies");
+	ann_usearch_ops.finish(change);
+	ann_usearch_vector_unref(vector);
+	ok(reclaim_label(backend, 1) && released == 0,
+	   "reclaimed navigation still pins its external owner");
+	float replacement[] = {4, 5};
+	is(ann_usearch_ops.prepare(backend, ANN_INSERT, 2, replacement, 2,
+				   &change), ANN_OK, "borrowed reuse prepares");
+	is(ann_usearch_ops.apply(change, nullptr), ANN_OK,
+	   "single entrypoint node can be reused");
+	is(released, 0, "undo retains the old external owner until finish");
+	size_t calls = graphs.calls;
+	ann_usearch_ops.rollback(change);
+	ann_usearch_ops.finish(change);
+	ok(released == 0 && graphs.calls == calls,
+	   "allocation-free rollback retains old navigation coordinates");
+	ok(insert(&ann_usearch_ops, backend, 2, replacement) == ANN_OK &&
+	   released == 1 && coordinates.bytes == 0,
+	   "successful reuse releases the old external owner exactly once");
+	ann_usearch_ops.destroy(backend);
+	ok(graphs.bytes == 0 && released == 1,
+	   "reused owner cannot be released twice during destruction");
+	vector = ann_usearch_vector_borrow(&memory, packed, 2, &released,
+					   release_borrowed);
+	bool ready = ann_usearch_ops.create(&config, &graph_memory, &backend) ==
+		ANN_OK && ann_usearch_prepare_shared(backend, 1, vector,
+						     &change) == ANN_OK &&
+		ann_usearch_ops.apply(change, nullptr) == ANN_OK;
+	ok(ready, "a second backend holds borrowed navigation coordinates");
+	ann_usearch_ops.finish(change);
+	ann_usearch_vector_unref(vector);
+	ready = reclaim_label(backend, 1) &&
+		ann_usearch_ops.prepare(backend, ANN_INSERT, 2, replacement, 2,
+					  &change) == ANN_OK &&
+		ann_usearch_ops.apply(change, nullptr) == ANN_OK;
+	ok(ready, "reuse can remain applied until backend destruction");
+	is(released, 1, "unfinished reuse still holds its undo owner");
+	ann_usearch_ops.destroy(backend);
+	ok(released == 2 && coordinates.bytes == 0 && graphs.bytes == 0,
+	   "destruction releases both the applied entry and its undo owner");
+	check_plan();
+}
+
+/** Scalar coordinates make graph topology independent of adapter ownership. */
+struct undo_metric {
+	/** One immutable coordinate per physical graph slot. */
+	double *coordinates;
+
+	double value(double coordinate) const { return coordinate; }
+	template<class K>
+	double value(unum::usearch::member_cref_gt<K> member) const
+	{
+		return coordinates[member.slot];
+	}
+	template<class K>
+	double value(unum::usearch::member_ref_gt<K> member) const
+	{
+		return coordinates[member.slot];
+	}
+	template<class T>
+	double value(const T &iterator) const { return value(*iterator); }
+	template<class A, class B>
+	double operator()(const A &left, const B &right) const
+	{
+		double delta = value(left) - value(right);
+		return delta * delta;
+	}
+};
+
+static void
+test_update_graph_undo(void)
+{
+	plan(6);
+	using graph_t = unum::usearch::index_gt<double, uint64_t, uint32_t>;
+	graph_t graph(unum::usearch::index_config_t{8});
+	ok(graph.try_reserve(unum::usearch::index_limits_t{64, 1}),
+	   "direct undo graph reserves nodes and scratch contexts");
+	double coordinates[64];
+	undo_metric metric{coordinates};
+	bool inserted = true;
+	for (uint32_t i = 0; i < 64; ++i) {
+		coordinates[i] = i;
+		auto result = graph.add(i + 1, coordinates[i], metric);
+		inserted &= bool(result);
+		result.error.release();
+	}
+	ok(inserted, "direct undo graph has multiple levels and reverse links");
+	size_t length = graph.serialized_length();
+	char *before = (char *)xmalloc(length);
+	char *after = (char *)xmalloc(length);
+	auto snapshot = [&graph, length](char *buffer) {
+		size_t offset = 0;
+		auto output = [&](const void *data, size_t size) {
+			if (size > length - offset)
+				return false;
+			memcpy(buffer + offset, data, size);
+			offset += size;
+			return true;
+		};
+		auto result = graph.save_to_stream(output);
+		bool success = bool(result) && offset == length;
+		result.error.release();
+		return success;
+	};
+	ok(before != nullptr && after != nullptr && snapshot(before),
+	   "serialized snapshot covers keys, levels and every adjacency list");
+	graph_t::add_undo_t aborted;
+	aborted.abort_after_reverse_for_test();
+	coordinates[31] = 1000;
+	auto stopped = graph.update(graph.iterator_at(31), 1000,
+		coordinates[31], metric, {}, [](auto) {}, [](auto, auto) {},
+		&aborted);
+	bool interrupted = !stopped && aborted.rolled_back() &&
+		aborted.recorded() > 1;
+	stopped.error.release();
+	coordinates[31] = 31;
+	ok(interrupted && snapshot(after) && memcmp(before, after, length) == 0,
+	   "interruption restores links, key and entrypoint");
+	graph_t::add_undo_t undo;
+	coordinates[31] = 1000;
+	auto updated = graph.update(graph.iterator_at(31), 1000,
+		coordinates[31], metric, {}, [](auto) {}, [](auto, auto) {},
+		&undo);
+	ok(bool(updated) && graph.at(31).key == 1000,
+	   "reused-node update publishes its replacement key");
+	updated.error.release();
+	undo.rollback(graph);
+	coordinates[31] = 31;
+	ok(snapshot(after) && memcmp(before, after, length) == 0,
+	   "update rollback restores the graph byte for byte");
+	free(after);
+	free(before);
+	check_plan();
+}
+
 int
 main(void)
 {
-	plan(16);
+	plan(21);
 	test_lifecycle(ann_backend_find("flat"));
 	test_lifecycle(&ann_usearch_ops);
 	test_filtered_topk(ann_backend_find("flat"));
@@ -804,5 +1107,10 @@ main(void)
 	test_generation_rebuild();
 	test_shared_coordinates();
 	test_borrowed_coordinates();
+	test_slot_reuse();
+	test_reuse_failures(true);
+	test_reuse_failures(false);
+	test_reuse_borrowed_owner();
+	test_update_graph_undo();
 	return check_plan();
 }

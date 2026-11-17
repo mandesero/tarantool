@@ -1,6 +1,6 @@
 # Native VECTOR implementation contract
 
-The RFC revision dated 2026-11-11 is normative. This document covers the
+The RFC revision dated 2026-11-17 is normative. This document covers the
 native index.
 The distributed API contract is maintained in the companion
 [CRUD guide](https://github.com/mandesero/crud/blob/codex/vector-search/doc/vector-search.md).
@@ -9,9 +9,9 @@ Build and verification evidence is in [report.md](report.md).
 ## Numeric and search behavior
 
 - The production algorithm is memtx HNSW with a replaceable internal backend.
-- Dense vectors use f32 and distances use f64 (`f32_f64_v1`). Tuple arrays
-  remain unchanged. Stored fields can also use packed varbinary coordinates.
-  Queries are dense finite arrays of the exact dimension.
+- Stored embedding values use f32; distances use f64 (`f32_f64_v1`).
+  The field and VECTOR part use `embedding`. Queries are dense finite
+  arrays or embedding values of the exact dimension.
 - `l2` is squared Euclidean distance; `cosine` is one minus normalized
   dot product; `ip` is one minus dot product. Smaller distances rank first.
 - Ordinary local and IProto SELECT use
@@ -43,8 +43,8 @@ Labels identify immutable embeddings, not individual tuple versions.
 Several versions of the same primary key share one graph node when their
 canonical f32 vectors match. A payload-only update keeps the vector and graph
 node; visibility and filters still select the exact tuple version. GC recycles
-binding and embedding labels. Graph slots keep navigation coordinates until
-compaction. Generations share reference-counted coordinates, charged once.
+binding and embedding labels. GC-safe graph slots are reused before append;
+they retain navigation coordinates until successful replacement or compaction. Generations share reference-counted coordinates, charged once.
 
 Each generation has a separate `ann_memory` owner. Shared coordinates and
 version bindings have independent owners. Allocations use malloc charged to
@@ -86,8 +86,8 @@ versions; they are not cancelled by maintenance. Quota exhaustion rejects
 new allocations rather than silently discarding needed versions. Data growth
 is still subject to memtx quota. A graph contains at most
 `2 * K + 64` nodes, where K is the peak number of embeddings required by
-retained tuple versions. New embeddings are rejected with OutOfMemory at
-this bound even if compaction is delayed or fails. `slots.embedding_peak`,
+retained tuple versions. Appending a node fails with OutOfMemory at
+this bound even if compaction is delayed or fails; reuse remains allowed. `slots.embedding_peak`,
 `slots.nodes` and `slots.node_limit` expose this rule. Capacity rounding and
 retained MVCC versions must also be included when sizing memory.
 
@@ -117,36 +117,30 @@ are enforced by CRUD and documented there.
 | `select` NEIGHBOR | local and native IProto; explicit limit |
 | `search` | rich local API; flat query; optional parallel distances |
 | `get`, `min`, `max`, `random` | reject early |
-| `pairs`, keyed `count` | ALL or exact NEIGHBOR; no result limit |
-| unkeyed `count` | return `len` |
+| `pairs`, keyed `count` | unsupported |
+| unkeyed `count` | visible primary-index row count |
 | offset, position, continuation | reject early |
 | functional, multikey or nullable vector part | reject at DDL |
 | public `box.read_view` | frozen ALL or exact ordered NEIGHBOR |
 
-Unbounded NEIGHBOR uses a fixed batch of 32 results and rescans the primary
-index for each batch. It does not materialize the full space. Returning R
-rows costs O(N * d * ceil(R / 32)); use bounded HNSW for efficient top-k.
-Live scans yield between rows with a 1 ms target, except inside non-MVCC
-transactions. Lua pairs/count use Lua C because yielding through a compiled
-FFI call is unsafe. Normal cursors do not freeze a changing space; use a
-transaction or public read view for the corresponding visibility guarantees.
-Read-view NEIGHBOR uses the same bounded-memory selection on stable primary
-storage and checks the fiber slice. It does not preserve or clone HNSW.
-No iterator silently ignores VECTOR-specific options.
+Public read-view NEIGHBOR uses a batch of 32 results and rescans frozen
+primary storage for each batch. Returning R rows costs
+O(N * d * ceil(R / 32)). It checks the fiber slice without cloning HNSW.
+Ordinary VECTOR pairs does not expose this exact-scan implementation.
 
-## Packed coordinates
+## Embedding coordinates
 
-A varbinary vector field contains exactly d little-endian IEEE 754 f32
-components, without a header. Dimension and scalar type come from the index.
-`box.vector.pack(array)` uses the same ties-to-even conversion as ARRAY;
-`box.vector.unpack(varbinary)` returns the decoded values. Stored packed
-coordinates are validated, read safely when unaligned and borrowed without
-an additional dense copy. The graph retains the source tuple until the last
-coordinate reference is released, including navigation references. Updating
-other fields shares this owner; it does not replace the source tuple with
-every payload update. Borrowed source-tuple memory is accounted by memtx,
-not added a second time to VECTOR bsize. CRUD projects packed coordinates
-back to arrays, retaining the existing wire representation.
+`require('embedding')` provides `new(array)`, `is(value)`, `totable(value)`
+and `#value`. MsgPack EXT type 9 contains exactly d little-endian IEEE 754
+f32 components with no payload header. Dimension is 1 through 4096;
+components must be finite, independently of any index. Conversion uses
+ties-to-even. Cosine additionally rejects a zero vector at index/search time.
+
+The index borrows inline tuple coordinates. The source tuple remains pinned
+until its last coordinate reference is released, including graph navigation.
+Payload updates share the owner instead of creating another coordinate copy.
+Borrowed tuple memory is accounted by memtx and excluded from VECTOR bsize.
+CRUD projects embedding values back to arrays for its existing wire format.
 
 ## Diagnostics and introspection
 
@@ -163,7 +157,7 @@ timeout. They describe production limits, excluding debug error injections.
 `versions.live` is the current primary-index size; `versions.retained` is
 `max(retained_tuple_bindings - live, 0)`. `versions.retired` counts inactive
 graph nodes. `slots.embeddings` counts embeddings with tuple bindings.
-Slots also report graph capacity and `pending_rebuild` navigation-only nodes.
+Slots also report graph capacity and `reusable` GC-safe navigation slots.
 Ordinary memtx releases obsolete bindings after commit or rollback; MVCC does
 so in story GC after dependent readers finish. Bindings and storage labels
 are reused independently of graph slots.
@@ -179,7 +173,7 @@ region memory, quota rounding and system allocator overhead; they are not RSS.
 `memory.maintenance_reserved` is unused quota credit, not allocated bytes, and
 is reported separately from total and bsize. `maintenance` exposes completed
 and failed rebuild counts, running state, admitted insertions and their cap.
-Exact cursors and public read-view scans do not increment ANN search counters.
+Public read-view scans do not increment ANN search counters.
 Search counters are cumulative
 requests, errors, timeouts, visited and filtered candidates. `duration_ns`
 counts time in admitted C searches, including query decoding, sorting, port

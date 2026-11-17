@@ -1,3 +1,4 @@
+local embedding = require('embedding')
 local bit = require('bit')
 local clock = require('clock')
 local digest = require('digest')
@@ -96,16 +97,16 @@ fio.mktree(work_dir)
 box.cfg({work_dir = work_dir, log_level = 'error'})
 local space = box.schema.space.create('vector_bench')
 space:format({{name = 'id', type = 'unsigned'},
-              {name = 'embedding', type = 'array'},
+              {name = 'embedding', type = 'embedding'},
               {name = 'bucket_id', type = 'unsigned'}})
 space:create_index('pk')
 for id, vector in ipairs(vectors) do
-    space:insert{id, vector, id % bucket_count}
+    space:insert{id, embedding.new(vector), id % bucket_count}
 end
 local started = clock.monotonic()
 local index = space:create_index('vec', {
     type = 'vector', dimension = dimension, distance = 'l2',
-    unique = false, parts = {{2, 'array'}},
+    unique = false, parts = {{2, 'embedding'}},
 })
 local build_seconds = clock.monotonic() - started
 local memory_after_build = index:stat().memory
@@ -184,12 +185,12 @@ end
 
 local insert_start = clock.monotonic()
 for id = count + 1, count + 100 do
-    space:insert{id, vectors[id - count], id % bucket_count}
+    space:insert{id, embedding.new(vectors[id - count]), id % bucket_count}
 end
 local insert_seconds = clock.monotonic() - insert_start
 local update_start = clock.monotonic()
 for id = 1, 100 do
-    space:update({id}, {{'=', 2, vectors[count - id + 1]}})
+    space:update({id}, {{'=', 2, embedding.new(vectors[count - id + 1])}})
 end
 local update_seconds = clock.monotonic() - update_start
 local delete_start = clock.monotonic()
@@ -198,6 +199,12 @@ for id = count + 1, count + 100 do
 end
 local delete_seconds = clock.monotonic() - delete_start
 local memory_after_dml = index:stat().memory
+local maintenance_deadline = clock.monotonic() + 120
+while index:stat().maintenance.running do
+    assert(clock.monotonic() < maintenance_deadline,
+           'Background maintenance did not complete')
+    fiber.sleep(0)
+end
 local rebuild_start = clock.monotonic()
 fiber.set_slice(120)
 local rebuild_ok, rebuild_error = pcall(index.rebuild, index)

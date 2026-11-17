@@ -2,6 +2,7 @@
 #define TARANTOOL_BOX_MEMTX_VECTOR_H_INCLUDED
 
 #include <stdint.h>
+#include <sys/types.h>
 #include "iterator_type.h"
 
 #if defined(__cplusplus)
@@ -50,11 +51,10 @@ memtx_vector_index_set_replace_source(struct index *index, struct tuple *tuple);
 int
 memtx_vector_index_rebuild(struct index *index);
 
-/** Create a lazy exact cursor for an unbounded scan. */
-struct iterator *
-memtx_vector_scan_iterator_new(struct index *index, enum iterator_type type,
-			       const char *key, uint32_t part_count,
-			       const char *pos);
+/** Count visible rows through the primary index; reject keyed counts. */
+ssize_t
+memtx_vector_index_count(struct index *index, enum iterator_type type,
+			 const char *key, uint32_t part_count);
 
 /** Create a bounded HNSW cursor with explicit per-request options. */
 struct iterator *

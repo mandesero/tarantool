@@ -16,17 +16,18 @@ g.before_each(function(cg)
     cg.server:exec(function()
         local s = box.schema.space.create('vector_lifecycle')
         s:format({{name = 'id', type = 'unsigned'},
-                  {name = 'vec', type = 'array'}})
+                  {name = 'vec', type = 'embedding'}})
         s:create_index('pk')
         s:create_index('vec', {type = 'vector', dimension = 2,
                                distance = 'l2', unique = false,
                                opts = {ef_search = 32},
-                               parts = {{2, 'array'}}})
+                               parts = {{2, 'embedding'}}})
     end)
 end)
 
 g.after_each(function(cg)
     cg.server:exec(function()
+        box.error.injection.set('ERRINJ_VECTOR_REBUILD_DELAY', false)
         if box.space.vector_lifecycle ~= nil then
             box.space.vector_lifecycle:drop()
         end
@@ -35,8 +36,9 @@ end)
 
 g.test_search_width_alter_avoids_rebuild = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local s = box.space.vector_lifecycle
-        s:insert{1, {1, 0}}
+        s:insert{1, embedding.new({1, 0})}
         local before = s.index.vec:bsize()
         local generation = s.index.vec:stat().hnsw.generation
         s.index.vec:alter({opts = {ef_search = 128}})
@@ -52,9 +54,10 @@ end
 
 g.test_statistics_and_read_view = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local s = box.space.vector_lifecycle
-        s:insert{1, {1, 0}}
-        s:insert{2, {0, 1}}
+        s:insert{1, embedding.new({1, 0})}
+        s:insert{2, embedding.new({0, 1})}
         s.index.vec:search({1, 0}, {
             limit = 1,
             filter = {field = 'id', values = {2}},
@@ -101,36 +104,38 @@ g.test_statistics_and_read_view = function(cg)
     end)
 end
 
-g.test_retired_slots_wait_for_rebuild = function(cg)
+g.test_retired_slots_are_reused = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local s = box.space.vector_lifecycle
-        s:insert{1, {1, 0}}
+        s:insert{1, embedding.new({1, 0})}
         s:delete{1}
         local stat = s.index.vec:stat()
-        t.assert_equals(stat.slots.pending_rebuild, 1)
-        s:insert{2, {0, 1}}
-        t.assert_equals(s.index.vec:stat().slots.pending_rebuild, 1)
+        t.assert_equals(stat.slots.reusable, 1)
+        s:insert{2, embedding.new({0, 1})}
+        t.assert_equals(s.index.vec:stat().slots.reusable, 0)
         box.begin()
-        s:replace{2, {2, 0}}
+        s:replace{2, embedding.new({2, 0})}
         box.rollback()
-        t.assert_equals(s.index.vec:stat().slots.pending_rebuild, 2)
-        t.assert_equals(s:get{2}[2], {0, 1})
+        t.assert_equals(s.index.vec:stat().slots.reusable, 1)
+        t.assert_equals(s:get{2}[2], embedding.new({0, 1}))
         s.index.vec:rebuild()
         stat = s.index.vec:stat()
-        t.assert_equals(stat.slots.pending_rebuild, 0)
+        t.assert_equals(stat.slots.reusable, 0)
         t.assert_equals(stat.versions.retired, 0)
         t.assert_equals(stat.versions.live, 1)
         t.assert_equals(s.index.vec:select({{0, 1}}, {
             iterator = 'neighbor', limit = 1,
-        })[1][2], {0, 1})
+        })[1][2], embedding.new({0, 1}))
     end)
 end
 
 g.test_failed_metric_alter_keeps_old_index = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local s = box.space.vector_lifecycle
-        s:insert{1, {1, 0}}
-        s:insert{2, {0, 1}}
+        s:insert{1, embedding.new({1, 0})}
+        s:insert{2, embedding.new({0, 1})}
         box.error.injection.set('ERRINJ_VECTOR_ALLOC', 0)
         local ok = pcall(function()
             s.index.vec:alter({distance = 'ip'})
@@ -147,13 +152,14 @@ end
 
 g.test_snapshot_then_wal_updates = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local s = box.space.vector_lifecycle
-        s:insert{1, {1, 0}}
-        s:insert{2, {0, 1}}
+        s:insert{1, embedding.new({1, 0})}
+        s:insert{2, embedding.new({0, 1})}
         box.snapshot()
-        s:replace{2, {0.9, 0.1}}
+        s:replace{2, embedding.new({0.9, 0.1})}
         s:delete{1}
-        s:insert{3, {1, 0}}
+        s:insert{3, embedding.new({1, 0})}
     end)
     cg.server:restart()
     cg.server:exec(function()
@@ -169,22 +175,23 @@ end
 
 g.test_large_snapshot_recovers_beyond_client_slice = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local fiber = require('fiber')
         local s = box.schema.space.create('vector_recovery_large')
         s:format({{name = 'id', type = 'unsigned'},
-                  {name = 'vec', type = 'array'}})
+                  {name = 'vec', type = 'embedding'}})
         s:create_index('pk')
         for id = 1, 1000 do
             local vector = {}
             for j = 1, 16 do
                 vector[j] = ((id * 37 + j * 19) % 1000) / 500 - 1
             end
-            s:insert{id, vector}
+            s:insert{id, embedding.new(vector)}
         end
         fiber.set_slice(120)
         s:create_index('vec', {type = 'vector', dimension = 16,
                                distance = 'l2', unique = false,
-                               parts = {{2, 'array'}}})
+                               parts = {{2, 'embedding'}}})
         fiber.set_slice(1)
         box.snapshot()
     end)
@@ -199,9 +206,10 @@ end
 
 g.test_rebuild_failure_and_generation_switch = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local s = box.space.vector_lifecycle
         for i = 1, 20 do
-            s:insert{i, {i, 0}}
+            s:insert{i, embedding.new({i, 0})}
         end
         local generation = s.index.vec:stat().hnsw.generation
         local before = s.index.vec:bsize()
@@ -237,16 +245,17 @@ end
 
 g.test_create_on_nonempty_and_failed_create = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local s = box.space.vector_lifecycle
         s.index.vec:drop()
         for i = 1, 8 do
-            s:insert{i, {i, 0}}
+            s:insert{i, embedding.new({i, 0})}
         end
         box.error.injection.set('ERRINJ_VECTOR_ALLOC', 0)
         local ok = pcall(function()
             s:create_index('vec', {type = 'vector', dimension = 2,
                                    distance = 'l2', unique = false,
-                                   parts = {{2, 'array'}}})
+                                   parts = {{2, 'embedding'}}})
         end)
         box.error.injection.set('ERRINJ_VECTOR_ALLOC', -1)
         t.assert_equals(ok, false)
@@ -254,7 +263,7 @@ g.test_create_on_nonempty_and_failed_create = function(cg)
         t.assert_equals(s:count(), 8)
         s:create_index('vec', {type = 'vector', dimension = 2,
                                distance = 'l2', unique = false,
-                               parts = {{2, 'array'}}})
+                               parts = {{2, 'embedding'}}})
         t.assert_equals(s.index.vec:len(), 8)
         t.assert_equals(s.index.vec:select({{8, 0}}, {
             iterator = 'neighbor', limit = 1,
@@ -269,8 +278,9 @@ end
 
 g.test_structural_alter_rebuilds = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local s = box.space.vector_lifecycle
-        s:insert{1, {1, 0}}
+        s:insert{1, embedding.new({1, 0})}
         local generation = s.index.vec:stat().hnsw.generation
         s.index.vec:alter({distance = 'ip'})
         t.assert_not_equals(s.index.vec:stat().hnsw.generation,
@@ -293,10 +303,11 @@ end
 g.test_rebuild_midway_oom_and_slice = function(cg)
     t.tarantool.skip_if_not_debug()
     cg.server:exec(function()
+        local embedding = require('embedding')
         local fiber = require('fiber')
         local s = box.space.vector_lifecycle
         for i = 1, 20 do
-            s:insert{i, {i, 0}}
+            s:insert{i, embedding.new({i, 0})}
         end
         local failures = 0
         for countdown = 0, 48 do
@@ -326,23 +337,24 @@ end
 g.test_dml_during_yielding_index_build = function(cg)
     t.tarantool.skip_if_not_debug()
     cg.server:exec(function()
+        local embedding = require('embedding')
         local fiber = require('fiber')
         local s = box.space.vector_lifecycle
         s.index.vec:drop()
         for i = 1, 20 do
-            s:insert{i, {i, 0}}
+            s:insert{i, embedding.new({i, 0})}
         end
         box.error.injection.set('ERRINJ_BUILD_INDEX_DELAY', true)
         local builder = fiber.new(function()
             s:create_index('vec', {type = 'vector', dimension = 2,
                                    distance = 'l2', unique = false,
-                                   parts = {{2, 'array'}}})
+                                   parts = {{2, 'embedding'}}})
         end)
         builder:set_joinable(true)
         fiber.yield()
-        s:replace{20, {200, 0}}
+        s:replace{20, embedding.new({200, 0})}
         s:delete{1}
-        s:insert{21, {21, 0}}
+        s:insert{21, embedding.new({21, 0})}
         box.error.injection.set('ERRINJ_BUILD_INDEX_DELAY', false)
         local ok, err = builder:join()
         t.assert(ok, err)
@@ -369,13 +381,14 @@ end
 g.test_failed_truncate_preserves_index = function(cg)
     t.tarantool.skip_if_not_debug()
     cg.server:exec(function()
+        local embedding = require('embedding')
         local s = box.space.vector_lifecycle
-        s:insert{1, {1, 0}}
+        s:insert{1, embedding.new({1, 0})}
         box.error.injection.set('ERRINJ_VECTOR_ALLOC', 0)
         local ok = pcall(function() s:truncate() end)
         box.error.injection.set('ERRINJ_VECTOR_ALLOC', -1)
         t.assert_equals(ok, false)
-        t.assert_equals(s:get{1}[2], {1, 0})
+        t.assert_equals(s:get{1}[2], embedding.new({1, 0}))
         t.assert_equals(s.index.vec:select({{1, 0}}, {
             iterator = 'neighbor', limit = 1,
         })[1][1], 1)
@@ -386,9 +399,12 @@ end
 g.test_rebuild_yields_and_accounts_generations = function(cg)
     t.tarantool.skip_if_not_debug()
     cg.server:exec(function()
+        local embedding = require('embedding')
         local fiber = require('fiber')
         local idx = box.space.vector_lifecycle.index.vec
-        for i = 1, 20 do box.space.vector_lifecycle:insert{i, {i, 0}} end
+        for i = 1, 20 do
+            box.space.vector_lifecycle:insert{i, embedding.new({i, 0})}
+        end
         local generation = idx:stat().hnsw.generation
         box.error.injection.set('ERRINJ_VECTOR_REBUILD_DELAY', true)
         local builder = fiber.new(function() idx:rebuild() end)
@@ -417,9 +433,10 @@ end
 g.test_rebuild_conflict_cancel_and_drop = function(cg)
     t.tarantool.skip_if_not_debug()
     cg.server:exec(function()
+        local embedding = require('embedding')
         local fiber = require('fiber')
         local s = box.space.vector_lifecycle
-        s:insert{1, {1, 0}}
+        s:insert{1, embedding.new({1, 0})}
         local actions = {'write', 'rollback', 'gc', 'truncate',
                          'cancel', 'drop'}
         for _, action in ipairs(actions) do
@@ -430,15 +447,15 @@ g.test_rebuild_conflict_cancel_and_drop = function(cg)
             builder:set_joinable(true)
             fiber.sleep(0.01)
             if action == 'write' then
-                s:replace{1, {2, 0}}
+                s:replace{1, embedding.new({2, 0})}
             elseif action == 'rollback' then
                 box.begin()
-                s:replace{1, {3, 0}}
+                s:replace{1, embedding.new({3, 0})}
                 box.rollback()
             elseif action == 'gc' then
                 box.internal.memtx_tx_gc(1000)
                 s:delete{1}
-                s:insert{1, {2, 0}}
+                s:insert{1, embedding.new({2, 0})}
             elseif action == 'truncate' then
                 s:truncate()
             elseif action == 'cancel' then
@@ -459,7 +476,7 @@ g.test_rebuild_conflict_cancel_and_drop = function(cg)
             end
             if action == 'truncate' then
                 t.assert_equals(s.index.vec:len(), 0)
-                s:insert{1, {2, 0}}
+                s:insert{1, embedding.new({2, 0})}
             elseif action ~= 'drop' then
                 if action == 'cancel' then
                     t.assert_equals(idx:stat().hnsw.generation, generation)
@@ -467,7 +484,8 @@ g.test_rebuild_conflict_cancel_and_drop = function(cg)
                     t.assert_not_equals(idx:stat().hnsw.generation, generation)
                 end
                 t.assert_equals(idx:stat().memory.transient, 0)
-                t.assert_equals(idx:search({2, 0}, {limit = 1})[1][2], {2, 0})
+                t.assert_equals(idx:search({2, 0}, {limit = 1})[1][2],
+                                embedding.new({2, 0}))
                 idx:rebuild()
             end
         end
@@ -476,17 +494,18 @@ end
 
 g.test_hash_primary_build_policy = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local s = box.schema.space.create('vector_hash_build')
         s:create_index('pk', {type = 'hash'})
         local opts = {type = 'vector', dimension = 2,
-                      unique = false, parts = {{2, 'array'}}}
-        s:insert{1, {1, 0}}
+                      unique = false, parts = {{2, 'embedding'}}}
+        s:insert{1, embedding.new({1, 0})}
         t.assert_error_covers({code = box.error.VECTOR_UNSUPPORTED},
                               s.create_index, s, 'vec', opts)
         t.assert_equals(s.index.vec, nil)
         s:truncate()
         local idx = s:create_index('vec', opts)
-        s:insert{1, {1, 0}}
+        s:insert{1, embedding.new({1, 0})}
         idx:rebuild()
         t.assert_equals(idx:search({1, 0}, {limit = 1})[1][1], 1)
         s:drop()
@@ -496,6 +515,7 @@ end
 
 g.test_large_build_and_rebuild_complete_with_short_slice = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local fiber = require('fiber')
         local s = box.schema.space.create('vector_cooperative')
         s:create_index('pk')
@@ -504,7 +524,7 @@ g.test_large_build_and_rebuild_complete_with_short_slice = function(cg)
             for j = 1, 16 do
                 vector[j] = ((id * 37 + j * 19) % 1000) / 500 - 1
             end
-            s:insert{id, vector}
+            s:insert{id, embedding.new(vector)}
         end
         local ticks = 0
         local running = true
@@ -518,7 +538,7 @@ g.test_large_build_and_rebuild_complete_with_short_slice = function(cg)
         fiber.set_slice(0.1)
         local idx = s:create_index('vec', {
             type = 'vector', dimension = 16, unique = false,
-            parts = {{2, 'array'}},
+            parts = {{2, 'embedding'}},
         })
         local after_build = ticks
         idx:rebuild()
@@ -536,8 +556,9 @@ end
 
 g.test_nonvector_updates_share_embedding = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local s = box.space.vector_lifecycle
-        s:insert{1, {1, 0}, 'first'}
+        s:insert{1, embedding.new({1, 0}), 'first'}
         s:update(1, {{'=', 3, 'second'}})
         local before = s.index.vec:stat()
         for i = 1, 1000 do s:update(1, {{'=', 3, tostring(i)}}) end
@@ -546,33 +567,34 @@ g.test_nonvector_updates_share_embedding = function(cg)
         t.assert_equals(after.slots.capacity, before.slots.capacity)
         t.assert_equals(after.memory.vectors, before.memory.vectors)
         t.assert_equals(after.memory.total, before.memory.total)
-        t.assert_equals(after.slots.pending_rebuild, 0)
+        t.assert_equals(after.slots.reusable, 0)
         t.assert_equals(s.index.vec:search({1, 0}, {limit = 1})[1][3],
                         '1000')
-        s:update(1, {{'=', 2, {1 + 1e-9, 0}}})
+        s:update(1, {{'=', 2, embedding.new({1 + 1e-9, 0})}})
         t.assert_equals(s.index.vec:stat().slots.embeddings, 1)
-        t.assert_equals(s.index.vec:stat().slots.pending_rebuild, 0)
+        t.assert_equals(s.index.vec:stat().slots.reusable, 0)
     end)
 end
 
 g.test_rebuild_mirrors_dml_and_rollback = function(cg)
     t.tarantool.skip_if_not_debug()
     cg.server:exec(function()
+        local embedding = require('embedding')
         local fiber = require('fiber')
         local s = box.space.vector_lifecycle
-        for i = 1, 20 do s:insert{i, {i, 0}} end
+        for i = 1, 20 do s:insert{i, embedding.new({i, 0})} end
         local idx = s.index.vec
         local generation = idx:stat().hnsw.generation
         box.error.injection.set('ERRINJ_VECTOR_REBUILD_DELAY', true)
         local builder = fiber.new(function() idx:rebuild() end)
         builder:set_joinable(true)
         fiber.sleep(0.01)
-        s:replace{1, {100, 0}}
+        s:replace{1, embedding.new({100, 0})}
         s:delete(2)
-        s:insert{100, {200, 0}}
+        s:insert{100, embedding.new({200, 0})}
         s:update(3, {{'=', 3, 'payload'}})
         box.begin()
-        s:replace{4, {400, 0}}
+        s:replace{4, embedding.new({400, 0})}
         box.rollback()
         box.error.injection.set('ERRINJ_VECTOR_REBUILD_DELAY', false)
         t.assert(builder:join())
@@ -590,59 +612,94 @@ end
 g.test_rebuild_bounds_concurrent_growth = function(cg)
     t.tarantool.skip_if_not_debug()
     cg.server:exec(function()
+        local embedding = require('embedding')
         local fiber = require('fiber')
         local s = box.space.vector_lifecycle
-        s:insert{1, {0, 0}}
+        s:insert{1, embedding.new({0, 0})}
         local idx = s.index.vec
         box.error.injection.set('ERRINJ_VECTOR_REBUILD_DELAY', true)
         local builder = fiber.new(function() idx:rebuild() end)
         builder:set_joinable(true)
         fiber.sleep(0.01)
         local limit = idx:stat().maintenance.admission_limit
-        for i = 1, limit do s:replace{1, {i, 0}} end
-        local ok, err = pcall(s.replace, s, {1, {limit + 1, 0}})
+        for i = 1, limit do s:replace{1, embedding.new({i, 0})} end
+        local ok, err = pcall(s.replace, s, {1, embedding.new({limit + 1, 0})})
         t.assert_equals(ok, false)
         t.assert_equals(err.type, 'OutOfMemory')
         s:update(1, {{'=', 3, 'still available'}})
-        t.assert_equals(idx:search({limit, 0}, {limit = 1})[1][2][1],
+        t.assert_equals(embedding.totable(
+            idx:search({limit, 0}, {limit = 1})[1][2])[1],
                         limit)
         box.error.injection.set('ERRINJ_VECTOR_REBUILD_DELAY', false)
         t.assert(builder:join())
-        s:replace{1, {limit + 1, 0}}
-        t.assert_equals(idx:search({limit + 1, 0}, {limit = 1})[1][2][1],
+        s:replace{1, embedding.new({limit + 1, 0})}
+        t.assert_equals(embedding.totable(
+            idx:search({limit + 1, 0}, {limit = 1})[1][2])[1],
                         limit + 1)
     end)
 end
 
-g.test_automatic_compaction_bounds_churn = function(cg)
+g.test_reuse_bounds_churn = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local fiber = require('fiber')
         local s = box.space.vector_lifecycle
-        for i = 1, 8 do s:insert{i, {i, 0}} end
+        for i = 1, 8 do s:insert{i, embedding.new({i, 0})} end
         for i = 1, 512 do
-            s:replace{1, {i, 1}}
+            s:replace{1, embedding.new({i, 1})}
             if i % 8 == 0 then fiber.sleep(0) end
         end
         t.helpers.retrying({timeout = 10}, function()
             local stat = s.index.vec:stat()
-            t.assert_gt(stat.maintenance.rebuilds, 1)
+            t.assert_le(stat.slots.nodes, stat.slots.node_limit)
             t.assert_equals(stat.maintenance.running, false)
         end)
         local stat = s.index.vec:stat()
-        t.assert_lt(stat.slots.pending_rebuild, 128)
+        t.assert_lt(stat.slots.reusable, 128)
         t.assert_le(stat.slots.capacity, 256)
         t.assert_le(stat.memory.vectors + stat.memory.retained, 8 * 256)
         t.assert_equals(s.index.vec:search({512, 1}, {limit = 1})[1][1], 1)
     end)
 end
 
+g.test_automatic_compaction_threshold = function(cg)
+    cg.server:exec(function()
+        local embedding = require('embedding')
+        local s = box.space.vector_lifecycle
+        for _, size in ipairs({128, 512}) do
+            s:truncate()
+            local idx = s.index.vec
+            for i = 1, size do s:insert{i, embedding.new({i, 0})} end
+            local rebuilds = idx:stat().maintenance.rebuilds
+            local threshold = math.max(64, size / 4)
+            box.error.injection.set('ERRINJ_VECTOR_REBUILD_DELAY', true)
+            for i = 1, threshold - 1 do s:delete{i} end
+            t.assert_equals(idx:stat().maintenance.rebuilds, rebuilds)
+            t.assert_equals(idx:stat().maintenance.running, false)
+            s:delete{threshold}
+            t.helpers.retrying({}, function()
+                t.assert_equals(idx:stat().maintenance.running, true)
+            end)
+            box.error.injection.set('ERRINJ_VECTOR_REBUILD_DELAY', false)
+            t.helpers.retrying({}, function()
+                t.assert_equals(idx:stat().maintenance.rebuilds,
+                                rebuilds + 1)
+                t.assert_equals(idx:stat().maintenance.running, false)
+            end)
+            t.assert_equals(idx:stat().slots.reusable, 0)
+            t.assert_equals(idx:stat().slots.nodes, size - threshold)
+        end
+    end)
+end
+
 g.test_mirrored_insert_failure_is_atomic = function(cg)
     t.tarantool.skip_if_not_debug()
     cg.server:exec(function()
+        local embedding = require('embedding')
         local fiber = require('fiber')
         local s = box.space.vector_lifecycle
         local idx = s.index.vec
-        s:insert{1, {1, 0}}
+        s:insert{1, embedding.new({1, 0})}
         box.error.injection.set('ERRINJ_VECTOR_REBUILD_DELAY', true)
         local builder = fiber.new(function() idx:rebuild() end)
         builder:set_joinable(true)
@@ -651,31 +708,34 @@ g.test_mirrored_insert_failure_is_atomic = function(cg)
         for fail_at = 0, 60 do
             box.begin()
             box.error.injection.set('ERRINJ_VECTOR_ALLOC', fail_at)
-            local ok = pcall(s.replace, s, {1, {2, 0}})
+            local ok = pcall(s.replace, s, {1, embedding.new({2, 0})})
             box.error.injection.set('ERRINJ_VECTOR_ALLOC', -1)
             box.rollback()
             if ok then successes = successes + 1
             else failures = failures + 1 end
-            t.assert_equals(idx:search({1, 0}, {limit = 1})[1][2], {1, 0})
+            t.assert_equals(idx:search({1, 0}, {limit = 1})[1][2],
+                            embedding.new({1, 0}))
         end
         t.assert_gt(failures, 0)
         t.assert_gt(successes, 0)
         box.error.injection.set('ERRINJ_VECTOR_REBUILD_DELAY', false)
         t.assert(builder:join())
-        t.assert_equals(idx:search({1, 0}, {limit = 1})[1][2], {1, 0})
+        t.assert_equals(idx:search({1, 0}, {limit = 1})[1][2],
+                            embedding.new({1, 0}))
         t.assert_equals(idx:stat().memory.transient, 0)
         idx:rebuild()
-        t.assert_equals(idx:stat().slots.pending_rebuild, 0)
+        t.assert_equals(idx:stat().slots.reusable, 0)
     end)
 end
 
 g.test_writes_and_cancel_after_rebuild_publication = function(cg)
     t.tarantool.skip_if_not_debug()
     cg.server:exec(function()
+        local embedding = require('embedding')
         local fiber = require('fiber')
         local s = box.space.vector_lifecycle
         local idx = s.index.vec
-        s:insert{1, {1, 0}}
+        s:insert{1, embedding.new({1, 0})}
         local generation = idx:stat().hnsw.generation
         box.error.injection.set('ERRINJ_VECTOR_REBUILD_GC_DELAY', true)
         local builder = fiber.new(function() idx:rebuild() end)
@@ -683,8 +743,8 @@ g.test_writes_and_cancel_after_rebuild_publication = function(cg)
         fiber.sleep(0.01)
         t.assert_not_equals(idx:stat().hnsw.generation, generation)
         t.assert_equals(idx:stat().maintenance.running, true)
-        s:replace{1, {2, 0}, 'after publication'}
-        s:insert{2, {3, 0}}
+        s:replace{1, embedding.new({2, 0}), 'after publication'}
+        s:insert{2, embedding.new({3, 0})}
         t.assert_equals(idx:search({2, 0}, {limit = 1})[1][3],
                         'after publication')
         builder:cancel()
@@ -692,6 +752,7 @@ g.test_writes_and_cancel_after_rebuild_publication = function(cg)
         t.assert(builder:join())
         t.assert_equals(idx:stat().memory.transient, 0)
         t.assert_equals(idx:search({3, 0}, {limit = 1})[1][1], 2)
-        t.assert_equals(idx:search({2, 0}, {limit = 1})[1][2], {2, 0})
+        t.assert_equals(idx:search({2, 0}, {limit = 1})[1][2],
+                                embedding.new({2, 0}))
     end)
 end

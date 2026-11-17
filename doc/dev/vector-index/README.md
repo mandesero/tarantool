@@ -7,19 +7,20 @@ Native IProto SELECT returns tuples;
 rich search with distances uses Lua or CALL.
 
 Create the VECTOR index in a memtx space whose vector field has the
-`array` type. Values must be dense finite numeric arrays of exactly
-the configured dimension. The index stores f32 components, computes
-distance in f64, and leaves original tuple values unchanged:
+`embedding` type. Create values with `embedding.new(array)`; coordinates
+are finite f32 values of the configured dimension. The index borrows their
+inline tuple payload, computes distance in f64, and retains the source tuple:
 
 ```lua
+local embedding = require('embedding')
 local s = box.schema.space.create('documents')
 s:format({{name = 'id', type = 'unsigned'},
-          {name = 'embedding', type = 'array'}})
+          {name = 'embedding', type = 'embedding'}})
 s:create_index('pk')
 s:create_index('vec', {type = 'vector', dimension = 2,
                        distance = 'l2', unique = false,
-                       parts = {{2, 'array'}}})
-s:insert{1, {0.1, 0.2}}
+                       parts = {{2, 'embedding'}}})
+s:insert{1, embedding.new({0.1, 0.2})}
 local tuples, _, distances = s.index.vec:search({0.1, 0.2}, {
     limit = 10, with_distance = true,
     timeout = 1, opts = {ef_search = 64},
@@ -69,26 +70,30 @@ bytes. Build and cleanup yield with a 1 ms target between graph operations,
 not a strict latency guarantee for each operation. Online creation on a
 nonempty space with a HASH primary key remains rejected.
 
-## Exact cursors and packed fields
+## Traversal and embedding values
 
-`index:pairs()` streams ALL tuples. `index:pairs({query},
-{iterator = 'neighbor'})` returns an exact distance/PK ordered traversal
-without the 1024-result cap. It retains at most 32 next results and rescans
-for each batch, so it is intended for controlled iteration rather than fast
-HNSW top-k. Public `box.read_view` uses frozen primary storage for exact
-ALL/NEIGHBOR reads that survive DML, compaction and DROP.
+Ordinary VECTOR `pairs` is unsupported. Use the space or primary index for
+ALL traversal; `index:count()` counts visible rows through primary storage.
+Keyed and NEIGHBOR count are unsupported. Bounded `select` and `search`
+provide HNSW top-k. The backend does not expose a resumable ANN cursor.
+Public `box.read_view` independently uses frozen primary storage for exact
+ALL/NEIGHBOR scans that survive DML, compaction and DROP. Ordered read-view
+scans retain at most 32 next results and rescan for every batch.
 
-A vector field and its index part may use `varbinary` instead of `array`.
-Insert `box.vector.pack({0.1, 0.2})` to store portable little-endian f32
-coordinates. The index borrows these bytes without another dense copy.
-`box.vector.unpack(value)` decodes the packed field. Navigation references
-may retain the original source tuple after version GC.
+The `embedding` module provides `new(array)`, `is(value)`, `totable(value)`
+and `#value`. MsgPack EXT type 9 stores d little-endian finite f32 components;
+this initial wire format has no payload header. ARRAY and BIN fields are not
+accepted by VECTOR; queries may be arrays or embedding values. Navigation
+references can retain the entire source tuple after version GC.
 
+After the last binding is collected, a slot is reusable. New insertions
+replace its coordinates and links with allocation-free rollback on failure.
+Old navigation coordinates are released after the successful replacement.
+`slots.reusable` counts these slots; rebuilding physically compacts them.
 A graph is limited to `2 * K + 64` nodes, with K the historical peak number
-of embeddings simultaneously needed by retained tuple versions. Writes
-requiring a new embedding fail with OutOfMemory at this limit until
-compaction releases space. `slots.nodes`, `slots.node_limit` and
-`slots.embedding_peak` report these values.
+of embeddings needed by retained tuple versions. At this limit reuse is
+allowed, while append fails with OutOfMemory. `slots.nodes`,
+`slots.node_limit` and `slots.embedding_peak` report these values.
 
 ## Distributed search
 

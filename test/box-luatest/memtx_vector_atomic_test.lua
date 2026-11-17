@@ -21,11 +21,11 @@ g.before_each(function(cg)
     cg.server:exec(function()
         local s = box.schema.space.create('vector_atomic')
         s:format({{name = 'id', type = 'unsigned'},
-                  {name = 'vec', type = 'array'},
+                  {name = 'vec', type = 'embedding'},
                   {name = 'tag', type = 'string'}})
         s:create_index('pk')
         s:create_index('vec', {type = 'vector', dimension = 2,
-                               unique = false, parts = {{2, 'array'}}})
+                               unique = false, parts = {{2, 'embedding'}}})
         s:create_index('tag', {unique = true, parts = {{3, 'string'}}})
     end)
 end)
@@ -38,29 +38,31 @@ end)
 
 g.test_later_secondary_failure = function(cg)
     cg.server:exec(function()
+        local e = require('embedding').new
         local s = box.space.vector_atomic
-        s:insert{1, {1, 0}, 'a'}
-        s:insert{2, {0, 1}, 'b'}
-        local ok = pcall(function() s:replace{1, {0.5, 0.5}, 'b'} end)
+        s:insert{1, e({1, 0}), 'a'}
+        s:insert{2, e({0, 1}), 'b'}
+        local ok = pcall(function() s:replace{1, e({0.5, 0.5}), 'b'} end)
         t.assert_equals(ok, false)
-        t.assert_equals(s:get{1}:totable(), {1, {1, 0}, 'a'})
+        t.assert_equals(s:get{1}:totable(), {1, e({1, 0}), 'a'})
         local found = s.index.vec:select({{1, 0}},
                                          {iterator = 'neighbor', limit = 1})
         t.assert_equals({#found, found[1][1]}, {1, 1})
         t.assert_equals(s.index.vec:len(), 2)
-        s:replace{1, {0.9, 0.1}, 'c'}
-        t.assert_equals(s:get{1}:totable(), {1, {0.9, 0.1}, 'c'})
+        s:replace{1, e({0.9, 0.1}), 'c'}
+        t.assert_equals(s:get{1}:totable(), {1, e({0.9, 0.1}), 'c'})
     end)
 end
 
 g.test_transaction_rollback = function(cg)
     cg.server:exec(function()
+        local e = require('embedding').new
         local s = box.space.vector_atomic
-        s:insert{1, {1, 0}, 'a'}
+        s:insert{1, e({1, 0}), 'a'}
         box.begin()
-        s:replace{1, {0, 1}, 'b'}
+        s:replace{1, e({0, 1}), 'b'}
         box.rollback()
-        t.assert_equals(s:get{1}:totable(), {1, {1, 0}, 'a'})
+        t.assert_equals(s:get{1}:totable(), {1, e({1, 0}), 'a'})
         local found = s.index.vec:select({{1, 0}},
                                          {iterator = 'neighbor', limit = 1})
         t.assert_equals({#found, found[1][1]}, {1, 1})
@@ -69,14 +71,15 @@ end
 
 g.test_savepoint_rollback = function(cg)
     cg.server:exec(function()
+        local e = require('embedding').new
         local s = box.space.vector_atomic
-        s:insert{1, {1, 0}, 'a'}
+        s:insert{1, e({1, 0}), 'a'}
         box.begin()
         local savepoint = box.savepoint()
-        s:replace{1, {0, 1}, 'b'}
+        s:replace{1, e({0, 1}), 'b'}
         box.rollback_to_savepoint(savepoint)
         box.commit()
-        t.assert_equals(s:get{1}:totable(), {1, {1, 0}, 'a'})
+        t.assert_equals(s:get{1}:totable(), {1, e({1, 0}), 'a'})
         local found = s.index.vec:select({{1, 0}},
                                          {iterator = 'neighbor', limit = 1})
         t.assert_equals({#found, found[1][1]}, {1, 1})
@@ -85,43 +88,45 @@ end
 
 g.test_invalid_replace_and_followup = function(cg)
     cg.server:exec(function()
+        local e = require('embedding').new
         local s = box.space.vector_atomic
-        s:insert{1, {1, 0}, 'a'}
+        s:insert{1, e({1, 0}), 'a'}
         t.assert_equals(pcall(function()
-            s:replace{1, {1}, 'b'}
+            s:replace{1, e({1}), 'b'}
         end), false)
-        t.assert_equals(s:get{1}:totable(), {1, {1, 0}, 'a'})
+        t.assert_equals(s:get{1}:totable(), {1, e({1, 0}), 'a'})
         t.assert_equals(s.index.vec:select({{1, 0}},
                                            {iterator = 'neighbor',
                                             limit = 1})[1][1], 1)
-        s:replace{1, {0, 1}, 'b'}
-        t.assert_equals(s:get{1}:totable(), {1, {0, 1}, 'b'})
+        s:replace{1, e({0, 1}), 'b'}
+        t.assert_equals(s:get{1}:totable(), {1, e({0, 1}), 'b'})
     end)
 end
 
 g.test_primary_key_and_nonvector_update = function(cg)
     cg.server:exec(function()
+        local e = require('embedding').new
         local s = box.space.vector_atomic
-        s:insert{1, {1, 0}, 'a'}
+        s:insert{1, e({1, 0}), 'a'}
         s:update({1}, {{'=', 3, 'b'}})
         t.assert_equals(s.index.vec:select({{1, 0}},
                                            {iterator = 'neighbor',
                                             limit = 1})[1]:totable(),
-                        {1, {1, 0}, 'b'})
+                        {1, e({1, 0}), 'b'})
         t.assert_equals(pcall(function()
             s:update({1}, {{'=', 1, 2}})
         end), false)
-        t.assert_equals(s:get{1}:totable(), {1, {1, 0}, 'b'})
+        t.assert_equals(s:get{1}:totable(), {1, e({1, 0}), 'b'})
         box.begin()
         s:delete{1}
-        s:insert{2, {1, 0}, 'b'}
+        s:insert{2, e({1, 0}), 'b'}
         box.commit()
         t.assert_equals(s:get{1}, nil)
         t.assert_equals(s.index.vec:select({{1, 0}},
                                            {iterator = 'neighbor',
                                             limit = 1})[1]:totable(),
-                        {2, {1, 0}, 'b'})
-        s:replace{2, {0, 1}, 'c'}
+                        {2, e({1, 0}), 'b'})
+        s:replace{2, e({0, 1}), 'c'}
         t.assert_equals(s.index.vec:select({{0, 1}},
                                            {iterator = 'neighbor',
                                             limit = 1})[1][1], 2)
@@ -130,28 +135,30 @@ end
 
 g.test_wal_failure_restores_vector = function(cg)
     cg.server:exec(function()
+        local e = require('embedding').new
         local s = box.space.vector_atomic
-        s:insert{1, {1, 0}, 'a'}
+        s:insert{1, e({1, 0}), 'a'}
         box.error.injection.set('ERRINJ_WAL_WRITE', true)
-        local ok = pcall(function() s:replace{1, {0, 1}, 'b'} end)
+        local ok = pcall(function() s:replace{1, e({0, 1}), 'b'} end)
         box.error.injection.set('ERRINJ_WAL_WRITE', false)
         t.assert_equals(ok, false)
-        t.assert_equals(s:get{1}:totable(), {1, {1, 0}, 'a'})
+        t.assert_equals(s:get{1}:totable(), {1, e({1, 0}), 'a'})
         t.assert_equals(s.index.vec:select({{1, 0}},
                                            {iterator = 'neighbor',
                                             limit = 1})[1][1], 1)
-        s:replace{1, {0, 1}, 'b'}
-        t.assert_equals(s:get{1}:totable(), {1, {0, 1}, 'b'})
+        s:replace{1, e({0, 1}), 'b'}
+        t.assert_equals(s:get{1}:totable(), {1, e({0, 1}), 'b'})
     end)
 end
 
 g.test_repeated_replacement_and_delete_rollback = function(cg)
     cg.server:exec(function()
+        local e = require('embedding').new
         local s = box.space.vector_atomic
-        s:insert{1, {1, 0}, 'a'}
+        s:insert{1, e({1, 0}), 'a'}
         for i = 1, 48 do
             local vector = {1 / (i + 1), 1}
-            s:replace{1, vector, 'a'}
+            s:replace{1, e(vector), 'a'}
             local found = s.index.vec:select({vector},
                                              {iterator = 'neighbor', limit = 1})
             t.assert_equals({#found, found[1][1]}, {1, 1})
@@ -168,7 +175,7 @@ g.test_repeated_replacement_and_delete_rollback = function(cg)
         t.assert_equals(#s.index.vec:select({{0, 1}},
                                             {iterator = 'neighbor',
                                             limit = 1}), 0)
-        s:insert{1, {1, 0}, 'a'}
+        s:insert{1, e({1, 0}), 'a'}
         t.assert_equals(s.index.vec:select({{1, 0}},
                                            {iterator = 'neighbor',
                                             limit = 1})[1][1],
@@ -179,15 +186,16 @@ end
 g.test_vector_allocation_failures = function(cg)
     t.tarantool.skip_if_not_debug()
     cg.server:exec(function()
+        local e = require('embedding').new
         local s = box.space.vector_atomic
         local errinj = box.error.injection
         local failures = 0
-        s:insert{1, {1, 0}, 'a'}
+        s:insert{1, e({1, 0}), 'a'}
         for countdown = 0, 48 do
             box.begin()
             errinj.set('ERRINJ_VECTOR_ALLOC', countdown)
             local ok = pcall(function()
-                s:replace{1, {0, 1}, 'b'}
+                s:replace{1, e({0, 1}), 'b'}
             end)
             if not ok then
                 failures = failures + 1
@@ -195,13 +203,13 @@ g.test_vector_allocation_failures = function(cg)
             errinj.set('ERRINJ_VECTOR_ALLOC', 0)
             box.rollback()
             errinj.set('ERRINJ_VECTOR_ALLOC', -1)
-            t.assert_equals(s:get{1}:totable(), {1, {1, 0}, 'a'})
+            t.assert_equals(s:get{1}:totable(), {1, e({1, 0}), 'a'})
             local found = s.index.vec:select({{1, 0}},
                                              {iterator = 'neighbor', limit = 1})
             t.assert_equals(found[1][1], 1)
         end
         t.assert_gt(failures, 3)
-        s:replace{1, {0, 1}, 'b'}
-        t.assert_equals(s:get{1}:totable(), {1, {0, 1}, 'b'})
+        s:replace{1, e({0, 1}), 'b'}
+        t.assert_equals(s:get{1}:totable(), {1, e({0, 1}), 'b'})
     end)
 end

@@ -1,3 +1,4 @@
+local embedding = require('embedding')
 local clock = require('clock')
 local digest = require('digest')
 local ffi = require('ffi')
@@ -27,12 +28,12 @@ box.cfg({work_dir = work_dir, log_level = 'error',
          memtx_use_mvcc_engine = true})
 local space = box.schema.space.create('vector_mvcc_bench')
 space:format({{name = 'id', type = 'unsigned'},
-              {name = 'embedding', type = 'array'}})
+              {name = 'embedding', type = 'embedding'}})
 space:create_index('pk')
-for id, vector in ipairs(vectors) do space:insert{id, vector} end
+for id, vector in ipairs(vectors) do space:insert{id, embedding.new(vector)} end
 local index = space:create_index('vec', {
     type = 'vector', dimension = dimension, distance = 'l2',
-    unique = false, parts = {{2, 'array'}},
+    unique = false, parts = {{2, 'embedding'}},
 })
 local before = index:stat()
 local query = vectors[1]
@@ -52,7 +53,7 @@ local started = clock.monotonic()
 for id = 1, 100 do
     local changed = {}
     for j = 1, dimension do changed[j] = -vectors[id][j] end
-    space:replace{id, changed}
+    space:replace{id, embedding.new(changed)}
 end
 local update_seconds = clock.monotonic() - started
 local held = index:stat()

@@ -16,12 +16,12 @@ g.before_each(function(cg)
     cg.server:exec(function()
         local s = box.schema.space.create('vector_select')
         s:format({{name = 'id', type = 'unsigned'},
-                  {name = 'vector', type = 'array'},
+                  {name = 'vector', type = 'embedding'},
                   {name = 'bucket_id', type = 'unsigned'}})
         s:create_index('pk')
         s:create_index('vec', {type = 'vector', dimension = 2,
                                distance = 'l2',
-                               unique = false, parts = {{2, 'array'}}})
+                               unique = false, parts = {{2, 'embedding'}}})
     end)
 end)
 
@@ -33,9 +33,10 @@ end)
 
 g.test_limits_and_distance = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local s = box.space.vector_select
         for i = 1, 1050 do
-            s:insert{i, {i / 10000, 0}, i % 2}
+            s:insert{i, embedding.new({i / 10000, 0}), i % 2}
         end
         local query = {0, 0}
         for _, limit in ipairs({0, 1, 32, 33, 100, 1024}) do
@@ -64,9 +65,10 @@ end
 
 g.test_filter_before_limit = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local s = box.space.vector_select
         for i = 1, 80 do
-            s:insert{i, {i / 1000, 0}, i % 2}
+            s:insert{i, embedding.new({i / 1000, 0}), i % 2}
         end
         local rows = s.index.vec:search({0, 0}, {
             limit = 32,
@@ -118,13 +120,14 @@ end
 
 g.test_equal_distance_and_unsigned_filter = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local s = box.space.vector_select
         local value = tonumber64('18446744073709551615')
         local large = tonumber64('18446744073709551613')
         local smaller = tonumber64('18446744073709551611')
-        s:insert{large, {1, 0}, value}
-        s:insert{smaller, {1, 0}, value}
-        s:insert{2, {1, 0}, 1}
+        s:insert{large, embedding.new({1, 0}), value}
+        s:insert{smaller, embedding.new({1, 0}), value}
+        s:insert{2, embedding.new({1, 0}), 1}
         local rows, _, distances = s.index.vec:search({1, 0}, {
             limit = 3, with_distance = true,
             filter = {field = 'bucket_id', values = {value}},
@@ -139,18 +142,19 @@ end
 
 g.test_composite_primary_key_tiebreak = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local s = box.schema.space.create('vec_composite')
         s:format({{name = 'a', type = 'unsigned'},
                   {name = 'b', type = 'string'},
-                  {name = 'vec', type = 'array'}})
+                  {name = 'vec', type = 'embedding'}})
         s:create_index('pk', {parts = {{1, 'unsigned'},
                                          {2, 'string'}}})
         s:create_index('vec', {type = 'vector', dimension = 2,
                                distance = 'l2', unique = false,
-                               parts = {{3, 'array'}}})
-        s:insert{1, 'b', {1, 0}}
-        s:insert{0, 'z', {1, 0}}
-        s:insert{1, 'a', {1, 0}}
+                               parts = {{3, 'embedding'}}})
+        s:insert{1, 'b', embedding.new({1, 0})}
+        s:insert{0, 'z', embedding.new({1, 0})}
+        s:insert{1, 'a', embedding.new({1, 0})}
         local rows = s.index.vec:search({1, 0}, {
             limit = 3,
         })
@@ -163,8 +167,9 @@ end
 
 g.test_timeout_and_generic_iterator_rejection = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local s = box.space.vector_select
-        s:insert{1, {1, 0}, 1}
+        s:insert{1, embedding.new({1, 0}), 1}
         local ok, err = pcall(function()
             s.index.vec:search({1, 0}, {
                 limit = 1, timeout = 1e-12,
@@ -175,7 +180,7 @@ g.test_timeout_and_generic_iterator_rejection = function(cg)
         ok = pcall(function()
             return s.index.vec:pairs({{1, 0}}, {iterator = 'neighbor'}):head()
         end)
-        t.assert_equals(ok, true)
+        t.assert_equals(ok, false)
         box.error.injection.set('ERRINJ_VECTOR_WORK_LIMIT', 1)
         ok, err = pcall(function()
             return s.index.vec:search({1, 0}, {
@@ -190,11 +195,12 @@ end
 
 g.test_heartbeat_during_selective_timeout = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local fiber = require('fiber')
         local clock = require('clock')
         local s = box.space.vector_select
         for i = 1, 2500 do
-            s:insert{i, {i / 2500, (2500 - i) / 2500}, i % 20}
+            s:insert{i, embedding.new({i / 2500, (2500 - i) / 2500}), i % 20}
         end
         local running = true
         local max_lag = 0

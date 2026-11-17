@@ -23,6 +23,7 @@
 #include "small/rlist.h"
 #include "info/info.h"
 #include "error.h"
+#include "mp_embedding.h"
 #include "lib/ann/ann_numeric.h"
 #include "lib/ann/ann_usearch.h"
 
@@ -192,15 +193,19 @@ static bool
 vector_reserve_maintenance(struct memtx_vector_index *index)
 {
 	uint64_t size;
-	ann_usearch_reclaimable(index->backend, &size);
+	uint64_t reusable = ann_usearch_reclaimable(index->backend, &size);
 	uint64_t peak = MAX(index->embedding_peak,
 			    (uint64_t)index->groups.live_count + 1);
-	if (size >= 2 * peak + 64) {
+	uint64_t limit = 2 * peak + 64;
+	if (reusable == 0 && size >= limit) {
 		vector_schedule_rebuild(index);
 		return false;
 	}
-	if (index->builder != NULL)
-		return index->builder_inserts < index->builder_insert_limit;
+	if (index->builder != NULL) {
+		reusable = ann_usearch_reclaimable(index->builder, &size);
+		return (reusable != 0 || size < limit) &&
+		       index->builder_inserts < index->builder_insert_limit;
+	}
 	size_t charged = index->memory_owner->charged;
 	if (charged > (QUOTA_MAX - 65536) / 4)
 		return false;
@@ -388,23 +393,20 @@ static inline int
 mp_decode_vector_from_key(double **vector, unsigned dimensions,
 			  const char *mp, uint32_t part_count)
 {
-	if (part_count == 1)
+	if (part_count == 1 && mp_typeof(*mp) == MP_EXT) {
+		uint32_t count;
+		const char *data = mp_decode_embedding(&mp, &count);
+		if (data == NULL || count != dimensions) {
+			diag_set(ClientError, ER_VECTOR_INVALID);
+			return -1;
+		}
+		for (unsigned i = 0; i < dimensions; ++i)
+			(*vector)[i] = embedding_f32le_load(data, i);
+		return 0;
+	}
+	if (part_count == 1 && mp_typeof(*mp) == MP_ARRAY)
 		part_count = mp_decode_array(&mp);
 	return mp_decode_vector(vector, dimensions, mp, part_count, "Key");
-}
-
-static inline int
-extract_vector(double **vector, struct tuple *tuple,
-	       struct index_def *index_def)
-{
-	assert(index_def->key_def->part_count == 1);
-	assert(!index_def->key_def->is_multikey);
-	const char *elems = tuple_field_by_part(tuple,
-				index_def->key_def->parts, MULTIKEY_NONE);
-	unsigned dimension = index_def->opts.dimension;
-
-	uint32_t count = mp_decode_array(&elems);
-	return mp_decode_vector(vector, dimension, elems, count, "Field");
 }
 
 static int
@@ -426,7 +428,13 @@ memtx_vector_index_create_iterator(struct index *base, enum iterator_type type,
 				  const char *key, uint32_t part_count,
 				  const char *pos)
 {
-	return memtx_vector_scan_iterator_new(base, type, key, part_count, pos);
+	(void)base;
+	(void)type;
+	(void)key;
+	(void)part_count;
+	(void)pos;
+	diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
+	return NULL;
 }
 
 /** VECTOR has no stable positional continuation under concurrent writes. */
@@ -435,10 +443,7 @@ memtx_vector_index_create_iterator_with_offset(
 	struct index *base, enum iterator_type type, const char *key,
 	uint32_t part_count, const char *pos, uint32_t offset)
 {
-	if (offset != 0) {
-		diag_set(ClientError, ER_VECTOR_UNSUPPORTED);
-		return NULL;
-	}
+	(void)offset;
 	return memtx_vector_index_create_iterator(base, type, key,
 						  part_count, pos);
 }
@@ -821,43 +826,19 @@ vector_prepare_group(struct memtx_vector_index *index, struct tuple *tuple,
 	}
 	const char *field = tuple_field_by_part(
 		tuple, def->key_def->parts, MULTIKEY_NONE);
-	const char *packed = NULL;
-	float *canonical = NULL;
-	enum ann_status status;
-	if (mp_typeof(*field) == MP_BIN) {
-		uint32_t size;
-		packed = mp_decode_bin(&field, &size);
-		if (size != index->dimension * sizeof(float))
-			return ANN_INVALID;
-		status = ann_vector_validate_le(packed, index->dimension,
-						index->metric);
-	} else {
-		struct region *region = &fiber()->gc;
-		double *decoded = xregion_alloc_array(region, double,
-						      index->dimension);
-		canonical = xregion_alloc_array(
-			region, float, index->dimension);
-		if (extract_vector(&decoded, tuple, def) != 0)
-			return ANN_INVALID;
-		status = ann_vector_from_double(decoded, index->dimension,
-						index->metric, canonical);
-	}
+	uint32_t dimension;
+	const char *packed = mp_decode_embedding(&field, &dimension);
+	if (packed == NULL || dimension != index->dimension)
+		return ANN_INVALID;
+	enum ann_status status = ann_vector_validate_le(
+		packed, index->dimension, index->metric);
 	if (status != ANN_OK)
 		return status;
-	if (same_row) {
-		const void *data =
-			ann_usearch_vector_data(previous->group->vector);
-		bool borrowed =
-			ann_usearch_vector_is_borrowed(previous->group->vector);
-		const void *input = packed != NULL ?
-			(const void *)packed : (const void *)canonical;
-		bool equal = borrowed == (packed != NULL) &&
-			memcmp(input, data,
-			       index->dimension * sizeof(float)) == 0;
-		if (equal) {
-			*out = previous->group;
-			return ANN_OK;
-		}
+	if (same_row &&
+	    memcmp(packed, ann_usearch_vector_data(previous->group->vector),
+		   index->dimension * sizeof(float)) == 0) {
+		*out = previous->group;
+		return ANN_OK;
 	}
 	if (!vector_reserve_maintenance(index))
 		return ANN_OUT_OF_MEMORY;
@@ -873,16 +854,11 @@ vector_prepare_group(struct memtx_vector_index *index, struct tuple *tuple,
 	group->live_count = 0;
 	struct ann_memory vector_memory =
 		ann_quota_memory_bind(&index->vector_memory);
-	if (packed != NULL) {
-		group->vector = ann_usearch_vector_borrow(
-			&vector_memory, packed, index->dimension, tuple,
-			vector_release_tuple);
-		if (group->vector != NULL)
-			tuple_ref(tuple);
-	} else {
-		group->vector = ann_usearch_vector_new(
-			&vector_memory, canonical, index->dimension);
-	}
+	group->vector = ann_usearch_vector_borrow(
+		&vector_memory, packed, index->dimension, tuple,
+		vector_release_tuple);
+	if (group->vector != NULL)
+		tuple_ref(tuple);
 	if (group->vector == NULL) {
 		memory.free(memory.ctx, group, sizeof(*group));
 		return ANN_OUT_OF_MEMORY;
@@ -1100,7 +1076,7 @@ memtx_vector_index_stat(struct index *base, struct info_handler *handler)
 	info_table_end(handler);
 	info_table_begin(handler, "slots");
 	info_append_int(handler, "capacity", stats.capacity);
-	info_append_int(handler, "pending_rebuild", stats.reclaimable);
+	info_append_int(handler, "reusable", stats.reclaimable);
 	info_append_int(handler, "embeddings", index->groups.live_count);
 	info_append_int(handler, "embedding_peak", index->embedding_peak);
 	uint64_t nodes;
@@ -1253,7 +1229,7 @@ static const struct index_vtab memtx_vector_index_vtab_base = {
 	/* .min = */ generic_index_min,
 	/* .max = */ generic_index_max,
 	/* .random = */ generic_index_random,
-	/* .count = */ generic_index_count,
+	/* .count = */ memtx_vector_index_count,
 	/* .get = */ memtx_index_get,
 	/* .create_iterator = */ memtx_vector_index_create_iterator,
 	/* .create_iterator_with_offset = */
@@ -1281,8 +1257,7 @@ memtx_vector_index_new(struct memtx_engine *memtx, struct index_def *def)
 {
 	assert(def->iid > 0);
 	assert(def->key_def->part_count == 1);
-	assert(def->key_def->parts[0].type == FIELD_TYPE_ARRAY ||
-	       def->key_def->parts[0].type == FIELD_TYPE_VARBINARY);
+	assert(def->key_def->parts[0].type == FIELD_TYPE_EMBEDDING);
 	assert(def->opts.is_unique == false);
 
 	/* Checked by memtx_space_check_index_def(). */

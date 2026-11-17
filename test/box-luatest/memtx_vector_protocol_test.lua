@@ -7,6 +7,7 @@ g.before_all(function(cg)
     cg.server = server:new()
     cg.server:start()
     cg.server:exec(function(disable_ffi)
+        local embedding = require('embedding')
         if disable_ffi then
             local ffi = require('ffi')
             ffi.cdef('void box_read_ffi_disable(void);')
@@ -15,9 +16,9 @@ g.before_all(function(cg)
         local s = box.schema.space.create('vector_protocol')
         s:create_index('pk')
         s:create_index('vec', {type = 'vector', dimension = 2, distance = 'l2',
-                              unique = false, parts = {{2, 'array'}}})
-        s:insert{1, {1, 0}}
-        s:insert{2, {0, 1}}
+                              unique = false, parts = {{2, 'embedding'}}})
+        s:insert{1, embedding.new({1, 0})}
+        s:insert{2, embedding.new({0, 1})}
     end, {cg.params.disable_ffi})
 end)
 
@@ -27,9 +28,11 @@ end)
 
 g.test_local_select = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local idx = box.space.vector_protocol.index.vec
         local opts = {iterator = 'neighbor', limit = 1}
-        t.assert_equals(idx:select({{1, 0}}, opts), {{1, {1, 0}}})
+        t.assert_equals(idx:select({{1, 0}}, opts),
+                        {{1, embedding.new({1, 0})}})
         t.assert_equals(idx:select({{1, 0}}, {
             iterator = 'neighbor', limit = 0,
         }), {})
@@ -52,12 +55,13 @@ g.test_local_select = function(cg)
 end
 
 g.test_network_select = function(cg)
+    local embedding = require('embedding')
     local idx = cg.server.net_box.space.vector_protocol.index.vec
     local opts = {iterator = 'neighbor', limit = 1, timeout = 10}
-    t.assert_equals(idx:select({{1, 0}}, opts), {{1, {1, 0}}})
+    t.assert_equals(idx:select({{1, 0}}, opts), {{1, embedding.new({1, 0})}})
     opts.is_async = true
     local future = idx:select({{0, 1}}, opts)
-    t.assert_equals(future:wait_result(10), {{2, {0, 1}}})
+    t.assert_equals(future:wait_result(10), {{2, embedding.new({0, 1})}})
     for _, extra in ipairs({{offset = 0}, {after = ''}, {fetch_pos = true},
                             {with_distance = true}, {filter = {}},
                             {opts = {ef_search = 32}}}) do
@@ -71,7 +75,7 @@ g.test_network_select = function(cg)
     local sid = cg.server.net_box.space.vector_protocol.id
     t.assert_equals(conn.space[sid].index[1]:select({{1, 0}}, {
         iterator = 'neighbor', limit = 1,
-    }), {{1, {1, 0}}})
+    }), {{1, embedding.new({1, 0})}})
     t.assert_error_covers({code = box.error.VECTOR_UNSUPPORTED}, function()
         conn.space[sid].index[1]:select({{1, 0}}, {
             iterator = 'EQ', limit = 1,
@@ -87,14 +91,16 @@ end
 
 g.test_search_contract = function(cg)
     cg.server:exec(function()
+        local embedding = require('embedding')
         local idx = box.space.vector_protocol.index.vec
         local tuples, _, distances = idx:search({1, 0}, {
             limit = 2, with_distance = true,
         })
-        t.assert_equals(tuples, {{1, {1, 0}}, {2, {0, 1}}})
+        t.assert_equals(tuples, {{1, embedding.new({1, 0})},
+                                 {2, embedding.new({0, 1})}})
         t.assert_equals(distances, {0, 2})
         tuples, _, distances = idx:search({1, 0}, {limit = 1})
-        t.assert_equals(tuples, {{1, {1, 0}}})
+        t.assert_equals(tuples, {{1, embedding.new({1, 0})}})
         t.assert_equals(distances, nil)
         t.assert_equals(select('#', idx:search({1, 0}, {limit = 1})), 1)
         t.assert_equals(select('#', idx:search({1, 0}, {

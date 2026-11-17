@@ -22,14 +22,15 @@ end)
 
 g.test_snapshot_join_and_async_apply = function(cg)
     cg.master:exec(function()
+        local embedding = require('embedding')
         local s = box.schema.space.create('vector_repl')
         s:format({{name = 'id', type = 'unsigned'},
-                  {name = 'vec', type = 'array'}})
+                  {name = 'vec', type = 'embedding'}})
         s:create_index('pk')
         s:create_index('vec', {type = 'vector', dimension = 2,
-                               unique = false, parts = {{2, 'array'}}})
-        s:insert{1, {1, 0}}
-        s:insert{2, {0, 1}}
+                               unique = false, parts = {{2, 'embedding'}}})
+        s:insert{1, embedding.new({1, 0})}
+        s:insert{2, embedding.new({0, 1})}
         box.snapshot()
     end)
     cg.replica:start()
@@ -43,10 +44,11 @@ g.test_snapshot_join_and_async_apply = function(cg)
         t.assert_equals({rows[1][1], distances[1]}, {1, 0})
     end)
     cg.master:exec(function()
+        local embedding = require('embedding')
         local s = box.space.vector_repl
-        s:replace{2, {0.9, 0.1}}
+        s:replace{2, embedding.new({0.9, 0.1})}
         s:delete{1}
-        s:insert{3, {1, 0}}
+        s:insert{3, embedding.new({1, 0})}
     end)
     cg.replica:wait_for_vclock_of(cg.master)
     cg.replica:exec(function()

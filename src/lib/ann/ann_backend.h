@@ -116,7 +116,7 @@ struct ann_backend_stats {
 	uint64_t live;
 	/** Retired records still available to older views. */
 	uint64_t retired;
-	/** Reclaimed navigation slots queued for generation rebuild. */
+	/** GC-safe slots available for reuse or generation rebuild. */
 	uint64_t reclaimable;
 	/** Allocated entry slots, including unused capacity. */
 	uint64_t capacity;
