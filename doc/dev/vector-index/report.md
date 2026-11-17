@@ -1,190 +1,151 @@
-# VECTOR review implementation report
+# VECTOR CoW read-view implementation report
 
-Date: 2026-11-17. This report supersedes the
-[November 11 report](report-20261111.md), which describes older contracts.
-The active native contract is [contract.md](contract.md).
+Date: 2026-11-18. This report supersedes the
+[November 17 report](report-20261117.md), whose exact-scan read-view contract
+is no longer active. The current native contract is [contract.md](contract.md).
 
 ## Source revisions
 
-- Starting native revision: `42ea5c3da6eeaff4a5822b10921ccf031fb75c64`.
-- Embedding type: `2de44f8a1cb8882f191613b40d9d5641a96c662e`.
-- Native VECTOR: `aa2d8bf5ec6d6667b34a633012c9fa846879699f`.
-- Backend isolation: `7b83b972f2704d20b07e4ff8af320a5a57648b1a`.
-- USearch: `5c9595ed9a8d019570973c8647b62e6ba416ca6a`.
-- Companion CRUD code: `e2b4c86883c37a0aa9277639a163eca95fd0dc6a`.
+- Starting native revision: `fa07b3aa5ae8d94e571e55dec1355e9e59793b9b`.
+- Backend snapshots: `2d7247e94486ee87a8be01594300663c101a6ff5`.
+- Memtx read-view integration: `ae48f57d5c6245909cacf135760ae9ff8f1662f9`.
+- USearch hooks: `378b4f3d7474bd98ef8f7225041f558545a07382`, on top of
+  `5c9595ed9a8d019570973c8647b62e6ba416ca6a`.
+- Unchanged CRUD: `1065bd56de3a9eff59a7f7bb18a60e092c2ae26e`.
 - Unchanged vshard: `674cda708d957cc145aa4f0622804bb5c2f8007a`.
 
-These revisions and this report are local commits, not a push. The native
-commit pins the USearch revision; the CRUD workflow pins native VECTOR.
-The exported USearch slot-reuse patch applies in reverse to that revision.
+The new native and USearch commits are local. No push was requested for this
+follow-up. The native submodule pin and exported usearch-cow.patch contain
+the same hooks; reverse application of the export was checked.
 
-## Review decisions and implementation
+## Implementation
 
-The read-API, embedding and slot-lifecycle reviewers agreed on the RFC
-changes before implementation, then checked their respective code paths.
-The six Word notes are addressed as follows.
+Public VECTOR read views retain an immutable HNSW root and the normal memtx
+primary snapshot. Opening a view does not walk graph nodes, copy their
+pointer array or copy coordinates. A seven-level, 32-way persistent radix
+array maps physical slots to immutable records. Each record owns its node
+tape and a reference to canonical coordinates.
 
-1. HNSW is the approximate algorithm; USearch is its replaceable initial
-   library. There is no comparative performance claim. Ordinary VECTOR
-   pairs is unsupported: ALL duplicates primary iteration and the current
-   top-k search exposes no resumable cursor. This is not a claim that
-   HNSW can never support pagination. Unkeyed count counts visible primary
-   rows; keyed count is unsupported. Core frozen read-view iteration
-   remains a separate exact interface. Filtering before the local limit
-   excludes foreign buckets without consuming CRUD's result budget.
-2. The note attached to "For example" concerns timeout. Rich search takes
-   the remaining distributed deadline from CRUD. A client wait timeout
-   alone cannot stop synchronous work in the TX thread; a fiber slice is
-   not the request's remaining budget. Ordinary select retains its internal
-   one-second search budget and has no new server timeout option.
-3. The unreleased prototype uses only embedding fields and index parts.
-   ARRAY/BIN storage fallbacks and box.vector pack/unpack are removed.
-   Queries accept arrays or embedding values. Embedding uses extension 9
-   with 1..4096 finite IEEE 754 f32 coordinates in little-endian order.
-   Shared conversion rounds ties to even. C/FFI MsgPack, JSON/YAML, tuple
-   fields, recovery and IProto support the type. Unsupported SQL and
-   comparable-key uses fail explicitly. CRUD returns portable arrays and
-   loads embedding lazily to preserve startup on a core without VECTOR.
-4. A label identifies a vector group, independently of a primary key,
-   tuple address or graph slot. Tuple-version bindings select the exact
-   MVCC-visible result. Coordinates can be shared across versions and
-   graph generations. The new RFC diagram is editable Mermaid code.
-5. GC-safe graph slots are reused before growth. USearch index_gt is a
-   low-level class, while ann_usearch.cc is the Tarantool adapter. The dense
-   wrapper uses the same update operation and does not supply MVCC or
-   allocation-free rollback. Prepared snapshots restore affected outgoing
-   and reverse links, labels and keys after failure. Repeated reuse avoids
-   duplicate reverse edges. Old coordinates remain owned until success.
-6. Current and rebuilding generations change atomically. Reuse remains
-   possible at the append cap; automatic compaction starts at both 64 free
-   slots and a 25 percent free ratio. The finite initial rebuild range and
-   bounded concurrent admission remain in place. Backshift deletion avoids
-   accumulating historical lookup tombstones. Only slots.reusable is
-   exposed; the unreleased pending_rebuild alias is removed.
+Before changing a shared node, the USearch adapter copies its tape. It
+publishes updated records through private radix paths only after graph work
+succeeds. Untouched nodes, paths and coordinates remain shared. Existing
+internal graph undo restores private tapes after an interrupted graph call.
+Published change undo instead restores retained tape pointers and a radix
+root without allocation. A snapshot opened after apply but before rollback
+therefore retains its own topology, labels and coordinates.
 
-The reserved pagination result is preserved: with_distance returns
-tuples, nil, distances. Without it, search returns tuples only.
-Additional fixes cover typed query validation, linearizable count,
-JSON/YAML without metatables, and the expanded field compatibility matrix.
+Snapshot searches allocate private scratch contexts per request. They do
+not change the shared root or acquire mutable graph-node locks. The C
+backend contract now includes snapshot creation, borrowed coordinate handles
+and a request-local scratch allocator. Flat remains the test-only search
+oracle and does not implement production snapshots.
 
-## Backend isolation follow-up
+The coordinate owner supplies a primary key for a point lookup in frozen
+primary storage. The predicate admits only coordinates matching that tuple
+version. The bounded result is ordered by distance and primary key and
+deduplicated. No full primary scan or exact-search fallback remains in
+NEIGHBOR. Like ordinary HNSW, the result is approximate and may be short.
 
-USearch was chosen initially for its convenient C-compatible API. The current
-adapter uses the lower-level C++ graph to supply Tarantool's required numeric,
-allocation, undo and stop behavior. Other libraries still need integration for
-MVCC, rollback, memory quota and cooperative execution. Total integration and
-maintenance costs have not been measured comparatively.
+Read-view NEIGHBOR select requires an explicit limit from 0 through 1024.
+It uses the captured index search width, a one-second request budget, the
+work limit, cancellation and fiber-slice checks. Unbounded NEIGHBOR pairs,
+offset and cursor options are rejected. ALL still streams frozen primary
+storage; it does not invoke HNSW. Ordinary VECTOR APIs and the reserved
+tuples, nil, distances return positions are unchanged.
 
-Memtx now obtains the implementation from the algorithm registry and routes
-all backend operations through its vtable. Shared insertion, membership and
-physical slot reclamation are part of the common C contract. Shared coordinate
-ownership moved to ann_vector.c, and HNSW configuration moved to ann_hnsw.h.
-Neither requires USearch types. The registry and library adapter determine
-which implementation serves hnsw; changing that mapping does not change Lua
-or CRUD interfaces. Public algorithm selection still accepts only hnsw.
+## Lifetime and memory
 
-Flat implements the extended contract, including borrowed unaligned coordinates.
-The same 36 assertions run on each backend: allocation failure, visibility,
-numeric results, cancellation, rollback, GC and external-owner lifetime.
-This verifies the shared boundary, not the integration cost of another ANN
-library. No new continuing-search interface or public pairs support is claimed.
-The RFC explicitly separates that current limitation from HNSW itself.
+Read views pin the index's coordinate allocation context. Generation quota
+owners are allocated independently instead of rotating two embedded owner
+objects. They survive rebuild while any snapshot still references their
+pages. Retiring a backend releases its live arrays, contexts and root;
+its allocator counters remain until the last shared record is released.
+DML, GC, slot reuse, rollback, rebuild and DROP cannot mutate an open view.
 
-## Word artifact verification
+All backend tapes, radix pages, immutable records and snapshot backend
+headers use the shared memtx quota. Shared allocations are counted once at
+their owner. memory.read_views and memory.generations.read_views include
+snapshot headers and retired generations retained by views. Allocations
+shared with a current or transient generation stay in that category.
+memory.total and bsize sum current, transient and read_views. Tuple storage
+and per-request materialization remain outside index bsize.
 
-Input: the user's third numbered Word export, SHA-256
-`f0b2baed8a659a1736bea986189e37e51c7d165403fcc95a5bb60b5204b8b971`.
-Output: vector-index-rfc-backend-red.docx, SHA-256
-`8921b3ba0b062698fb7fda595e0dd5e334d9c9317f0df41d07186411142dc3dd`.
-Both files are external to the repository.
+The existing node cap bounds each working graph. It does not bound the
+number of old CoW versions pinned by readers. Long-lived read views can
+retain extra node tapes, pages and source tuples until closure. Quota
+exhaustion rejects new allocations instead of discarding required snapshots.
+The cost of additional write barriers and allocations needs production-scale
+measurement; these correctness checks are not a performance comparison.
 
-The revision changes 33 paragraphs, adds a Mermaid block, and removes one
-duplicate C field. Insertions and replacements are red relative to this
-input. Other source prose is preserved. All six native Word comments,
-seven tables and three original formula images remain. Internal links,
-image embedding, comment ranges and unchanged text were checked. Exactly three
-paragraphs differ from the preceding revision: backend choice, the common
-interface and the pairs rationale. The 22 rendered pages were verified: six
-are byte-identical to previously inspected pages, and the other 16 were
-inspected again. The earlier export layout and link repairs remain intact.
-
-## Verification on Ubuntu
-
-After backend isolation, the full GCC Debug build and all 18 focused CTest
-entries passed in one run. The Clang 19 ASan+UBSan build and all 12 focused
-entries also passed in one run. The sets include the two common backend
-contract subtests, quota/rollback/lifetime units, VECTOR functional tests and
-regular-build replication. Checkpatch and git diff --check reported no errors.
-Additional isolated AppleClang Debug and sanitizer contract checks passed.
-The 14 changed source/build/test files match the Ubuntu copies by SHA-256.
-Two new headers had only trailing blank lines removed after the test run;
-that formatting was synchronized before the final source comparison.
-Logs, the source manifest and document audit are retained externally beside
-the revised Word artifact, under verification/.
-
-The following broader results describe the preceding embedding review:
+## Verification
 
 GCC 13.3 Debug and Clang 19 ASan+UBSan builds completed on the selected
-Ubuntu host. Its existing checkout was synchronized without resetting
-unrelated work. The binary's old git-describe label does not identify these
-sources. SHA-256 comparison verified all 59 changed code, test and benchmark
-files against their local versions, including the USearch header.
+Ubuntu host. The final clean verification run passed:
 
-- All 18 focused native CTest entries passed across the initial run and
-  repaired-fixture rerun: ANN/embedding units, VECTOR/type Lua suites and
-  replication. Fixture repairs concerned SQL full-scan permission and a
-  zero vector in a cosine read-view test.
-- All 134 core unit entries passed across the initial run and the repaired
-  tuple-format fixture rerun. The compatibility matrix includes the new
-  field type. A final clean build and seven selected unit entries passed.
-- ASan+UBSan passed 12 focused entries; after the final source adjustments,
-  the sanitizer build and all five ANN/embedding unit entries passed again.
-- All 129 core read-view Lua tests passed.
-- All 12 focused CRUD tests passed, including lazy unavailable-feature
-  handling, storage privileges, routing and the real cluster path.
-- The complete three-replicaset CRUD fixture passed, including migration,
-  permissions, timeout and schema checks. It passed again after the final
-  fixture cleanup. Five benchmark profiles ran 30 calls each with three
-  participants; these are smoke profiles, not scalability evidence.
-- Native benchmark smoke with 256 rows, dimension 8 and 10 queries reported
-  Recall@10 = 1, no short results and successful rebuild. Transient memory
-  returned to zero; memory.vectors and memory.retained were zero as expected.
-- LuaCheck reported no warnings or errors for the changed Lua files.
-  git diff --check passed. Tarantool checkpatch reported zero errors after
-  excluding the required volatile f32 conversion and a C++ reference
-  spacing false positive; later benchmark/CI changes passed separately.
+- All 18 focused CTest entries: ANN and embedding units, VECTOR/type Lua
+  suites and vector replication.
+- All 12 focused ASan+UBSan entries with leak detection and fail-fast UBSan.
+- All four general read-view CTest entries, including pagination and stats.
+- LuaCheck for both changed Lua files: zero warnings and zero errors.
+- git diff --check. Tarantool checkpatch has one C++ destructor syntax
+  false positive at backend->~ann_backend(); excluding SPACING reports
+  zero errors. No other diagnostics were suppressed.
 
-The initial aggregate runs and their fixture reruns are recorded separately;
-they are not represented as single all-green executions. Logs, benchmark
-JSON, document checks and the source hash manifest are retained locally
-beside the external Word artifact, under verification/.
+New unit checks exercise constant-size root capture, physical slot reuse,
+snapshots created before rollback, allocation-free undo, source destruction,
+and 80 allocation-failure positions. A multi-level graph test reads a frozen
+snapshot from another pthread while the writer reuses nodes and destroys
+the original graph. Reader scratch ownership and final allocator release
+are checked. This does not introduce an asynchronous public search API.
+
+Luatest covers C and FFI paths with ordinary memtx and MVCC, HASH primary
+lookup, committed snapshot visibility during rollback, DML, DROP, multiple
+simultaneous views across two rebuilds, memory totals, allocation failure,
+work exhaustion, zero/absent/oversized limits and unsupported pagination.
+
+SHA-256 comparison verified all 19 transferred files against the local
+sources, including the USearch header. The remote binary's old git-describe
+label does not identify this source state. Logs, the exact manifest and
+document checks are retained externally beside the Word artifact under
+verification/. Earlier failing runs are not represented as green runs:
+they exposed an immutable-node lock access, a test assertion helper typo,
+and missing enum/aggregate initializers, all fixed before the final run.
+
+## Word revision
+
+Input is the user's third numbered Word export, SHA-256
+`f0b2baed8a659a1736bea986189e37e51c7d165403fcc95a5bb60b5204b8b971`.
+Output is vector-index-rfc-cow-red.docx, SHA-256
+`839f4455629859174763e2e62ddbd6d90b8d67a2d4b8f5241798344c6745bb46`.
+The files are external to the repository.
+
+The CoW follow-up changes 11 prose paragraphs and adds two internal C
+members relative to the previous backend edition. It replaces the read-view
+scan description and adjusts memory accounting, rebuild lifetime and the
+backend contract. Previously accepted edits remain. Insertions and
+replacements are red relative to the user's original export.
+
+All six native Word comments, seven tables, three original formula images
+and editable Mermaid source are preserved. Comment ranges and image bytes
+were checked. All 22 final pages were visually verified; the first seven
+are byte-identical to already inspected pages of the initial render.
 
 ## Reproduction
 
-Build Debug with recursive submodules, including the pinned USearch fork.
-For the native focused set:
+Use the pinned recursive submodules and separate Debug and sanitizer builds.
 
 ```sh
+ann_units='test/unit/(ann[._]|embedding[._])'
+vector_lua='embedding_type|memtx_vector|replication-luatest/vector_index'
+cmake --build build -j 4
 ctest --test-dir build --timeout 180 --output-on-failure -E '/\._' \
-  -R '(test/unit/(ann[._]|embedding[._])|embedding_type|memtx_vector|replication-luatest/vector_index)'
-ctest --test-dir build -L tarantool-unit -j 4 --timeout 120 -E '/\._'
+  -R "($ann_units|$vector_lua)"
+cmake --build build-vector-lifecycle-clang -j 4
+asan_lua='memtx_vector_(atomic|embedding|lifecycle|mvcc|read_contract|review)'
+ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+  ctest --test-dir build-vector-lifecycle-clang --timeout 180 \
+  --output-on-failure -E '/\._' \
+  -R "($ann_units|embedding_type|$asan_lua)"
+ctest --test-dir build --timeout 180 --output-on-failure \
+  -E '/\._' -R read_view
 ```
-
-Build the sanitizer tree with Clang, ENABLE_ASAN=ON and ENABLE_UB_SANITIZER=ON;
-use ASAN_OPTIONS=detect_leaks=1 and UBSAN_OPTIONS=halt_on_error=1 for its
-focused CTest set. The companion [CRUD report][crud-report] records cluster
-setup and commands. Select a matching Luatest checkout for runner and child
-processes. Benchmark scripts are perf/lua/vector_index.lua and the companion
-perf/vector_search.lua.
-
-## Limits
-
-Coordinates are inline in a tuple. Borrowing them pins the whole tuple;
-it does not retain only an independent vector blob. Payload-only updates
-share the ANN coordinate owner but create a new tuple containing its field.
-The RFC plans a copied-versus-borrowed ownership comparison using the same
-embedding format. That comparison and production-scale load measurements
-have not been performed. Live data and MVCC readers still consume quota;
-slot reuse bounds historical churn, not the amount of retained live data.
-
-[crud-report]: https://github.com/mandesero/crud/blob/codex/vector-search/doc/vector-search-report.md
