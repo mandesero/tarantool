@@ -5,6 +5,8 @@
  */
 #include "lib/ann/ann_backend.h"
 #include "lib/ann/ann_usearch.h"
+#include "lib/ann/ann_vector.h"
+#include "lib/ann/ann_hnsw.h"
 #include "box/ann_memory.h"
 
 #include <cstddef>
@@ -133,7 +135,7 @@ test_filtered_topk(const struct ann_backend_ops *ops)
 	struct ann_filter filter = {accept_odd_label, nullptr};
 	struct ann_search_control control = {};
 	control.work_limit = 1000000;
-	struct ann_usearch_search_opts algorithm = {128};
+	struct ann_hnsw_search_opts algorithm = {128};
 	struct ann_search_opts opts = {};
 	opts.candidate_limit = 10;
 	opts.query_dimension = 2;
@@ -314,7 +316,7 @@ wide_search(struct ann_backend *backend, const float *query,
 {
 	struct ann_search_control control = {};
 	control.work_limit = 100000;
-	struct ann_usearch_search_opts algorithm = {1024};
+	struct ann_hnsw_search_opts algorithm = {1024};
 	struct ann_search_opts opts = {};
 	opts.candidate_limit = 2;
 	opts.query_dimension = 2;
@@ -476,7 +478,7 @@ test_growth_and_retire(void)
 	plan(6);
 	struct owner owner = {};
 	struct ann_memory memory = owner_memory(&owner);
-	struct ann_usearch_config algorithm = {8, 32, 64};
+	struct ann_hnsw_config algorithm = {8, 32, 64};
 	struct ann_config config = {2, ANN_L2, &algorithm};
 	struct ann_backend *backend = nullptr;
 	is(ann_usearch_ops.create(&config, &memory, &backend), ANN_OK,
@@ -704,8 +706,8 @@ test_shared_coordinates(void)
 	struct ann_memory shared_memory = owner_memory(&coordinates);
 	struct ann_memory graph_memory = owner_memory(&graphs);
 	float data[] = {1, 2};
-	struct ann_usearch_vector *vector =
-		ann_usearch_vector_new(&shared_memory, data, 2);
+	struct ann_vector *vector =
+		ann_vector_new(&shared_memory, data, 2);
 	ok(vector != nullptr, "shared vector allocates once");
 	size_t bytes = coordinates.bytes;
 	struct ann_config config = {2, ANN_L2, nullptr};
@@ -717,8 +719,8 @@ test_shared_coordinates(void)
 	struct ann_backend *backends[] = {old, fresh};
 	for (auto *graph : backends) {
 		struct ann_change *change = nullptr;
-		enum ann_status status =
-			ann_usearch_prepare_shared(graph, 1, vector, &change);
+		enum ann_status status = ann_usearch_ops.prepare_shared(
+			graph, 1, vector, &change);
 		is(status, ANN_OK,
 		   "shared insertion prepares without copying coordinates");
 		is(ann_usearch_ops.apply(change, nullptr), ANN_OK,
@@ -726,9 +728,9 @@ test_shared_coordinates(void)
 		ann_usearch_ops.finish(change);
 	}
 	uint64_t size = 0;
-	ok(ann_usearch_reclaimable(fresh, &size) == 0 && size == 1,
+	ok(ann_usearch_ops.reclaimable(fresh, &size) == 0 && size == 1,
 	   "constant-time maintenance counters describe the graph");
-	ann_usearch_vector_unref(vector);
+	ann_vector_unref(vector);
 	ann_usearch_ops.destroy(old);
 	ok(coordinates.bytes == bytes, "new graph retains the same vector");
 	struct ann_candidate found[2];
@@ -757,25 +759,25 @@ test_borrowed_coordinates(void)
 	struct ann_memory graph_memory = owner_memory(&graphs);
 	unsigned released = 0;
 	unsigned char packed[] = {0xff, 0, 0, 128, 63, 0, 0, 0, 64};
-	struct ann_usearch_vector *vector = ann_usearch_vector_borrow(
+	struct ann_vector *vector = ann_vector_borrow(
 		&memory, packed + 1, 2, &released, release_borrowed);
-	ok(vector != nullptr && ann_usearch_vector_is_borrowed(vector),
+	ok(vector != nullptr && ann_vector_is_borrowed(vector),
 	   "unaligned packed coordinates can be borrowed");
-	is(ann_usearch_vector_data(vector), packed + 1,
+	is(ann_vector_data(vector), packed + 1,
 	   "coordinate pointer is not copied");
-	is(coordinates.bytes, ann_usearch_vector_overhead(),
+	is(coordinates.bytes, ann_vector_overhead(),
 	   "only a lifetime header is allocated");
 	struct ann_config config = {2, ANN_L2, nullptr};
 	struct ann_backend *backend = nullptr;
 	is(ann_usearch_ops.create(&config, &graph_memory, &backend), ANN_OK,
 	   "packed graph creates");
 	struct ann_change *change = nullptr;
-	is(ann_usearch_prepare_shared(backend, 1, vector, &change), ANN_OK,
+	is(ann_usearch_ops.prepare_shared(backend, 1, vector, &change), ANN_OK,
 	   "packed insertion prepares");
 	is(ann_usearch_ops.apply(change, nullptr), ANN_OK,
 	   "packed insertion applies");
 	ann_usearch_ops.finish(change);
-	ann_usearch_vector_unref(vector);
+	ann_vector_unref(vector);
 	is(released, 0, "graph retains the external owner");
 	float query[] = {1, 2};
 	struct ann_candidate found[2];
@@ -816,16 +818,16 @@ test_slot_reuse(void)
 	ok(inserted, "initial graph contains sixteen distinct nodes");
 	ok(reclaim_label(backend, 16), "GC grants reuse of one retired node");
 	uint64_t size = 0;
-	ok(ann_usearch_reclaimable(backend, &size) == 1 && size == 16,
+	ok(ann_usearch_ops.reclaimable(backend, &size) == 1 && size == 16,
 	   "one navigation slot is available without graph growth");
 	float vector[] = {17, 0};
 	struct ann_change *change = nullptr;
 	is(ann_usearch_ops.prepare(backend, ANN_INSERT, 17, vector, 2,
 				   &change), ANN_OK, "reuse reserves a slot");
-	ok(ann_usearch_reclaimable(backend, &size) == 0 && size == 16,
+	ok(ann_usearch_ops.reclaimable(backend, &size) == 0 && size == 16,
 	   "prepared reuse exclusively reserves the slot");
 	ann_usearch_ops.finish(change);
-	ok(ann_usearch_reclaimable(backend, &size) == 1 && size == 16,
+	ok(ann_usearch_ops.reclaimable(backend, &size) == 1 && size == 16,
 	   "discarding an unapplied change returns the slot");
 	bool reused = true;
 	for (uint64_t label = 17; label <= 1040; ++label) {
@@ -840,12 +842,12 @@ test_slot_reuse(void)
 			found[0].distance == 0;
 		reused &= reclaim_label(backend, label);
 		for (uint64_t retained = 1; retained < 16; ++retained)
-			reused &= ann_usearch_contains(backend, retained);
+			reused &= ann_usearch_ops.contains(backend, retained);
 		if (!reused)
 			break;
 	}
 	ok(reused, "repeated reuse keeps new values reachable");
-	ok(ann_usearch_reclaimable(backend, &size) == 1 && size == 16,
+	ok(ann_usearch_ops.reclaimable(backend, &size) == 1 && size == 16,
 	   "a thousand replacements do not accumulate graph nodes");
 	ann_usearch_ops.destroy(backend);
 	ok(owner.bytes == 0 && owner.bad_free == 0,
@@ -899,10 +901,11 @@ test_reuse_failures(bool allocation)
 			ann_usearch_ops.finish(change);
 			consistent &= owner.calls == calls;
 			uint64_t size = 0;
-			consistent &= ann_usearch_reclaimable(backend, &size) ==
-				1 && size == 16 &&
-				!ann_usearch_contains(backend, 100) &&
-				!ann_usearch_contains(backend, 8);
+			uint64_t reusable =
+				ann_usearch_ops.reclaimable(backend, &size);
+			consistent &= reusable == 1 && size == 16 &&
+				!ann_usearch_ops.contains(backend, 100) &&
+				!ann_usearch_ops.contains(backend, 8);
 			owner.fail_at = 0;
 			for (uint64_t label = 1; label <= 16; ++label) {
 				if (label == 8)
@@ -942,19 +945,19 @@ test_reuse_borrowed_owner(void)
 	struct ann_memory graph_memory = owner_memory(&graphs);
 	unsigned released = 0;
 	unsigned char packed[] = {0, 0, 128, 63, 0, 0, 0, 64};
-	struct ann_usearch_vector *vector = ann_usearch_vector_borrow(
+	struct ann_vector *vector = ann_vector_borrow(
 		&memory, packed, 2, &released, release_borrowed);
 	struct ann_config config = {2, ANN_L2, nullptr};
 	struct ann_backend *backend = nullptr;
 	is(ann_usearch_ops.create(&config, &graph_memory, &backend), ANN_OK,
 	   "borrowed reuse backend creates");
 	struct ann_change *change = nullptr;
-	is(ann_usearch_prepare_shared(backend, 1, vector, &change), ANN_OK,
+	is(ann_usearch_ops.prepare_shared(backend, 1, vector, &change), ANN_OK,
 	   "borrowed navigation vector prepares");
 	is(ann_usearch_ops.apply(change, nullptr), ANN_OK,
 	   "borrowed navigation vector applies");
 	ann_usearch_ops.finish(change);
-	ann_usearch_vector_unref(vector);
+	ann_vector_unref(vector);
 	ok(reclaim_label(backend, 1) && released == 0,
 	   "reclaimed navigation still pins its external owner");
 	float replacement[] = {4, 5};
@@ -974,15 +977,15 @@ test_reuse_borrowed_owner(void)
 	ann_usearch_ops.destroy(backend);
 	ok(graphs.bytes == 0 && released == 1,
 	   "reused owner cannot be released twice during destruction");
-	vector = ann_usearch_vector_borrow(&memory, packed, 2, &released,
-					   release_borrowed);
+	vector = ann_vector_borrow(&memory, packed, 2, &released,
+				   release_borrowed);
 	bool ready = ann_usearch_ops.create(&config, &graph_memory, &backend) ==
-		ANN_OK && ann_usearch_prepare_shared(backend, 1, vector,
+		ANN_OK && ann_usearch_ops.prepare_shared(backend, 1, vector,
 						     &change) == ANN_OK &&
 		ann_usearch_ops.apply(change, nullptr) == ANN_OK;
 	ok(ready, "a second backend holds borrowed navigation coordinates");
 	ann_usearch_ops.finish(change);
-	ann_usearch_vector_unref(vector);
+	ann_vector_unref(vector);
 	ready = reclaim_label(backend, 1) &&
 		ann_usearch_ops.prepare(backend, ANN_INSERT, 2, replacement, 2,
 					  &change) == ANN_OK &&

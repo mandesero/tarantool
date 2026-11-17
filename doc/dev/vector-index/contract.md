@@ -6,6 +6,24 @@ The distributed API contract is maintained in the companion
 [CRUD guide](https://github.com/mandesero/crud/blob/codex/vector-search/doc/vector-search.md).
 Build and verification evidence is in [report.md](report.md).
 
+## Backend boundary
+
+USearch was selected for the initial implementation because its C API made
+prototyping convenient. The integrated adapter uses its lower-level C++ graph
+to provide Tarantool's allocation, numeric and undo guarantees. A comparison
+of the total integration and maintenance cost of alternatives is still needed.
+
+Memtx selects an algorithm through `ann_backend_find` and uses its operations
+for search, mutations, membership, reclamation and statistics. `ann_vector`
+owns shared coordinates independently of the library. HNSW configuration is
+algorithm-specific, with no USearch types in the storage layer. The same C
+contract tests run against Flat and USearch. Flat remains a test oracle.
+
+The current contract provides bounded top-k, with no continuing search state.
+This does not prohibit streaming HNSW traversal. A future cursor contract must
+define ordering, completeness, bounded work per advance and behavior across
+yield and concurrent mutations; a cursor over materialized top-k is insufficient.
+
 ## Numeric and search behavior
 
 - The production algorithm is memtx HNSW with a replaceable internal backend.

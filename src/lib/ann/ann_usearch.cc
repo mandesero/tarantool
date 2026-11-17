@@ -5,6 +5,8 @@
  */
 #include "ann_usearch.h"
 #include "ann_numeric.h"
+#include "ann_vector.h"
+#include "ann_hnsw.h"
 
 #include <usearch/index.hpp>
 
@@ -107,100 +109,12 @@ using ann_graph_allocator = ann_usearch_allocator<unum::usearch::byte_t>;
 using ann_graph = unum::usearch::index_gt<double, uint64_t, uint32_t,
 					 ann_graph_allocator, ann_graph_allocator>;
 
-/** Independently owned coordinates outlive either graph generation. */
-struct ann_usearch_vector {
-	/** Allocator of the shared coordinate block. */
-	struct ann_memory memory;
-	/** Owners in the storage layer and both graph generations. */
-	uint32_t refs;
-	/** Number of referenced coordinates. */
-	uint32_t dimension;
-	/** Native owned coordinates or borrowed little-endian bytes. */
-	const void *data;
-	/** External lifetime owner, or NULL for copied coordinates. */
-	void *owner;
-	/** Release the external lifetime owner, or NULL for owned payload. */
-	void (*release)(void *owner);
-};
-
-extern "C" struct ann_usearch_vector *
-ann_usearch_vector_new(const struct ann_memory *memory, const float *data,
-		       uint32_t dimension)
-{
-	size_t size = sizeof(struct ann_usearch_vector) +
-		      (size_t)dimension * sizeof(float);
-	void *ptr = memory->alloc(memory->ctx, size);
-	if (ptr == nullptr)
-		return nullptr;
-	auto *vector = (struct ann_usearch_vector *)ptr;
-	vector->memory = *memory;
-	vector->refs = 1;
-	vector->dimension = dimension;
-	vector->data = vector + 1;
-	vector->owner = nullptr;
-	vector->release = nullptr;
-	memcpy(vector + 1, data, (size_t)dimension * sizeof(float));
-	return vector;
-}
-
-extern "C" void
-ann_usearch_vector_unref(struct ann_usearch_vector *vector)
-{
-	if (vector == nullptr || --vector->refs != 0)
-		return;
-	struct ann_memory memory = vector->memory;
-	size_t size = sizeof(*vector);
-	if (vector->release != nullptr)
-		vector->release(vector->owner);
-	else
-		size += (size_t)vector->dimension * sizeof(float);
-	memory.free(memory.ctx, vector, size);
-}
-
-extern "C" const void *
-ann_usearch_vector_data(const struct ann_usearch_vector *vector)
-{
-	return vector->data;
-}
-
-extern "C" struct ann_usearch_vector *
-ann_usearch_vector_borrow(const struct ann_memory *memory, const void *data,
-			  uint32_t dimension, void *owner,
-			  void (*release)(void *))
-{
-	if (data == nullptr || release == nullptr || dimension == 0)
-		return nullptr;
-	auto *vector = (struct ann_usearch_vector *)
-		memory->alloc(memory->ctx, sizeof(struct ann_usearch_vector));
-	if (vector == nullptr)
-		return nullptr;
-	vector->memory = *memory;
-	vector->refs = 1;
-	vector->dimension = dimension;
-	vector->data = data;
-	vector->owner = owner;
-	vector->release = release;
-	return vector;
-}
-
-extern "C" bool
-ann_usearch_vector_is_borrowed(const struct ann_usearch_vector *vector)
-{
-	return vector->release != nullptr;
-}
-
-extern "C" size_t
-ann_usearch_vector_overhead(void)
-{
-	return sizeof(struct ann_usearch_vector);
-}
-
 /** One slot-stable graph entry. */
 struct ann_usearch_entry {
 	/** Owned native or borrowed packed coordinates. */
 	const void *vector;
 	/** Shared coordinate owner, or NULL for an owned test vector. */
-	struct ann_usearch_vector *shared;
+	struct ann_vector *shared;
 	/** Storage-layer version label. */
 	uint64_t label;
 	/** Current-view membership. */
@@ -226,7 +140,7 @@ struct ann_backend {
 	/** Copied allocation callbacks and owner. */
 	struct ann_memory memory;
 	/** Immutable HNSW settings. */
-	struct ann_usearch_config options;
+	struct ann_hnsw_config options;
 	/** Charged allocation bytes including context buffers. */
 	uint64_t retained_bytes;
 	/** Patched low-level HNSW graph. */
@@ -247,7 +161,7 @@ struct ann_backend {
 	struct ann_change *pending;
 
 	ann_backend(const struct ann_config &cfg, struct ann_memory mem,
-		    struct ann_usearch_config opts) : config(cfg), memory(mem),
+		    struct ann_hnsw_config opts) : config(cfg), memory(mem),
 	    options(opts), retained_bytes(sizeof(*this)),
 	    graph(unum::usearch::index_config_t{opts.connectivity},
 		  ann_graph_allocator{mem, &retained_bytes},
@@ -270,7 +184,7 @@ struct ann_change {
 	/** Vector awaiting transfer to the slot. */
 	const void *vector;
 	/** Shared coordinate owner awaiting transfer. */
-	struct ann_usearch_vector *shared;
+	struct ann_vector *shared;
 	/** Graph slot affected by this change. */
 	uint32_t slot;
 	/** Whether this change altered the current view. */
@@ -288,7 +202,7 @@ struct ann_change {
 };
 
 static size_t
-ann_usearch_vector_size(const struct ann_backend *backend)
+ann_vector_size(const struct ann_backend *backend)
 {
 	return (size_t)backend->config.dimension * sizeof(float);
 }
@@ -314,13 +228,13 @@ ann_usearch_free(struct ann_backend *backend, void *ptr, size_t size)
 /** Coordinates can belong to this generation or an independent owner. */
 static void
 ann_usearch_release_vector(struct ann_backend *backend, const void *vector,
-			   struct ann_usearch_vector *shared)
+			   struct ann_vector *shared)
 {
 	if (shared != nullptr)
-		ann_usearch_vector_unref(shared);
+		ann_vector_unref(shared);
 	else
 		ann_usearch_free(backend, (void *)vector,
-				 ann_usearch_vector_size(backend));
+				 ann_vector_size(backend));
 }
 
 /** Mix pointer-like and sequential labels before masking to table capacity. */
@@ -430,7 +344,7 @@ struct ann_usearch_metric {
 	{
 		const auto *entry = &backend->entries[value.slot];
 		return {entry->vector, entry->shared != nullptr &&
-			ann_usearch_vector_is_borrowed(entry->shared)};
+			ann_vector_is_borrowed(entry->shared)};
 	}
 	template <class K>
 	ann_coordinate_ref vector(unum::usearch::member_ref_gt<K> value)
@@ -493,9 +407,9 @@ ann_usearch_create(const struct ann_config *config,
 		config->dimension ||
 	    (unsigned)config->metric > ANN_IP)
 		return ANN_INVALID;
-	struct ann_usearch_config options = {16, 200, 64};
+	struct ann_hnsw_config options = {16, 200, 64};
 	if (config->algorithm != nullptr)
-		options = *(const struct ann_usearch_config *)config->algorithm;
+		options = *(const struct ann_hnsw_config *)config->algorithm;
 	if (options.connectivity < 2 || options.connectivity > UINT32_MAX / 2 ||
 	    options.expansion_add == 0 || options.expansion_search == 0)
 		return ANN_INVALID;
@@ -625,7 +539,7 @@ ann_usearch_prepare_impl(struct ann_backend *backend,
 			 enum ann_change_kind kind,
 		    uint64_t label, const void *vector, uint32_t dimension,
 		    struct ann_change **out,
-		    struct ann_usearch_vector *shared)
+		    struct ann_vector *shared)
 {
 	if (out == nullptr)
 		return ANN_INVALID;
@@ -639,7 +553,7 @@ ann_usearch_prepare_impl(struct ann_backend *backend,
 		if (slot >= 0)
 			return ANN_EXISTS;
 		enum ann_status valid = shared != nullptr &&
-			ann_usearch_vector_is_borrowed(shared) ?
+			ann_vector_is_borrowed(shared) ?
 			ann_vector_validate_le(vector, dimension,
 					       backend->config.metric) :
 			ann_vector_validate_f32(
@@ -677,19 +591,19 @@ ann_usearch_prepare_impl(struct ann_backend *backend,
 		backend->reclaim_queue[backend->reclaim_count - 1] :
 		backend->graph.size();
 	if (kind == ANN_INSERT && shared != nullptr) {
-		++shared->refs;
+		ann_vector_ref(shared);
 		change->shared = shared;
-		change->vector = ann_usearch_vector_data(shared);
+		change->vector = ann_vector_data(shared);
 	} else if (kind == ANN_INSERT) {
 		change->vector = (float *)ann_usearch_alloc(
-			backend, ann_usearch_vector_size(backend));
+			backend, ann_vector_size(backend));
 		if (change->vector == nullptr) {
 			change->~ann_change();
 			ann_usearch_free(backend, change, sizeof(*change));
 			return ANN_OUT_OF_MEMORY;
 		}
 		memcpy((void *)change->vector, vector,
-		       ann_usearch_vector_size(backend));
+		       ann_vector_size(backend));
 	}
 	if (change->reused) {
 		change->old_entry = backend->entries[change->slot];
@@ -711,23 +625,29 @@ ann_usearch_prepare(struct ann_backend *backend, enum ann_change_kind kind,
 					out, nullptr);
 }
 
-extern "C" enum ann_status
+static enum ann_status
 ann_usearch_prepare_shared(struct ann_backend *backend, uint64_t label,
-			   struct ann_usearch_vector *vector,
+			   struct ann_vector *vector,
 			   struct ann_change **out)
 {
-	const void *data = ann_usearch_vector_data(vector);
+	if (vector == nullptr) {
+		if (out != nullptr)
+			*out = nullptr;
+		return ANN_INVALID;
+	}
+	const void *data = ann_vector_data(vector);
+	uint32_t dimension = ann_vector_dimension(vector);
 	return ann_usearch_prepare_impl(backend, ANN_INSERT, label, data,
-					vector->dimension, out, vector);
+					dimension, out, vector);
 }
 
-extern "C" bool
+static bool
 ann_usearch_contains(const struct ann_backend *backend, uint64_t label)
 {
 	return backend != nullptr && ann_usearch_find(backend, label) >= 0;
 }
 
-extern "C" uint64_t
+static uint64_t
 ann_usearch_reclaimable(const struct ann_backend *backend, uint64_t *size)
 {
 	*size = backend->graph.size();
@@ -761,7 +681,7 @@ ann_usearch_apply(struct ann_change *change,
 	enum ann_status status = ANN_OK;
 	ann_usearch_metric metric{backend, control, &status,
 		change->shared != nullptr &&
-		ann_usearch_vector_is_borrowed(change->shared)};
+		ann_vector_is_borrowed(change->shared)};
 	struct ann_usearch_stop stop{control, &status};
 	unum::usearch::index_update_config_t config;
 	config.expansion = backend->options.expansion_add;
@@ -908,7 +828,7 @@ ann_usearch_search(struct ann_backend *backend, const float *query,
 		return status;
 	uint32_t expansion = backend->options.expansion_search;
 	if (opts->algorithm != nullptr) {
-		expansion = ((const struct ann_usearch_search_opts *)
+		expansion = ((const struct ann_hnsw_search_opts *)
 			     opts->algorithm)->expansion;
 		if (expansion == 0)
 			return ANN_INVALID;
@@ -977,7 +897,8 @@ ann_usearch_stat(const struct ann_backend *backend,
 
 extern "C" const struct ann_backend_ops ann_usearch_ops = {
 	"usearch", ann_usearch_create, ann_usearch_destroy,
-	ann_usearch_reserve, ann_usearch_prepare, ann_usearch_apply,
+	ann_usearch_reserve, ann_usearch_prepare, ann_usearch_prepare_shared,
+	ann_usearch_contains, ann_usearch_reclaimable, ann_usearch_apply,
 	ann_usearch_rollback, ann_usearch_finish, ann_usearch_set_live,
 	ann_usearch_is_live,
 	ann_usearch_reclaim,

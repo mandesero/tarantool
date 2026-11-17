@@ -5,6 +5,7 @@
  */
 #include "ann_backend.h"
 #include "ann_numeric.h"
+#include "ann_vector.h"
 
 #include <assert.h>
 #include <math.h>
@@ -14,8 +15,10 @@
 struct ann_flat_entry {
 	/** Opaque label supplied by the caller. */
 	uint64_t label;
-	/** Backend-owned canonical float32 vector. */
-	float *vector;
+	/** Native or packed coordinates. */
+	const void *vector;
+	/** Shared coordinate owner, or NULL for a backend-owned copy. */
+	struct ann_vector *shared;
 	/** Whether the current view may return this version. */
 	bool live;
 };
@@ -49,7 +52,9 @@ struct ann_change {
 	/** Target label. */
 	uint64_t label;
 	/** Prepared vector, transferred to an entry on apply. */
-	float *vector;
+	const void *vector;
+	/** Shared owner transferred to an entry on apply. */
+	struct ann_vector *shared;
 	/** Target slot for a retire. */
 	uint32_t slot;
 	/** True after a successful application. */
@@ -80,6 +85,18 @@ static size_t
 ann_flat_vector_size(const struct ann_backend *backend)
 {
 	return (size_t)backend->config.dimension * sizeof(float);
+}
+
+/** Shared payloads are charged to their coordinate owner. */
+static void
+ann_flat_release_vector(struct ann_backend *backend, const void *vector,
+			struct ann_vector *shared)
+{
+	if (shared != NULL)
+		ann_vector_unref(shared);
+	else
+		ann_flat_free(backend, (void *)vector,
+			      ann_flat_vector_size(backend));
 }
 
 static enum ann_status
@@ -116,15 +133,14 @@ ann_flat_destroy(struct ann_backend *backend)
 		return;
 	for (struct ann_change *change = backend->pending; change != NULL;) {
 		struct ann_change *previous = change->previous;
-		if (change->vector != NULL)
-			ann_flat_free(backend, change->vector,
-				      ann_flat_vector_size(backend));
+		ann_flat_release_vector(backend, change->vector,
+					change->shared);
 		ann_flat_free(backend, change, sizeof(*change));
 		change = previous;
 	}
 	for (uint32_t i = 0; i < backend->count; ++i)
-		ann_flat_free(backend, backend->entries[i].vector,
-			      ann_flat_vector_size(backend));
+		ann_flat_release_vector(backend, backend->entries[i].vector,
+					backend->entries[i].shared);
 	ann_flat_free(backend, backend->entries,
 		      (size_t)backend->capacity * sizeof(*backend->entries));
 	backend->memory.free(backend->memory.ctx, backend, sizeof(*backend));
@@ -166,9 +182,9 @@ ann_flat_find(const struct ann_backend *backend, uint64_t label)
 }
 
 static enum ann_status
-ann_flat_prepare(struct ann_backend *backend, enum ann_change_kind kind,
-		 uint64_t label, const float *vector, uint32_t dimension,
-		 struct ann_change **out)
+ann_flat_prepare_impl(struct ann_backend *backend, enum ann_change_kind kind,
+		      uint64_t label, const void *vector, uint32_t dimension,
+		      struct ann_change **out, struct ann_vector *shared)
 {
 	if (out == NULL)
 		return ANN_INVALID;
@@ -184,8 +200,13 @@ ann_flat_prepare(struct ann_backend *backend, enum ann_change_kind kind,
 			return ANN_INVALID;
 		if (slot >= 0)
 			return ANN_EXISTS;
-		if (ann_vector_validate_f32(vector, backend->config.dimension,
-					   backend->config.metric) != ANN_OK)
+		enum ann_status valid = shared != NULL &&
+			ann_vector_is_borrowed(shared) ?
+			ann_vector_validate_le(vector, dimension,
+					       backend->config.metric) :
+			ann_vector_validate_f32(vector, dimension,
+						backend->config.metric);
+		if (valid != ANN_OK)
 			return ANN_INVALID;
 		if (backend->count == UINT32_MAX)
 			return ANN_INVALID;
@@ -211,18 +232,59 @@ ann_flat_prepare(struct ann_backend *backend, enum ann_change_kind kind,
 	change->kind = kind;
 	change->label = label;
 	change->slot = kind == ANN_RETIRE ? (uint32_t)slot : backend->count;
-	if (kind == ANN_INSERT) {
+	if (kind == ANN_INSERT && shared != NULL) {
+		ann_vector_ref(shared);
+		change->shared = shared;
+		change->vector = vector;
+	} else if (kind == ANN_INSERT) {
 		size_t size = ann_flat_vector_size(backend);
 		change->vector = ann_flat_alloc(backend, size);
 		if (change->vector == NULL) {
 			ann_flat_free(backend, change, sizeof(*change));
 			return ANN_OUT_OF_MEMORY;
 		}
-		memcpy(change->vector, vector, size);
+		memcpy((void *)change->vector, vector, size);
 	}
 	backend->pending = change;
 	*out = change;
 	return ANN_OK;
+}
+
+static enum ann_status
+ann_flat_prepare(struct ann_backend *backend, enum ann_change_kind kind,
+		 uint64_t label, const float *vector, uint32_t dimension,
+		 struct ann_change **out)
+{
+	return ann_flat_prepare_impl(backend, kind, label, vector, dimension,
+				     out, NULL);
+}
+
+/** Retain the same owner across independently committed backend generations. */
+static enum ann_status
+ann_flat_prepare_shared(struct ann_backend *backend, uint64_t label,
+			struct ann_vector *vector, struct ann_change **out)
+{
+	if (vector == NULL) {
+		if (out != NULL)
+			*out = NULL;
+		return ANN_INVALID;
+	}
+	return ann_flat_prepare_impl(backend, ANN_INSERT, label,
+				     ann_vector_data(vector),
+				     ann_vector_dimension(vector), out, vector);
+}
+
+static bool
+ann_flat_contains(const struct ann_backend *backend, uint64_t label)
+{
+	return backend != NULL && ann_flat_find(backend, label) >= 0;
+}
+
+static uint64_t
+ann_flat_reclaimable(const struct ann_backend *backend, uint64_t *size)
+{
+	*size = backend->count;
+	return 0;
 }
 
 static enum ann_status
@@ -242,8 +304,10 @@ ann_flat_apply(struct ann_change *change,
 		struct ann_flat_entry *entry = &backend->entries[backend->count++];
 		entry->label = change->label;
 		entry->vector = change->vector;
+		entry->shared = change->shared;
 		entry->live = true;
 		change->vector = NULL;
+		change->shared = NULL;
 	} else {
 		backend->entries[change->slot].live = false;
 	}
@@ -263,8 +327,7 @@ ann_flat_rollback(struct ann_change *change)
 	struct ann_backend *backend = change->backend;
 	if (change->kind == ANN_INSERT) {
 		struct ann_flat_entry *entry = &backend->entries[--backend->count];
-		ann_flat_free(backend, entry->vector,
-			      ann_flat_vector_size(backend));
+		ann_flat_release_vector(backend, entry->vector, entry->shared);
 	} else {
 		backend->entries[change->slot].live = true;
 	}
@@ -279,7 +342,7 @@ ann_flat_finish(struct ann_change *change)
 	struct ann_backend *backend = change->backend;
 	assert(backend->pending == change);
 	backend->pending = change->previous;
-	ann_flat_free(backend, change->vector, ann_flat_vector_size(backend));
+	ann_flat_release_vector(backend, change->vector, change->shared);
 	ann_flat_free(backend, change, sizeof(*change));
 }
 
@@ -314,8 +377,8 @@ ann_flat_reclaim(struct ann_backend *backend, uint64_t label)
 	int64_t slot = ann_flat_find(backend, label);
 	if (slot < 0 || backend->entries[slot].live)
 		return ANN_NOT_FOUND;
-	ann_flat_free(backend, backend->entries[slot].vector,
-		      ann_flat_vector_size(backend));
+	ann_flat_release_vector(backend, backend->entries[slot].vector,
+				backend->entries[slot].shared);
 	backend->entries[slot] = backend->entries[--backend->count];
 	return ANN_OK;
 }
@@ -375,10 +438,12 @@ ann_flat_search(struct ann_backend *backend, const float *query,
 			continue;
 		}
 		double distance;
-		status = ann_distance(query, entry->vector,
-				      backend->config.dimension,
-				      backend->config.metric, opts->control,
-				      &distance);
+		bool packed = entry->shared != NULL &&
+			      ann_vector_is_borrowed(entry->shared);
+		status = ann_distance_raw(query, false, entry->vector, packed,
+					  backend->config.dimension,
+					  backend->config.metric, opts->control,
+					  &distance);
 		if (status != ANN_OK)
 			return status;
 		if (count == opts->candidate_limit &&
@@ -410,7 +475,8 @@ ann_flat_stat(const struct ann_backend *backend, struct ann_backend_stats *out)
 	out->lookup_bytes = (uint64_t)backend->capacity *
 			    sizeof(*backend->entries);
 	for (uint32_t i = 0; i < backend->count; ++i) {
-		if (backend->entries[i].vector != NULL)
+		if (backend->entries[i].vector != NULL &&
+		    backend->entries[i].shared == NULL)
 			out->vector_bytes += (uint64_t)backend->config.dimension *
 					     sizeof(float);
 		if (backend->entries[i].live)
@@ -429,6 +495,9 @@ const struct ann_backend_ops ann_flat_ops = {
 	.destroy = ann_flat_destroy,
 	.reserve = ann_flat_reserve,
 	.prepare = ann_flat_prepare,
+	.prepare_shared = ann_flat_prepare_shared,
+	.contains = ann_flat_contains,
+	.reclaimable = ann_flat_reclaimable,
 	.apply = ann_flat_apply,
 	.rollback = ann_flat_rollback,
 	.finish = ann_flat_finish,

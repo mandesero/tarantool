@@ -5,6 +5,7 @@
  */
 #include "lib/ann/ann_backend.h"
 #include "lib/ann/ann_numeric.h"
+#include "lib/ann/ann_vector.h"
 
 #include <fenv.h>
 #include <float.h>
@@ -219,8 +220,8 @@ test_lifecycle(void)
 {
 	plan(38);
 	const struct ann_backend_ops *ops = ann_backend_find("flat");
-	ok(ops != NULL && ann_backend_find("hnsw") == NULL,
-	   "Flat is registered without a production algorithm");
+	ok(ops != NULL && ann_backend_find("hnsw") != NULL,
+	   "reference and production algorithms are registered");
 	struct owner first = {0}, second = {0};
 	struct ann_memory first_mem = owner_memory(&first);
 	struct ann_memory second_mem = owner_memory(&second);
@@ -522,15 +523,142 @@ test_failure(void)
 	check_plan();
 }
 
+static void
+release_borrowed(void *ctx)
+{
+	++*(int *)ctx;
+}
+
+static bool
+accept_any_label(uint64_t label, void *ctx)
+{
+	(void)label;
+	(void)ctx;
+	return true;
+}
+
+static bool
+stop_search(void *ctx)
+{
+	(void)ctx;
+	return true;
+}
+
+/** Both backends obey the same contract without implementation extensions. */
+static void
+test_backend_contract(const char *algorithm)
+{
+	plan(36);
+	const struct ann_backend_ops *ops = ann_backend_find(algorithm);
+	fail_unless(ops != NULL);
+	struct owner owner = {0};
+	struct ann_memory memory = owner_memory(&owner);
+	struct ann_config config = {2, ANN_L2, NULL};
+	struct ann_backend *backend = NULL;
+	is(ops->create(&config, &memory, &backend), ANN_OK,
+	   "%s creates through the common factory", algorithm);
+	is(ops->reserve(backend, 8), ANN_OK, "reserve before mutation");
+	is(ops->prepare_shared(backend, 17, NULL, NULL), ANN_INVALID,
+	   "invalid shared payload is rejected");
+	is(ann_vector_new(&memory, NULL, 2), NULL,
+	   "copied owner rejects missing coordinates");
+	is(ann_vector_borrow(&memory, NULL, 0, NULL, NULL), NULL,
+	   "borrowed owner rejects invalid lifetime and dimension");
+	/* Tuple coordinates may be unaligned and have an external owner. */
+	const unsigned char packed[] = {0, 0, 0, 128, 63, 0, 0, 0, 64};
+	int released = 0;
+	struct ann_vector *vector =
+		ann_vector_borrow(&memory, packed + 1, 2, &released,
+				  release_borrowed);
+	fail_unless(vector != NULL);
+	is(ann_vector_dimension(vector), 2, "owner preserves dimension");
+	ok(ann_vector_data(vector) == packed + 1,
+	   "borrowed owner preserves the caller's coordinate address");
+	struct ann_change *change = NULL;
+	ok(!ops->contains(backend, 17), "unpublished label is absent");
+	is(ops->prepare_shared(backend, 17, vector, &change), ANN_OK,
+	   "prepare borrowed coordinates");
+	ok(!ops->contains(backend, 17), "prepare does not publish the label");
+	struct ann_search_control control = search_control(1000000);
+	is(ops->apply(change, &control), ANN_OK, "publish borrowed vector");
+	ops->finish(change);
+	ann_vector_unref(vector);
+	is(released, 0, "backend retains the external owner");
+	ok(ops->contains(backend, 17), "published label is present");
+	float query[] = {0, 0};
+	struct ann_candidate found[2];
+	uint32_t count = 0;
+	struct ann_search_opts opts = {2, 2, NULL, &control, NULL};
+	is(ops->search(backend, query, &opts, found, &count), ANN_OK,
+	   "search borrowed coordinates");
+	ok(count == 1 && found[0].label == 17 && found[0].distance == 5,
+	   "shared numeric contract for unaligned little-endian values");
+	struct ann_backend_stats stats;
+	ops->stat(backend, &stats);
+	is(stats.vector_bytes, 0, "shared payload is not charged twice");
+	is(ops->set_live(backend, 17, false), ANN_OK, "retire the label");
+	ok(!ops->is_live(backend, 17) && ops->contains(backend, 17),
+	   "retired label remains available to older views");
+	is(ops->search(backend, query, &opts, found, &count), ANN_OK,
+	   "search current view");
+	is(count, 0, "retired label is absent from the current view");
+	struct ann_filter filter = {accept_any_label, NULL};
+	opts.filter = &filter;
+	is(ops->search(backend, query, &opts, found, &count), ANN_OK,
+	   "search an external visibility view");
+	is(count, 1, "external predicate can expose a retained version");
+	is(ops->reclaim(backend, 17), ANN_OK, "GC releases the label");
+	ok(!ops->contains(backend, 17), "reclaimed label is absent");
+	uint64_t size = 0;
+	uint64_t reusable = ops->reclaimable(backend, &size);
+	ok(reusable <= size, "maintenance reports physical slot usage");
+	float native[] = {3, 4};
+	vector = ann_vector_new(&memory, native, 2);
+	fail_unless(vector != NULL);
+	owner.fail_at = owner.allocations + 1;
+	is(ops->prepare_shared(backend, 21, vector, &change), ANN_OUT_OF_MEMORY,
+	   "failed prepare preserves the caller's shared reference");
+	owner.fail_at = 0;
+	is(ops->prepare_shared(backend, 21, vector, &change), ANN_OK,
+	   "prepare after allocation failure");
+	control.should_stop = stop_search;
+	is(ops->apply(change, &control), ANN_STOPPED,
+	   "stopped mutation remains rollbackable");
+	ops->rollback(change);
+	ops->finish(change);
+	ok(!ops->contains(backend, 21), "rollback keeps the label absent");
+	control.should_stop = NULL;
+	is(ops->prepare_shared(backend, 21, vector, &change), ANN_OK,
+	   "prepare after rollback");
+	is(ops->apply(change, &control), ANN_OK, "publish copied coordinates");
+	ops->finish(change);
+	ann_vector_unref(vector);
+	opts.filter = NULL;
+	is(ops->search(backend, query, &opts, found, &count), ANN_OK,
+	   "search copied coordinates");
+	ok(count == 1 && found[0].label == 21 && found[0].distance == 25,
+	   "native coordinate ownership has the same search contract");
+	ops->destroy(backend);
+	is(released, 1, "external owner released exactly once");
+	ok(owner.live == 0 && owner.wrong_free == 0,
+	   "all shared and backend allocations released through their owner");
+	ok(ann_backend_find(NULL) == NULL &&
+	   ann_backend_find("missing") == NULL,
+	   "unknown algorithms are not silently substituted");
+	check_plan();
+}
+
 int
 main(void)
 {
-	plan(6);
+	plan(8);
 	test_numeric();
 	test_lifecycle();
 	test_control();
 	test_metric_search();
 	test_compound_undo();
 	test_failure();
+	test_backend_contract("flat");
+	test_backend_contract("hnsw");
 	return check_plan();
 }

@@ -40,7 +40,7 @@ struct ann_config {
 	uint32_t dimension;
 	/** Distance function shared by all entries and queries. */
 	enum ann_metric metric;
-	/** Optional backend-specific immutable configuration. */
+	/** Optional algorithm-specific immutable configuration. */
 	const void *algorithm;
 };
 
@@ -57,6 +57,7 @@ struct ann_memory {
 /** Opaque backend and a prepared, single-writer change. */
 struct ann_backend;
 struct ann_change;
+struct ann_vector;
 
 /** One candidate copied into caller-owned storage. */
 struct ann_candidate {
@@ -148,6 +149,16 @@ struct ann_backend_ops {
 				   enum ann_change_kind kind, uint64_t label,
 				   const float *vector, uint32_t dimension,
 				   struct ann_change **out);
+	/** Prepare an insertion retaining shared coordinates until release. */
+	enum ann_status (*prepare_shared)(struct ann_backend *backend,
+					  uint64_t label,
+					  struct ann_vector *vector,
+					  struct ann_change **out);
+	/** Test membership, including labels retained only for rollback. */
+	bool (*contains)(const struct ann_backend *backend, uint64_t label);
+	/** Count reusable slots and write physical size without allocation. */
+	uint64_t (*reclaimable)(const struct ann_backend *backend,
+				uint64_t *size);
 	/** Publish; a failure must remain safely rollbackable. */
 	enum ann_status (*apply)(struct ann_change *change,
 			 struct ann_search_control *control);
@@ -174,7 +185,7 @@ struct ann_backend_ops {
 		     struct ann_backend_stats *out);
 };
 
-/** Find a compiled backend. Flat is available to internal tests only. */
+/** Find the compiled implementation of an algorithm; Flat is test-only. */
 const struct ann_backend_ops *
 ann_backend_find(const char *name);
 

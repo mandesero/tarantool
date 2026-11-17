@@ -25,7 +25,9 @@
 #include "error.h"
 #include "mp_embedding.h"
 #include "lib/ann/ann_numeric.h"
-#include "lib/ann/ann_usearch.h"
+#include "lib/ann/ann_backend.h"
+#include "lib/ann/ann_vector.h"
+#include "lib/ann/ann_hnsw.h"
 
 #include <cmath>
 
@@ -67,6 +69,8 @@ struct memtx_vector_index {
 	uint64_t rebuilds;
 	/** Failed maintenance passes. */
 	uint64_t rebuild_errors;
+	/** Operations selected for both index generations. */
+	const struct ann_backend_ops *ops;
 	/** Current HNSW generation. */
 	struct ann_backend *backend;
 	/** Stable labels and retained tuple addresses. */
@@ -97,7 +101,7 @@ struct vector_group {
 	/** Versions retaining this embedding, including rollback versions. */
 	struct rlist versions;
 	/** Coordinates shared with both graph generations. */
-	struct ann_usearch_vector *vector;
+	struct ann_vector *vector;
 	/** Recyclable storage label, independent of a graph slot. */
 	uint64_t label;
 	/** Number of bindings not explicitly retired by rollback or DML. */
@@ -138,11 +142,11 @@ static void
 vector_group_set_live(struct memtx_vector_index *index,
 		      struct vector_group *group)
 {
-	ann_usearch_ops.set_live(index->backend, group->label,
+	index->ops->set_live(index->backend, group->label,
 				group->live_count != 0);
 	if (index->builder != NULL &&
-	    ann_usearch_contains(index->builder, group->label))
-		ann_usearch_ops.set_live(index->builder, group->label,
+	    index->ops->contains(index->builder, group->label))
+		index->ops->set_live(index->builder, group->label,
 					group->live_count != 0);
 }
 
@@ -173,7 +177,7 @@ vector_schedule_rebuild(struct memtx_vector_index *index)
 	    index->transient_memory != NULL)
 		return;
 	uint64_t size;
-	uint64_t garbage = ann_usearch_reclaimable(index->backend, &size);
+	uint64_t garbage = index->ops->reclaimable(index->backend, &size);
 	if (garbage < 64 || garbage * 4 < size)
 		return;
 	struct fiber *worker =
@@ -193,7 +197,7 @@ static bool
 vector_reserve_maintenance(struct memtx_vector_index *index)
 {
 	uint64_t size;
-	uint64_t reusable = ann_usearch_reclaimable(index->backend, &size);
+	uint64_t reusable = index->ops->reclaimable(index->backend, &size);
 	uint64_t peak = MAX(index->embedding_peak,
 			    (uint64_t)index->groups.live_count + 1);
 	uint64_t limit = 2 * peak + 64;
@@ -202,7 +206,7 @@ vector_reserve_maintenance(struct memtx_vector_index *index)
 		return false;
 	}
 	if (index->builder != NULL) {
-		reusable = ann_usearch_reclaimable(index->builder, &size);
+		reusable = index->ops->reclaimable(index->builder, &size);
 		return (reusable != 0 || size < limit) &&
 		       index->builder_inserts < index->builder_insert_limit;
 	}
@@ -480,7 +484,7 @@ memtx_vector_index_search(struct index *base,
 	struct ann_candidate *candidates = NULL;
 	struct ann_filter filter = {};
 	struct ann_search_control control = {};
-	struct ann_usearch_search_opts algorithm = {};
+	struct ann_hnsw_search_opts algorithm = {};
 	struct ann_search_opts opts = {};
 	uint32_t count = 0;
 	struct key_def *pk = NULL;
@@ -573,7 +577,7 @@ memtx_vector_index_search(struct index *base,
 	opts.filter = &filter;
 	opts.control = &control;
 	opts.algorithm = &algorithm;
-	status = ann_usearch_ops.search(index->backend, query, &opts,
+	status = index->ops->search(index->backend, query, &opts,
 					&candidates[0], &count);
 	if (filter_ctx.status != ANN_OK)
 		status = filter_ctx.status;
@@ -663,7 +667,7 @@ memtx_vector_index_rebuild(struct index *base)
 	index->maintenance.reserved = 0;
 	owner->use_reserve = true;
 	struct ann_memory memory = ann_quota_memory_bind(owner);
-	struct ann_usearch_config algorithm = {
+	struct ann_hnsw_config algorithm = {
 		base->def->opts.vector_m,
 		base->def->opts.vector_ef_construction,
 		base->def->opts.vector_ef_search,
@@ -681,7 +685,7 @@ memtx_vector_index_rebuild(struct index *base)
 	index->transient_memory = owner;
 	index->builder_inserts = 0;
 	index->builder_insert_limit = MAX(64, index->groups.live_count / 4);
-	enum ann_status status = ann_usearch_ops.create(&config, &memory,
+	enum ann_status status = index->ops->create(&config, &memory,
 						      &replacement);
 	if (status != ANN_OK)
 		goto fail_status;
@@ -712,22 +716,22 @@ memtx_vector_index_rebuild(struct index *base)
 		}
 		struct vector_group *group = vector_group_get(index, i + 1);
 		if (group == NULL ||
-		    ann_usearch_contains(replacement, group->label))
+		    index->ops->contains(replacement, group->label))
 			continue;
 		struct ann_change *change = NULL;
 		owner->use_reserve = true;
-		status = ann_usearch_prepare_shared(
+		status = index->ops->prepare_shared(
 			replacement, group->label, group->vector, &change);
 		if (status == ANN_OK) {
-			status = ann_usearch_ops.apply(change, &control);
+			status = index->ops->apply(change, &control);
 			if (status != ANN_OK)
-				ann_usearch_ops.rollback(change);
-			ann_usearch_ops.finish(change);
+				index->ops->rollback(change);
+			index->ops->finish(change);
 		}
 		owner->use_reserve = false;
 		if (status != ANN_OK)
 			goto fail_status;
-		ann_usearch_ops.set_live(replacement, group->label,
+		index->ops->set_live(replacement, group->label,
 					group->live_count != 0);
 		if (owner->bytes > index->temporary_peak)
 			index->temporary_peak = owner->bytes;
@@ -754,7 +758,7 @@ out:
 	ann_quota_memory_reserve(owner, 0);
 	ann_quota_memory_start_gc(owner);
 	ERROR_INJECT_YIELD(ERRINJ_VECTOR_REBUILD_GC_DELAY);
-	ann_usearch_ops.destroy(replacement);
+	index->ops->destroy(replacement);
 	assert(owner->blocks == 0);
 	index->transient_memory = NULL;
 	if (rc == 0) {
@@ -835,7 +839,7 @@ vector_prepare_group(struct memtx_vector_index *index, struct tuple *tuple,
 	if (status != ANN_OK)
 		return status;
 	if (same_row &&
-	    memcmp(packed, ann_usearch_vector_data(previous->group->vector),
+	    memcmp(packed, ann_vector_data(previous->group->vector),
 		   index->dimension * sizeof(float)) == 0) {
 		*out = previous->group;
 		return ANN_OK;
@@ -854,7 +858,7 @@ vector_prepare_group(struct memtx_vector_index *index, struct tuple *tuple,
 	group->live_count = 0;
 	struct ann_memory vector_memory =
 		ann_quota_memory_bind(&index->vector_memory);
-	group->vector = ann_usearch_vector_borrow(
+	group->vector = ann_vector_borrow(
 		&vector_memory, packed, index->dimension, tuple,
 		vector_release_tuple);
 	if (group->vector != NULL)
@@ -919,16 +923,16 @@ memtx_vector_index_replace(struct index *base, struct tuple *old_tuple,
 		status = vector_prepare_group(index, new_tuple, source, &group);
 		if (status != ANN_OK)
 			goto fail;
-		new_group = !ann_usearch_contains(index->backend, group->label);
+		new_group = !index->ops->contains(index->backend, group->label);
 		if (new_group) {
 			struct ann_backend *backends[2] = {index->backend,
 							  index->builder};
 			for (int i = 0; i < 2 && backends[i] != NULL; ++i) {
-				status = ann_usearch_prepare_shared(
+				status = index->ops->prepare_shared(
 					backends[i], group->label,
 					group->vector, &changes[i]);
 				if (status == ANN_OK) {
-					status = ann_usearch_ops.apply(
+					status = index->ops->apply(
 						changes[i], &control);
 				}
 				if (status != ANN_OK)
@@ -958,19 +962,19 @@ memtx_vector_index_replace(struct index *base, struct tuple *old_tuple,
 			++index->builder_inserts;
 	}
 	for (int i = 1; i >= 0; --i)
-		ann_usearch_ops.finish(changes[i]);
+		index->ops->finish(changes[i]);
 	region_truncate(region, svp);
 	*result = old_tuple;
 	return 0;
 fail:
 	vector_index_diag(status, "replace");
 	for (int i = 1; i >= 0; --i) {
-		ann_usearch_ops.rollback(changes[i]);
-		ann_usearch_ops.finish(changes[i]);
+		index->ops->rollback(changes[i]);
+		index->ops->finish(changes[i]);
 	}
 	if (new_group) {
 		ann_tuple_map_remove(&index->groups, group);
-		ann_usearch_vector_unref(group->vector);
+		ann_vector_unref(group->vector);
 		memory.free(memory.ctx, group, sizeof(*group));
 	}
 	if (binding != NULL)
@@ -986,7 +990,7 @@ memtx_vector_index_size(struct index *base)
 {
 	struct memtx_vector_index *index = (struct memtx_vector_index *)base;
 	struct ann_backend_stats stats;
-	ann_usearch_ops.stat(index->backend, &stats);
+	index->ops->stat(index->backend, &stats);
 	return stats.live;
 }
 
@@ -1005,14 +1009,14 @@ memtx_vector_index_stat(struct index *base, struct info_handler *handler)
 {
 	struct memtx_vector_index *index = (struct memtx_vector_index *)base;
 	struct ann_backend_stats stats;
-	ann_usearch_ops.stat(index->backend, &stats);
+	index->ops->stat(index->backend, &stats);
 	struct space *space = space_by_id(base->def->space_id);
 	ssize_t current = index_size(space->index[0]);
 	uint64_t live = current > 0 ? (uint64_t)current : 0;
 	uint64_t retained = index->tuples.live_count > live ?
 		index->tuples.live_count - live : 0;
 	uint64_t vector_bytes = index->vector_memory.payload_bytes -
-		index->vector_memory.blocks * ann_usearch_vector_overhead();
+		index->vector_memory.blocks * ann_vector_overhead();
 	uint64_t active_vectors = 0;
 	uint64_t borrowed_vectors = 0;
 	for (uint32_t i = 0; i < index->groups.count; ++i) {
@@ -1020,7 +1024,7 @@ memtx_vector_index_stat(struct index *base, struct info_handler *handler)
 		if (group == NULL)
 			continue;
 		uint64_t size = index->dimension * sizeof(float);
-		if (ann_usearch_vector_is_borrowed(group->vector))
+		if (ann_vector_is_borrowed(group->vector))
 			borrowed_vectors += size;
 		else
 			active_vectors += size;
@@ -1080,7 +1084,7 @@ memtx_vector_index_stat(struct index *base, struct info_handler *handler)
 	info_append_int(handler, "embeddings", index->groups.live_count);
 	info_append_int(handler, "embedding_peak", index->embedding_peak);
 	uint64_t nodes;
-	ann_usearch_reclaimable(index->backend, &nodes);
+	index->ops->reclaimable(index->backend, &nodes);
 	info_append_int(handler, "nodes", nodes);
 	info_append_int(handler, "node_limit", 2 * index->embedding_peak + 64);
 	info_table_end(handler);
@@ -1151,12 +1155,12 @@ memtx_vector_index_gc_tuple(struct index *base, struct tuple *tuple)
 	memory.free(memory.ctx, binding, sizeof(*binding));
 	tuple_unref(tuple);
 	if (rlist_empty(&group->versions)) {
-		ann_usearch_ops.reclaim(index->backend, group->label);
+		index->ops->reclaim(index->backend, group->label);
 		if (index->builder != NULL &&
-		    ann_usearch_contains(index->builder, group->label))
-			ann_usearch_ops.reclaim(index->builder, group->label);
+		    index->ops->contains(index->builder, group->label))
+			index->ops->reclaim(index->builder, group->label);
 		ann_tuple_map_remove(&index->groups, group);
-		ann_usearch_vector_unref(group->vector);
+		ann_vector_unref(group->vector);
 		memory.free(memory.ctx, group, sizeof(*group));
 		vector_schedule_rebuild(index);
 	}
@@ -1168,7 +1172,7 @@ memtx_vector_index_destroy(struct index *base)
 	struct memtx_vector_index *index = (struct memtx_vector_index *)base;
 	assert(index->transient_memory == NULL && index->gc_fiber == NULL);
 	ann_quota_memory_reserve(&index->maintenance, 0);
-	ann_usearch_ops.destroy(index->backend);
+	index->ops->destroy(index->backend);
 	for (uint32_t i = 0; i < index->tuples.count; ++i) {
 		struct tuple *tuple = (struct tuple *)ann_tuple_map_get(
 			&index->tuples, (uint64_t)i + 1);
@@ -1184,7 +1188,7 @@ memtx_vector_index_destroy(struct index *base)
 		struct vector_group *group = vector_group_get(index, i + 1);
 		if (group == NULL)
 			continue;
-		ann_usearch_vector_unref(group->vector);
+		ann_vector_unref(group->vector);
 		struct ann_memory memory = index->groups.memory;
 		memory.free(memory.ctx, group, sizeof(*group));
 	}
@@ -1266,6 +1270,8 @@ memtx_vector_index_new(struct memtx_engine *memtx, struct index_def *def)
 
 	struct memtx_vector_index *index =
 		(struct memtx_vector_index *)xcalloc(1, sizeof(*index));
+	index->ops = ann_backend_find("hnsw");
+	assert(index->ops != NULL);
 	index->memory_owner = &index->memory_owners[0];
 	index_create(&index->base, (struct engine *)memtx,
 		     &memtx_vector_index_vtab.base, def);
@@ -1293,13 +1299,13 @@ memtx_vector_index_new(struct memtx_engine *memtx, struct index_def *def)
 	default:
 		unreachable();
 	}
-	struct ann_usearch_config algorithm = {
+	struct ann_hnsw_config algorithm = {
 		def->opts.vector_m,
 		def->opts.vector_ef_construction,
 		def->opts.vector_ef_search,
 	};
 	config.algorithm = &algorithm;
-	enum ann_status status = ann_usearch_ops.create(&config, &memory,
+	enum ann_status status = index->ops->create(&config, &memory,
 							  &index->backend);
 	if (vector_index_diag(status, "init") != 0) {
 		index_unref(&index->base);
