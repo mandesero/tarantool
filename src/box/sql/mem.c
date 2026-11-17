@@ -2642,6 +2642,11 @@ mem_cmp_msgpack(const struct Mem *a, const char **b, int *result,
 		int8_t type;
 		const char *buf = *b;
 		uint32_t len = mp_decode_extl(b, &type);
+		if (type == MP_EMBEDDING) {
+			diag_set(ClientError, ER_SQL_EXECUTE,
+				 "Embedding values are not supported in SQL");
+			return -1;
+		}
 		if (type == MP_UUID) {
 			assert(len == UUID_LEN);
 			mem.type = MEM_TYPE_UUID;
@@ -2950,6 +2955,11 @@ mem_from_mp_ephemeral(struct Mem *mem, const char *buf, uint32_t *len)
 		int8_t type;
 		const char *svp = buf;
 		uint32_t size = mp_decode_extl(&buf, &type);
+		if (type == MP_EMBEDDING) {
+			diag_set(ClientError, ER_SQL_EXECUTE,
+				 "Embedding values are not supported in SQL");
+			return -1;
+		}
 		if (type == MP_UUID) {
 			assert(size == UUID_LEN);
 			VERIFY(uuid_unpack(&buf, size, &mem->u.uuid) != NULL);
@@ -3600,6 +3610,11 @@ port_c_get_vdbemem(struct port *base, uint32_t *size)
 			str = data;
 			int8_t type;
 			len = mp_decode_extl(&data, &type);
+			if (type == MP_EMBEDDING) {
+				diag_set(ClientError, ER_SQL_EXECUTE,
+					 "Embedding values are not supported in SQL");
+				goto error;
+			}
 			if (type == MP_UUID) {
 				assert(len == UUID_LEN);
 				struct tt_uuid *uuid = &val[i].u.uuid;
