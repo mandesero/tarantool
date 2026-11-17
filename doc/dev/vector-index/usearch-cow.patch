@@ -1,0 +1,248 @@
+diff --git a/include/usearch/index.hpp b/include/usearch/index.hpp
+index d8ded13..14d6f78 100644
+--- a/include/usearch/index.hpp
++++ b/include/usearch/index.hpp
+@@ -1451,6 +1451,10 @@ struct index_update_config_t {
+     /// @brief Optional non-throwing stop check for a rollbackable insertion.
+     bool (*should_stop)(void*) = nullptr;
+     void* stop_context = nullptr;
++
++    /// @brief Single-writer CoW barrier, called before modifying an existing node.
++    bool (*before_write)(void*, std::size_t) = nullptr;
++    void* write_context = nullptr;
+ };
+
+ struct index_search_config_t {
+@@ -2329,6 +2333,10 @@ class index_gt {
+     /// @brief  Array of thread-specific buffers for temporary data.
+     mutable buffer_gt<context_t, contexts_allocator_t> contexts_{};
+
++    /// @brief Immutable node lookup owned by an external persistent snapshot.
++    byte_t* (*node_resolver_)(void*, std::size_t) = nullptr;
++    void* node_resolver_context_ = nullptr;
++
+   public:
+     std::size_t connectivity() const noexcept { return config_.connectivity; }
+     std::size_t capacity() const noexcept { return nodes_capacity_; }
+@@ -2336,7 +2344,7 @@ class index_gt {
+     std::size_t max_level() const noexcept { return nodes_count_ ? static_cast<std::size_t>(max_level_) : 0; }
+     index_config_t const& config() const noexcept { return config_; }
+     index_limits_t const& limits() const noexcept { return limits_; }
+-    bool is_immutable() const noexcept { return bool(viewed_file_); }
++    bool is_immutable() const noexcept { return bool(viewed_file_) || node_resolver_; }
+     explicit operator bool() const noexcept { return config_.is_valid(); }
+
+     /**
+@@ -2439,7 +2447,7 @@ class index_gt {
+         // Now all is left - is to allocate new `node_t` instances and populate
+         // the `other.nodes_` array into it.
+         for (std::size_t i = 0; i != nodes_count_; ++i)
+-            other.nodes_[i] = other.node_make_copy_(node_bytes_(nodes_[i]));
++            other.nodes_[i] = other.node_make_copy_(node_bytes_(node_at_(i)));
+
+         other.nodes_count_ = nodes_count_.load();
+         other.max_level_ = max_level_;
+@@ -2457,11 +2465,40 @@ class index_gt {
+     member_iterator_t begin() noexcept { return {this, static_cast<compressed_slot_t>(0u)}; }
+     member_iterator_t end() noexcept { return {this, static_cast<compressed_slot_t>(size())}; }
+
+-    member_ref_t at(compressed_slot_t slot) noexcept { return {nodes_[slot].key(), slot}; }
+-    member_cref_t at(compressed_slot_t slot) const noexcept { return {nodes_[slot].ckey(), slot}; }
++    member_ref_t at(compressed_slot_t slot) noexcept { return {node_at_(slot).key(), slot}; }
++    member_cref_t at(compressed_slot_t slot) const noexcept { return {node_at_(slot).ckey(), slot}; }
+     member_iterator_t iterator_at(compressed_slot_t slot) noexcept { return {this, slot}; }
+     member_citerator_t citerator_at(compressed_slot_t slot) const noexcept { return {this, slot}; }
+
++    /** Capture graph metadata without copying nodes or their pointer array.
++     *  The caller retains immutable tapes and serializes creation with writes.
++     *  This graph must be empty and is read-only after success.
++     */
++    bool snapshot_from(index_gt const& source, byte_t* (*resolve)(void*, std::size_t),
++                       void* context, bool with_context = true) noexcept {
++        usearch_assert_m(!size() && !contexts_, "Snapshot target must be empty");
++        if (with_context) {
++            buffer_gt<context_t, contexts_allocator_t> contexts(1, contexts_allocator_t{dynamic_allocator_});
++            if (!contexts)
++                return false;
++            contexts[0].bind_allocator(dynamic_allocator_);
++            contexts_ = std::move(contexts);
++        }
++        config_ = source.config_;
++        pre_ = source.pre_;
++        limits_ = index_limits_t{source.size(), 1};
++        nodes_count_ = source.size();
++        max_level_ = source.max_level_;
++        entry_slot_ = source.entry_slot_;
++        node_resolver_ = resolve;
++        node_resolver_context_ = context;
++        return true;
++    }
++
++    /// @brief Single-writer raw tape access for an external CoW owner.
++    span_gt<byte_t> node_bytes(std::size_t slot) const noexcept { return node_bytes_(node_at_(slot)); }
++    void replace_node(std::size_t slot, byte_t* tape) noexcept { nodes_[slot] = node_t{tape}; }
++
+     dynamic_allocator_t const& dynamic_allocator() const noexcept { return dynamic_allocator_; }
+     tape_allocator_t const& tape_allocator() const noexcept { return tape_allocator_; }
+
+@@ -2476,7 +2513,10 @@ class index_gt {
+      *  Will keep the number of available threads/contexts the same as it was.
+      */
+     void clear() noexcept {
+-        if (!has_reset<tape_allocator_t>()) {
++        if (node_resolver_) {
++            node_resolver_ = nullptr;
++            node_resolver_context_ = nullptr;
++        } else if (!has_reset<tape_allocator_t>()) {
+             std::size_t n = nodes_count_;
+             for (std::size_t i = 0; i != n; ++i)
+                 node_free_(i);
+@@ -2520,6 +2560,8 @@ class index_gt {
+         std::swap(nodes_, other.nodes_);
+         std::swap(nodes_mutexes_, other.nodes_mutexes_);
+         std::swap(contexts_, other.contexts_);
++        std::swap(node_resolver_, other.node_resolver_);
++        std::swap(node_resolver_context_, other.node_resolver_context_);
+
+         // Non-atomic parts.
+         std::size_t capacity_copy = nodes_capacity_;
+@@ -2638,12 +2680,12 @@ class index_gt {
+     };
+
+     class search_result_t {
+-        node_t const* nodes_{};
++        index_gt const* index_{};
+         top_candidates_t const* top_{};
+
+         friend class index_gt;
+         inline search_result_t(index_gt const& index, top_candidates_t const* top) noexcept
+-            : nodes_(index.nodes_), top_(top) {}
++            : index_(&index), top_(top) {}
+
+       public:
+         /**  @brief  Number of search results found. */
+@@ -2682,7 +2724,7 @@ class index_gt {
+         inline match_t at(std::size_t i) const noexcept {
+             candidate_t const* top_ordered = top_->data();
+             candidate_t candidate = top_ordered[i];
+-            node_t node = nodes_[candidate.slot];
++            node_t node = index_->node_at_(candidate.slot);
+             return {member_cref_t{node.ckey(), candidate.slot}, candidate.distance};
+         }
+
+@@ -2881,6 +2923,32 @@ class index_gt {
+             abort_after_reverse_ = true;
+         }
+
++        template <typename callback_at>
++        void for_each_changed(callback_at&& callback) const noexcept {
++            for (std::size_t i = 0; i != count_; ++i) {
++                compressed_slot_t slot;
++                std::memcpy(&slot, bytes_.data() + i * stride_, sizeof(slot));
++                callback(slot);
++            }
++            if (reused_)
++                callback(updated_slot_);
++        }
++
++        template <typename callback_at>
++        void rollback_nodes(index_gt& index, callback_at&& restore) noexcept {
++            if (!active_)
++                return;
++            for_each_changed(restore);
++            if (!reused_) {
++                index.node_free_(old_size_);
++                index.nodes_count_ = old_size_;
++                index.entry_slot_ = old_entry_;
++                index.max_level_ = old_level_;
++            }
++            active_ = false;
++            rolled_back_ = true;
++        }
++
+         void rollback(index_gt& index) noexcept {
+             if (!active_)
+                 return;
+@@ -3047,7 +3115,8 @@ class index_gt {
+             }
+             if (!form_reverse_links_(metric, new_slot, closest_view, value,
+                                      level, context, undo,
+-                                     config.should_stop, config.stop_context)) {
++                                     config.should_stop, config.stop_context,
++                                     config.before_write, config.write_context)) {
+                 undo->rollback(*this);
+                 return result.failed("Add stopped");
+             }
+@@ -3144,6 +3213,13 @@ class index_gt {
+             return result.failed("Out of memory!");
+         if (undo)
+             undo->active_ = true;
++        if (config.before_write && !config.before_write(config.write_context, updated_slot)) {
++            // No write has happened yet; leave ordinary undo safe on the shared tape.
++            if (undo)
++                undo->active_ = false;
++            return result.failed("CoW allocation failed");
++        }
++        updated_node = node_at_(updated_slot);
+
+         // Copy entry coordinates under locks
+         level_t max_level_copy;
+@@ -3200,7 +3276,8 @@ class index_gt {
+                     closest_slot = closest_view[0].slot;
+             }
+             if (!form_reverse_links_(metric, updated_slot, closest_view, value, level, context, undo,
+-                                     config.should_stop, config.stop_context)) {
++                                     config.should_stop, config.stop_context,
++                                     config.before_write, config.write_context)) {
+                 undo->rollback(*this);
+                 return result.failed("Update stopped");
+             }
+@@ -4013,7 +4090,9 @@ class index_gt {
+         node = node_t{};
+     }
+
+-    inline node_t node_at_(std::size_t idx) const noexcept { return nodes_[idx]; }
++    inline node_t node_at_(std::size_t idx) const noexcept {
++        return node_resolver_ ? node_t{node_resolver_(node_resolver_context_, idx)} : nodes_[idx];
++    }
+     inline neighbors_ref_t neighbors_base_(node_t node) const noexcept { return {node.neighbors_tape()}; }
+
+     inline neighbors_ref_t neighbors_non_base_(node_t node, level_t level) const noexcept {
+@@ -4028,10 +4107,15 @@ class index_gt {
+     struct node_lock_t {
+         nodes_mutexes_t& mutexes;
+         std::size_t slot;
+-        inline ~node_lock_t() noexcept { mutexes.atomic_reset(slot); }
++        inline ~node_lock_t() noexcept {
++            if (slot != std::numeric_limits<std::size_t>::max())
++                mutexes.atomic_reset(slot);
++        }
+     };
+
+     inline node_lock_t node_lock_(std::size_t slot) const noexcept {
++        if (node_resolver_)
++            return {nodes_mutexes_, std::numeric_limits<std::size_t>::max()};
+         while (nodes_mutexes_.atomic_set(slot))
+             ;
+         return {nodes_mutexes_, slot};
+@@ -4103,7 +4187,8 @@ class index_gt {
+         metric_at&& metric, compressed_slot_t new_slot, candidates_view_t new_neighbors, value_at&& value,
+         level_t level, context_t& context,
+         add_undo_t* undo = nullptr, bool (*should_stop)(void*) = nullptr,
+-        void* stop_context = nullptr) usearch_noexcept_m {
++        void* stop_context = nullptr, bool (*before_write)(void*, std::size_t) = nullptr,
++        void* write_context = nullptr) usearch_noexcept_m {
+
+         top_candidates_t& top_for_refine = context.top_for_refine;
+         std::size_t const connectivity_max = level ? config_.connectivity : config_.connectivity_base;
+@@ -4133,6 +4218,10 @@ class index_gt {
+                 already_linked |= slot == new_slot;
+             if (already_linked)
+                 continue;
++            if (before_write && !before_write(write_context, close_slot))
++                return false;
++            close_node = node_at_(close_slot);
++            close_header = neighbors_(close_node, level);
+             if (undo)
+                 undo->record(close_slot, level, close_header,
+                              connectivity_max);

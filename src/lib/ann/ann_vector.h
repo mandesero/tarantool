@@ -48,6 +48,10 @@ ann_vector_borrow(const struct ann_memory *memory, const void *data,
 bool
 ann_vector_is_borrowed(const struct ann_vector *vector);
 
+/** External owner retained by borrowed coordinates, otherwise NULL. */
+void *
+ann_vector_owner(const struct ann_vector *vector);
+
 /** Bytes per coordinate owner, excluding optional owned payload. */
 size_t
 ann_vector_overhead(void);

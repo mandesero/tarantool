@@ -264,8 +264,9 @@ vector_visible_tuple(struct vector_index_filter_ctx *filter, uint64_t label)
 }
 
 static bool
-vector_index_filter(uint64_t label, void *ctx)
+vector_index_filter(uint64_t label, const struct ann_vector *vector, void *ctx)
 {
+	(void)vector;
 	struct vector_index_filter_ctx *filter =
 		(struct vector_index_filter_ctx *)ctx;
 	struct tuple *tuple = vector_visible_tuple(filter, label);

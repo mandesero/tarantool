@@ -7,6 +7,7 @@
 #include "ann_numeric.h"
 #include "ann_vector.h"
 #include "ann_hnsw.h"
+#include "ann_cow.h"
 
 #include <usearch/index.hpp>
 
@@ -27,6 +28,8 @@ struct ann_usearch_block {
 	size_t total;
 	/** Element count supplied by USearch. */
 	size_t count;
+	/** Graph and immutable record references to this tape. */
+	uint32_t refs;
 };
 
 /** Rebindable allocator preserving the index's memory owner. */
@@ -68,6 +71,7 @@ template <class T> struct ann_usearch_allocator {
 		header->base = base;
 		header->total = total;
 		header->count = count;
+		header->refs = 1;
 		T *result = (T *)address;
 		if (result != nullptr && retained != nullptr)
 			*retained += total;
@@ -80,6 +84,8 @@ template <class T> struct ann_usearch_allocator {
 				(ann_usearch_block *)((uintptr_t)ptr -
 						     sizeof(*header));
 			assert(header->count == count);
+			if (--header->refs != 0)
+				return;
 			if (retained != nullptr)
 				*retained -= header->total;
 			memory.free(memory.ctx, header->base, header->total);
@@ -133,6 +139,20 @@ struct ann_usearch_lookup_entry {
 	uint8_t state;
 };
 
+/** Immutable slot state shared by live and frozen radix roots. */
+struct ann_usearch_record {
+	/** Source allocator and tape reference counter. */
+	struct ann_backend *owner;
+	/** References from persistent leaf pages. */
+	uint32_t refs;
+	/** Frozen graph tape. */
+	unum::usearch::byte_t *tape;
+	/** Tape size required by the allocator. */
+	size_t bytes;
+	/** Frozen label and coordinate owner. */
+	struct ann_usearch_entry entry;
+};
+
 /** One HNSW generation with owner-bound graph and lookup. */
 struct ann_backend {
 	/** Common scalar and dimensional configuration. */
@@ -159,6 +179,12 @@ struct ann_backend {
 	uint32_t capacity;
 	/** Top of the change undo stack. */
 	struct ann_change *pending;
+	/** Immutable node tapes and coordinates indexed by slot. */
+	struct ann_cow records;
+	/** Live source retained by a frozen backend, otherwise NULL. */
+	struct ann_backend *source;
+	/** Live owner and frozen backend references. */
+	uint32_t refs;
 
 	ann_backend(const struct ann_config &cfg, struct ann_memory mem,
 		    struct ann_hnsw_config opts) : config(cfg), memory(mem),
@@ -168,7 +194,8 @@ struct ann_backend {
 		  ann_graph_allocator{mem, &retained_bytes}),
 	    entries(nullptr), lookup(nullptr), reclaim_queue(nullptr),
 	    reclaim_count(0), lookup_capacity(0),
-	    capacity(0), pending(nullptr) {}
+	    capacity(0), pending(nullptr), records{}, source(nullptr),
+	    refs(1) {}
 };
 
 /** Prepared version change with graph-level undo. */
@@ -199,6 +226,8 @@ struct ann_change {
 	struct ann_usearch_entry old_entry;
 	/** Own and reverse-link snapshots retained until finish. */
 	ann_graph::add_undo_t undo;
+	/** Persistent root used by allocation-free pointer undo. */
+	struct ann_cow old_records;
 };
 
 static size_t
@@ -223,6 +252,144 @@ ann_usearch_free(struct ann_backend *backend, void *ptr, size_t size)
 		return;
 	backend->retained_bytes -= size;
 	backend->memory.free(backend->memory.ctx, ptr, size);
+}
+
+static void *
+ann_usearch_cow_alloc(void *ctx, size_t size)
+{
+	return ann_usearch_alloc((struct ann_backend *)ctx, size);
+}
+
+static void
+ann_usearch_cow_free(void *ctx, void *ptr, size_t size)
+{
+	ann_usearch_free((struct ann_backend *)ctx, ptr, size);
+}
+
+static ann_usearch_block *
+ann_usearch_header(void *ptr)
+{
+	uintptr_t address = (uintptr_t)ptr - sizeof(ann_usearch_block);
+	return (ann_usearch_block *)address;
+}
+
+static void
+ann_usearch_tape_ref(void *ptr)
+{
+	auto *header = ann_usearch_header(ptr);
+	assert(header->refs != 0 && header->refs < UINT32_MAX);
+	++header->refs;
+}
+
+static void
+ann_usearch_record_ref(void *ptr)
+{
+	auto *record = (struct ann_usearch_record *)ptr;
+	assert(record->refs < UINT32_MAX);
+	++record->refs;
+}
+
+/** Immutable records own both the tape and its shared coordinates. */
+static void
+ann_usearch_record_unref(void *ptr)
+{
+	auto *record = (struct ann_usearch_record *)ptr;
+	if (--record->refs != 0)
+		return;
+	auto *owner = record->owner;
+	ann_graph_allocator allocator{owner->memory, &owner->retained_bytes};
+	allocator.deallocate(record->tape, record->bytes);
+	ann_vector_unref(record->entry.shared);
+	ann_usearch_free(owner, record, sizeof(*record));
+}
+
+/** Frozen lookups must not consult the mutable live entry array. */
+static const struct ann_usearch_entry *
+ann_usearch_entry_at(const struct ann_backend *backend, uint32_t slot)
+{
+	if (backend->source == nullptr)
+		return &backend->entries[slot];
+	auto *record = (struct ann_usearch_record *)
+		ann_cow_get(&backend->records, slot);
+	assert(record != nullptr);
+	return &record->entry;
+}
+
+/** Resolve without locking or modifying the persistent root. */
+static unum::usearch::byte_t *
+ann_usearch_resolve(void *ctx, size_t slot)
+{
+	auto *backend = (struct ann_backend *)ctx;
+	auto *record = (struct ann_usearch_record *)
+		ann_cow_get(&backend->records, slot);
+	assert(record != nullptr);
+	return record->tape;
+}
+
+/** The write barrier never changes tapes reachable from a frozen root. */
+static bool
+ann_usearch_touch(void *ctx, size_t slot)
+{
+	auto *backend = (struct ann_backend *)ctx;
+	auto bytes = backend->graph.node_bytes(slot);
+	if (ann_usearch_header(bytes.data())->refs == 1)
+		return true;
+	ann_graph_allocator allocator{backend->memory,
+		&backend->retained_bytes};
+	auto *copy = allocator.allocate(bytes.size());
+	if (copy == nullptr)
+		return false;
+	memcpy(copy, bytes.data(), bytes.size());
+	backend->graph.replace_node(slot, copy);
+	allocator.deallocate(bytes.data(), bytes.size());
+	return true;
+}
+
+/** Publish one immutable slot only after all graph writes have completed. */
+static enum ann_status
+ann_usearch_publish(struct ann_backend *backend, uint32_t slot)
+{
+	auto bytes = backend->graph.node_bytes(slot);
+	auto *old = (struct ann_usearch_record *)
+		ann_cow_get(&backend->records, slot);
+	if (old != nullptr && old->tape == bytes.data())
+		return ANN_OK;
+	struct ann_usearch_record *record = (struct ann_usearch_record *)
+		ann_usearch_alloc(backend, sizeof(*record));
+	if (record == nullptr)
+		return ANN_OUT_OF_MEMORY;
+	record->owner = backend;
+	record->refs = 1;
+	record->tape = bytes.data();
+	record->bytes = bytes.size();
+	record->entry = backend->entries[slot];
+	assert(record->entry.shared != nullptr);
+	ann_vector_ref(record->entry.shared);
+	ann_usearch_tape_ref(record->tape);
+	enum ann_status status = ann_cow_set(&backend->records, slot, record);
+	ann_usearch_record_unref(record);
+	return status;
+}
+
+/** Restore tape pointers instead of writing adjacency lists shared by views. */
+static void
+ann_usearch_undo_nodes(struct ann_change *change)
+{
+	auto *backend = change->backend;
+	auto restore = [change, backend](uint32_t slot) {
+		auto *record = (struct ann_usearch_record *)
+			ann_cow_get(&change->old_records, slot);
+		assert(record != nullptr);
+		auto current = backend->graph.node_bytes(slot);
+		ann_usearch_tape_ref(record->tape);
+		backend->graph.replace_node(slot, record->tape);
+		ann_graph_allocator allocator{backend->memory,
+			&backend->retained_bytes};
+		allocator.deallocate(current.data(), current.size());
+	};
+	change->undo.rollback_nodes(backend->graph, restore);
+	ann_cow_destroy(&backend->records);
+	ann_cow_copy(&backend->records, &change->old_records);
 }
 
 /** Coordinates can belong to this generation or an independent owner. */
@@ -342,7 +509,7 @@ struct ann_usearch_metric {
 	ann_coordinate_ref vector(unum::usearch::member_cref_gt<K> value)
 		const noexcept
 	{
-		const auto *entry = &backend->entries[value.slot];
+		const auto *entry = ann_usearch_entry_at(backend, value.slot);
 		return {entry->vector, entry->shared != nullptr &&
 			ann_vector_is_borrowed(entry->shared)};
 	}
@@ -420,8 +587,23 @@ ann_usearch_create(const struct ann_config *config,
 	copied.algorithm = nullptr;
 	struct ann_backend *backend = new (storage)
 		ann_backend(copied, *memory, options);
+	struct ann_memory cow_memory = {backend, ann_usearch_cow_alloc,
+		ann_usearch_cow_free};
+	ann_cow_create(&backend->records, &cow_memory,
+		       ann_usearch_record_ref, ann_usearch_record_unref);
 	*out = backend;
 	return ANN_OK;
+}
+
+/** A source header owns allocator counters until its last view is closed. */
+static void
+ann_usearch_unref(struct ann_backend *backend)
+{
+	if (--backend->refs != 0)
+		return;
+	struct ann_memory memory = backend->memory;
+	backend->~ann_backend();
+	memory.free(memory.ctx, backend, sizeof(*backend));
 }
 
 static void
@@ -429,6 +611,13 @@ ann_usearch_destroy(struct ann_backend *backend)
 {
 	if (backend == nullptr)
 		return;
+	if (backend->source != nullptr) {
+		auto *source = backend->source;
+		ann_cow_destroy(&backend->records);
+		ann_usearch_unref(backend);
+		ann_usearch_unref(source);
+		return;
+	}
 	for (struct ann_change *change = backend->pending; change != nullptr;) {
 		struct ann_change *previous = change->previous;
 		ann_usearch_release_vector(backend, change->vector,
@@ -439,6 +628,7 @@ ann_usearch_destroy(struct ann_backend *backend)
 						   change->old_entry.shared);
 		}
 		change->undo.commit();
+		ann_cow_destroy(&change->old_records);
 		change->~ann_change();
 		ann_usearch_free(backend, change, sizeof(*change));
 		change = previous;
@@ -452,15 +642,50 @@ ann_usearch_destroy(struct ann_backend *backend)
 		 backend->lookup_capacity * sizeof(*backend->lookup));
 	ann_usearch_free(backend, backend->reclaim_queue,
 		 (size_t)backend->capacity * sizeof(*backend->reclaim_queue));
-	struct ann_memory memory = backend->memory;
-	backend->~ann_backend();
-	memory.free(memory.ctx, backend, sizeof(*backend));
+	backend->entries = nullptr;
+	backend->lookup = nullptr;
+	backend->reclaim_queue = nullptr;
+	backend->graph.reset();
+	ann_cow_destroy(&backend->records);
+	ann_usearch_unref(backend);
+}
+
+/** Root retention captures topology in constant time and space. */
+static enum ann_status
+ann_usearch_snapshot(struct ann_backend *backend,
+		     const struct ann_memory *memory,
+		     struct ann_backend **out)
+{
+	if (out == nullptr)
+		return ANN_INVALID;
+	*out = nullptr;
+	if (backend == nullptr || backend->source != nullptr ||
+	    memory == nullptr || memory->alloc == nullptr ||
+	    memory->free == nullptr)
+		return ANN_INVALID;
+	struct ann_config config = backend->config;
+	config.algorithm = &backend->options;
+	struct ann_backend *view;
+	enum ann_status status = ann_usearch_create(&config, memory, &view);
+	if (status != ANN_OK)
+		return status;
+	if (!view->graph.snapshot_from(backend->graph,
+				       ann_usearch_resolve, view, false)) {
+		ann_usearch_unref(view);
+		return ANN_OUT_OF_MEMORY;
+	}
+	ann_cow_copy(&view->records, &backend->records);
+	assert(backend->refs < UINT32_MAX);
+	++backend->refs;
+	view->source = backend;
+	*out = view;
+	return ANN_OK;
 }
 
 static enum ann_status
 ann_usearch_reserve(struct ann_backend *backend, uint32_t capacity)
 {
-	if (backend == nullptr)
+	if (backend == nullptr || backend->source != nullptr)
 		return ANN_INVALID;
 	if (backend->pending != nullptr && !backend->pending->applied)
 		return ANN_BUSY;
@@ -544,7 +769,8 @@ ann_usearch_prepare_impl(struct ann_backend *backend,
 	if (out == nullptr)
 		return ANN_INVALID;
 	*out = nullptr;
-	if (backend == nullptr || (kind != ANN_INSERT && kind != ANN_RETIRE))
+	if (backend == nullptr || backend->source != nullptr ||
+	    (kind != ANN_INSERT && kind != ANN_RETIRE))
 		return ANN_INVALID;
 	if (backend->pending != nullptr && !backend->pending->applied)
 		return ANN_BUSY;
@@ -595,15 +821,16 @@ ann_usearch_prepare_impl(struct ann_backend *backend,
 		change->shared = shared;
 		change->vector = ann_vector_data(shared);
 	} else if (kind == ANN_INSERT) {
-		change->vector = (float *)ann_usearch_alloc(
-			backend, ann_vector_size(backend));
-		if (change->vector == nullptr) {
+		struct ann_memory memory = {backend, ann_usearch_cow_alloc,
+			ann_usearch_cow_free};
+		change->shared = ann_vector_new(&memory, (const float *)vector,
+						dimension);
+		if (change->shared == nullptr) {
 			change->~ann_change();
 			ann_usearch_free(backend, change, sizeof(*change));
 			return ANN_OUT_OF_MEMORY;
 		}
-		memcpy((void *)change->vector, vector,
-		       ann_vector_size(backend));
+		change->vector = ann_vector_data(change->shared);
 	}
 	if (change->reused) {
 		change->old_entry = backend->entries[change->slot];
@@ -672,6 +899,8 @@ ann_usearch_apply(struct ann_change *change,
 		change->applied = true;
 		return ANN_OK;
 	}
+	ann_cow_destroy(&change->old_records);
+	ann_cow_copy(&change->old_records, &backend->records);
 	struct ann_usearch_entry *entry = &backend->entries[change->slot];
 	entry->vector = change->vector;
 	entry->shared = change->shared;
@@ -685,6 +914,8 @@ ann_usearch_apply(struct ann_change *change,
 	struct ann_usearch_stop stop{control, &status};
 	unum::usearch::index_update_config_t config;
 	config.expansion = backend->options.expansion_add;
+	config.before_write = ann_usearch_touch;
+	config.write_context = backend;
 	if (control != nullptr) {
 		config.should_stop = ann_usearch_should_stop;
 		config.stop_context = &stop;
@@ -695,11 +926,20 @@ ann_usearch_apply(struct ann_change *change,
 			[](auto) {}, [](auto, auto) {}, &change->undo) :
 		backend->graph.add(change->label, change->vector, metric,
 			config, [](auto) {}, [](auto, auto) {}, &change->undo);
+	if (result && status == ANN_OK) {
+		auto publish = [backend, &status](uint32_t slot) {
+			if (status == ANN_OK)
+				status = ann_usearch_publish(backend, slot);
+		};
+		change->undo.for_each_changed(publish);
+		if (status == ANN_OK)
+			status = ann_usearch_publish(backend, change->slot);
+	}
 	if (result && status == ANN_OK && control != nullptr)
 		status = ann_search_control_poll(control);
 	if (!result || status != ANN_OK) {
 		result.error.release();
-		change->undo.rollback(backend->graph);
+		ann_usearch_undo_nodes(change);
 		if (change->reused)
 			*entry = change->old_entry;
 		else
@@ -733,7 +973,7 @@ ann_usearch_rollback(struct ann_change *change)
 		backend->entries[change->slot].live = true;
 	} else {
 		ann_usearch_lookup_erase(backend, change->label);
-		change->undo.rollback(backend->graph);
+		ann_usearch_undo_nodes(change);
 		struct ann_usearch_entry *entry = &backend->entries[change->slot];
 		ann_usearch_release_vector(backend, entry->vector,
 					   entry->shared);
@@ -754,6 +994,7 @@ ann_usearch_finish(struct ann_change *change)
 	assert(backend->pending == change);
 	backend->pending = change->previous;
 	change->undo.commit();
+	ann_cow_destroy(&change->old_records);
 	if (change->reused && change->applied) {
 		ann_usearch_release_vector(backend, change->old_entry.vector,
 					   change->old_entry.shared);
@@ -817,7 +1058,8 @@ ann_usearch_search(struct ann_backend *backend, const float *query,
 	    opts->control == nullptr || out_count == nullptr ||
 	    (opts->candidate_limit != 0 && out == nullptr) ||
 	    opts->query_dimension != backend->config.dimension ||
-	    (opts->filter != nullptr && opts->filter->accept == nullptr))
+	    (opts->filter != nullptr && opts->filter->accept == nullptr) ||
+	    (backend->source != nullptr && opts->filter == nullptr))
 		return ANN_INVALID;
 	enum ann_status status = ann_vector_validate_f32(query,
 		backend->config.dimension, backend->config.metric);
@@ -841,13 +1083,29 @@ ann_usearch_search(struct ann_backend *backend, const float *query,
 	config.stop_context = &stop;
 	auto predicate = [backend, opts](ann_graph::member_cref_t member) {
 		const struct ann_usearch_entry *entry =
-			&backend->entries[member.slot];
-		if (entry->reclaimed)
+			ann_usearch_entry_at(backend, member.slot);
+		if (backend->source == nullptr && entry->reclaimed)
 			return false;
 		return opts->filter == nullptr ? entry->live :
-			opts->filter->accept(entry->label, opts->filter->ctx);
+			opts->filter->accept(entry->label, entry->shared,
+				     opts->filter->ctx);
 	};
-	auto result = backend->graph.search(query, opts->candidate_limit,
+	/* Scratch state belongs to this search, including on other cords. */
+	uint64_t scratch_bytes = 0;
+	struct ann_memory memory = opts->memory == nullptr ? backend->memory :
+		*opts->memory;
+	ann_graph frozen(unum::usearch::index_config_t{
+		backend->options.connectivity},
+		ann_graph_allocator{memory, &scratch_bytes},
+		ann_graph_allocator{memory, &scratch_bytes});
+	ann_graph *graph = &backend->graph;
+	if (backend->source != nullptr) {
+		if (!frozen.snapshot_from(backend->graph,
+					  ann_usearch_resolve, backend))
+			return ANN_OUT_OF_MEMORY;
+		graph = &frozen;
+	}
+	auto result = graph->search(query, opts->candidate_limit,
 					    metric, config, predicate);
 	if (!result) {
 		result.error.release();
@@ -860,7 +1118,10 @@ ann_usearch_search(struct ann_backend *backend, const float *query,
 		if (status != ANN_OK)
 			return status;
 		auto match = result[i];
-		out[i].label = backend->entries[match.member.slot].label;
+		const auto *entry =
+			ann_usearch_entry_at(backend, match.member.slot);
+		out[i].label = entry->label;
+		out[i].vector = entry->shared;
 		out[i].distance = match.distance;
 	}
 	status = ann_search_control_poll(opts->control);
@@ -882,11 +1143,11 @@ ann_usearch_stat(const struct ann_backend *backend,
 		(sizeof(*backend->entries) + sizeof(*backend->reclaim_queue)) +
 		(uint64_t)backend->lookup_capacity * sizeof(*backend->lookup);
 	for (uint32_t i = 0; i < backend->graph.size(); ++i) {
-		if (backend->entries[i].vector != nullptr &&
-		    backend->entries[i].shared == nullptr)
+		const auto *entry = ann_usearch_entry_at(backend, i);
+		if (entry->vector != nullptr && entry->shared == nullptr)
 			out->vector_bytes += (uint64_t)backend->config.dimension *
 					     sizeof(float);
-		if (backend->entries[i].live)
+		if (entry->live)
 			++out->live;
 		else
 			++out->retired;
@@ -902,5 +1163,5 @@ extern "C" const struct ann_backend_ops ann_usearch_ops = {
 	ann_usearch_rollback, ann_usearch_finish, ann_usearch_set_live,
 	ann_usearch_is_live,
 	ann_usearch_reclaim,
-	ann_usearch_search, ann_usearch_stat,
+	ann_usearch_search, ann_usearch_stat, ann_usearch_snapshot,
 };

@@ -433,7 +433,7 @@ ann_flat_search(struct ann_backend *backend, const float *query,
 		if (opts->filter == NULL) {
 			if (!entry->live)
 				continue;
-		} else if (!opts->filter->accept(entry->label,
+		} else if (!opts->filter->accept(entry->label, entry->shared,
 						 opts->filter->ctx)) {
 			continue;
 		}
@@ -446,13 +446,13 @@ ann_flat_search(struct ann_backend *backend, const float *query,
 					  &distance);
 		if (status != ANN_OK)
 			return status;
+		struct ann_candidate candidate = {
+			entry->label, distance, entry->shared,
+		};
 		if (count == opts->candidate_limit &&
-		    !ann_candidate_before(&(struct ann_candidate){entry->label,
-								   distance},
-					  &out[count - 1]))
+		    !ann_candidate_before(&candidate, &out[count - 1]))
 			continue;
 		uint32_t pos = count < opts->candidate_limit ? count++ : count - 1;
-		struct ann_candidate candidate = {entry->label, distance};
 		while (pos > 0 && ann_candidate_before(&candidate, &out[pos - 1])) {
 			out[pos] = out[pos - 1];
 			--pos;

@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <pthread.h>
 #include <usearch/index.hpp>
 
 #include "trivia/util.h"
@@ -111,8 +112,9 @@ search(const struct ann_backend_ops *ops, struct ann_backend *backend,
 
 /** Flat defines filtered top-k semantics independently of HNSW recall. */
 static bool
-accept_odd_label(uint64_t label, void *ctx)
+accept_odd_label(uint64_t label, const struct ann_vector *vector, void *ctx)
 {
+	(void)vector;
 	(void)ctx;
 	return (label & 1) != 0;
 }
@@ -1090,10 +1092,91 @@ test_update_graph_undo(void)
 	check_plan();
 }
 
+/** Reader-owned state; scratch allocation never touches the writer's owner. */
+struct snapshot_reader {
+	/** Frozen graph shared with the owner cord. */
+	struct ann_backend *view;
+	/** Search and allocator invariants checked after joining. */
+	bool success;
+};
+
+/** A frozen graph is traversable while its source reuses physical slots. */
+static void *
+snapshot_reader_f(void *opaque)
+{
+	auto *reader = (struct snapshot_reader *)opaque;
+	struct owner scratch = {};
+	struct ann_memory memory = owner_memory(&scratch);
+	struct ann_filter filter = {accept_odd_label, nullptr};
+	float query[] = {0, 0};
+	for (unsigned i = 0; i < 64; ++i) {
+		struct ann_search_control control = {};
+		control.work_limit = 1000000;
+		struct ann_search_opts opts = {};
+		opts.candidate_limit = 2;
+		opts.query_dimension = 2;
+		opts.filter = &filter;
+		opts.control = &control;
+		opts.memory = &memory;
+		struct ann_candidate found[2];
+		uint32_t count = 0;
+		reader->success &= ann_usearch_ops.search(reader->view, query,
+			&opts, found, &count) == ANN_OK && count == 2 &&
+			found[0].label == 1 && found[0].distance == 0 &&
+			found[1].label == 3 && found[1].distance == 4;
+		reader->success &= scratch.bytes == 0 && scratch.bad_free == 0;
+	}
+	return nullptr;
+}
+
+static void
+test_concurrent_snapshot(void)
+{
+	plan(6);
+	struct owner owner = {}, views = {};
+	struct ann_memory memory = owner_memory(&owner);
+	struct ann_memory view_memory = owner_memory(&views);
+	struct ann_config config = {2, ANN_L2, nullptr};
+	struct ann_backend *backend = nullptr, *view = nullptr;
+	bool ready = ann_usearch_ops.create(&config, &memory, &backend) ==
+		ANN_OK;
+	for (unsigned i = 0; i < 512 && ready; ++i) {
+		float vector[] = {(float)i, 0};
+		ready = insert(&ann_usearch_ops, backend, i + 1, vector) ==
+			ANN_OK;
+	}
+	ok(ready, "source graph has multiple HNSW layers");
+	size_t calls = owner.calls;
+	ok(ann_usearch_ops.snapshot(backend, &view_memory, &view) == ANN_OK &&
+	   owner.calls == calls, "large snapshot does not walk graph nodes");
+	struct snapshot_reader reader = {view, true};
+	pthread_t thread;
+	int rc = pthread_create(&thread, nullptr, snapshot_reader_f, &reader);
+	is(rc, 0, "reader starts on a separate thread");
+	bool changed = true;
+	uint64_t label = 1;
+	for (unsigned i = 0; i < 128; ++i) {
+		float vector[] = {1000 + (float)i, 0};
+		changed &= reclaim_label(backend, label);
+		label = 10000 + i;
+		changed &= insert(&ann_usearch_ops, backend, label, vector) ==
+			ANN_OK;
+	}
+	ann_usearch_ops.destroy(backend);
+	if (rc == 0)
+		pthread_join(thread, nullptr);
+	ok(changed, "writer reuses slots and destroys its graph");
+	ok(reader.success, "reader keeps frozen results and private scratch");
+	ann_usearch_ops.destroy(view);
+	ok(owner.bytes == 0 && views.bytes == 0 && owner.bad_free == 0 &&
+	   views.bad_free == 0, "concurrent snapshot releases both owners");
+	check_plan();
+}
+
 int
 main(void)
 {
-	plan(21);
+	plan(22);
 	test_lifecycle(ann_backend_find("flat"));
 	test_lifecycle(&ann_usearch_ops);
 	test_filtered_topk(ann_backend_find("flat"));
@@ -1115,5 +1198,6 @@ main(void)
 	test_reuse_failures(false);
 	test_reuse_borrowed_owner();
 	test_update_graph_undo();
+	test_concurrent_snapshot();
 	return check_plan();
 }

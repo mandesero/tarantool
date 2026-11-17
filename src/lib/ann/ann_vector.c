@@ -116,3 +116,9 @@ ann_vector_overhead(void)
 {
 	return sizeof(struct ann_vector);
 }
+
+void *
+ann_vector_owner(const struct ann_vector *vector)
+{
+	return vector->owner;
+}

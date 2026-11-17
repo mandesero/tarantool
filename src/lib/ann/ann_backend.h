@@ -65,12 +65,15 @@ struct ann_candidate {
 	uint64_t label;
 	/** Finite distance computed from canonical float32 values. */
 	double distance;
+	/** Coordinates retained by the backend until its next mutation. */
+	const struct ann_vector *vector;
 };
 
 /** Result predicate; rejected records may still aid ANN navigation. */
 struct ann_filter {
 	/** Decide whether a label may appear in the result. */
-	bool (*accept)(uint64_t label, void *ctx);
+	bool (*accept)(uint64_t label, const struct ann_vector *vector,
+		       void *ctx);
 	/** Visibility and declarative-filter state. */
 	void *ctx;
 };
@@ -103,6 +106,8 @@ struct ann_search_opts {
 	struct ann_search_control *control;
 	/** Algorithm-specific options; NULL for Flat. */
 	const void *algorithm;
+	/** Optional request-local allocator for frozen graph search buffers. */
+	const struct ann_memory *memory;
 };
 
 /** Type of a prepared logical mutation. */
@@ -183,6 +188,15 @@ struct ann_backend_ops {
 	/** Read current counters without allocating. */
 	void (*stat)(const struct ann_backend *backend,
 		     struct ann_backend_stats *out);
+	/**
+	 * Freeze topology and coordinates; search requires a visibility filter.
+	 * Searches use independent buffers. Destroy the result with this vtab.
+	 * Snapshot creation must not copy coordinates or walk graph nodes.
+	 * NULL when the test-only backend doesn't implement snapshots.
+	 */
+	enum ann_status (*snapshot)(struct ann_backend *backend,
+				    const struct ann_memory *memory,
+				    struct ann_backend **out);
 };
 
 /** Find the compiled implementation of an algorithm; Flat is test-only. */
